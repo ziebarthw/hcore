@@ -377,6 +377,7 @@ libevhtp behaviours the engine works around (each is commented at the site in
 git clone https://github.com/criticalstack/libevhtp && cd libevhtp/build
 cmake .. -DEVHTP_DISABLE_REGEX=ON -DEVHTP_DISABLE_EVTHR=ON \
          -DCMAKE_INSTALL_PREFIX=$HOME/local && make && make install
+# (or the ziebarthw/libevhtp fork: see "With the ziebarthw/libevhtp fork")
 
 # this project (needs the libevent 2.1 and OpenSSL dev packages)
 make EVHTP_PREFIX=$HOME/local
@@ -397,18 +398,54 @@ Like the Java example, it pools up to 100 connections, 20 per route.
 
 ### With the ziebarthw/libevhtp fork
 
-The engine uses only libevhtp's public API, which the fork keeps, and its
-workarounds still apply there: deferred resume, the automatic 100 written
-after the headers hook, and unchecked certificate loading. The fork adds
-HTTP/2 negotiated through ALPN, and the engine pins HTTP/1.1 explicitly on
-both sides:
-- servers answer ALPN with `http/1.1` only;
-- clients offer only `http/1.1`.
+All three test suites pass, valgrind-clean, against both upstream
+criticalstack/libevhtp 1.2.18 and the fork's `develop` branch. To build
+against the fork:
 
-The engine frames bodies and writes 1xx responses itself, which is only
-valid on HTTP/1.1. Both settings are harmless with upstream libevhtp, which
-does no ALPN. HTTP/2 support in the engine itself would build on the fork's
-nghttp2 integration.
+```sh
+# nghttp2 >= 1.60 is required (the fork uses nghttp2_ssize and
+# nghttp2_data_provider2); Ubuntu 24.04 ships 1.59, so build one if needed:
+git clone -b v1.64.0 https://github.com/nghttp2/nghttp2 && cd nghttp2 && mkdir b && cd b
+cmake .. -DENABLE_LIB_ONLY=ON -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=OFF \
+         -DBUILD_STATIC_LIBS=ON -DCMAKE_INSTALL_PREFIX=$HOME/local-ng2 && make install
+
+# the fork
+cd libevhtp && mkdir build && cd build
+PKG_CONFIG_PATH=$HOME/local-ng2/lib/pkgconfig cmake .. -DEVHTP_DISABLE_REGEX=ON \
+         -DCMAKE_INSTALL_PREFIX=$HOME/local-fork && make && make install
+
+# ptcore
+make EVHTP_PREFIX=$HOME/local-fork EXTRA_LIBS=$HOME/local-ng2/lib/libnghttp2.a check
+```
+
+(Use `lib64` in those paths if that is where nghttp2 installs.)
+
+Differences the engine accounts for:
+- **Method enum order.** `htp_method_UNKNOWN` is first in the fork and last
+  upstream, so the engine maps method names through the enumerators by name
+  and never iterates over the enum.
+- **Header layout.** The fork installs `include/evhtp/string.h`, so only
+  `include/` may be on the include path, not `include/evhtp/`. Otherwise
+  `<string.h>` resolves to the fork's header, as an earlier Makefile here
+  allowed.
+- **HTTP/2 through ALPN.** The fork negotiates h2 when offered. The engine
+  frames bodies and writes 1xx responses itself, which is only valid on
+  HTTP/1.1, so it pins ALPN to `http/1.1` on both sides: servers answer only
+  `http/1.1`, clients offer only `http/1.1`. Both are harmless upstream, which
+  does no ALPN. HTTP/2 in the engine itself would build on the fork's nghttp2
+  integration.
+- **Deferred connection free.** The fork's `evhtp_connection_free()` waits for
+  pending output to flush before freeing the bufferevent, without an event
+  callback that would notice the flush failing. The engine therefore drops
+  unsent output when libevhtp frees a server connection because of an error,
+  and when `hc_server_free()` closes connections. That needs
+  `evbuffer_unfreeze()` first: libevent freezes the start of a socket
+  bufferevent's output buffer. Normal closes still flush.
+- **The fork's `msgparser`.** It handles 1xx, pipelined responses and split
+  input correctly, so the engine's 1xx interposer is redundant there but
+  harmless. When a chunk-size or header line is split across reads, libevhtp's
+  read callback logs "ODDITY, resuming when not paused". That's benign: the
+  parser waits for the rest of the line.
 
 ## Tested
 
