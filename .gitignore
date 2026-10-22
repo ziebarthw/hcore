@@ -1,0 +1,7 @@
+# build outputs
+*.o
+/reverse_proxy
+/echo_server
+/full_duplex_client
+/tests/pool_test
+/tests/support_test
