@@ -147,5 +147,10 @@ for P in $(pgrep -f "reverse_proxy .* 808[0-9]( --quiet)?$"); do
 done
 check "no client connections left open" "$down_open" "0"
 check "pooled origin connections all healthy ($up_idle idle)" "$up_bad" "0"
-check "no libevhtp errors" "$(cat $S/p8080.err $S/p8082.err $S/p8083.err $S/p8085.err $S/p8086.err $S/p8087.err $S/echo.err $S/echo_tls.err | grep -c 'ERROR\|shutting down')" "0"
+# "ODDITY, resuming when not paused" is excluded: with ziebarthw/libevhtp's
+# msgparser it is logged whenever a chunk-size or header line is split
+# across reads (the parser waits for the rest; libevhtp's read callback
+# takes that for pipelining and tries to resume an unpaused connection,
+# which is a no-op). Harmless there; stalls would fail the checks above.
+check "no libevhtp errors" "$(cat $S/p8080.err $S/p8082.err $S/p8083.err $S/p8085.err $S/p8086.err $S/p8087.err $S/echo.err $S/echo_tls.err | grep -v 'ODDITY, resuming when not paused' | grep -c 'ERROR\|shutting down')" "0"
 echo "passed=$pass failed=$fail"
