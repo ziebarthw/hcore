@@ -1,0 +1,19 @@
+# Copy to config.mk and edit. config.mk is ignored by git: it is for settings
+# that only make sense on your machine.
+#
+#   cp config.mk.example config.mk
+#
+# Then plain `make`, `make check` etc. use these values. Anything given on the
+# command line (make EVHTP_PREFIX=...) still overrides them.
+
+# Where libevhtp is installed (include/evhtp/ and lib/libevhtp.a below it).
+EVHTP_PREFIX = /usr/local
+
+# Libraries your libevhtp build needs in addition to libevent and OpenSSL:
+#   -lnghttp2   if it was built with HTTP/2 (nghttp2 found at its configure time)
+#   -lonig      if it was built with regex support (oniguruma found)
+# A full path to a library file works too, e.g. /opt/nghttp2/lib/libnghttp2.a
+EXTRA_LIBS =
+
+# Compiler flags for hcore itself (the default is -O2 -g).
+# CFLAGS = -O0 -g
