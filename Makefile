@@ -1,12 +1,18 @@
 # Point EVHTP_PREFIX at a libevhtp install (headers in include/evhtp,
-# libevhtp.a in lib). libevent 2.1 headers/libs must be on the default paths.
+# libevhtp.a in lib). libevent 2.1 and OpenSSL headers/libs must be on the
+# default paths. EXTRA_LIBS adds libraries your libevhtp build needs, e.g.
+# EXTRA_LIBS=-lnghttp2 for a libevhtp with HTTP/2 (ziebarthw/libevhtp).
 EVHTP_PREFIX ?= /usr/local
+EXTRA_LIBS   ?=
 
 CC      ?= cc
 CFLAGS  ?= -O2 -g
 HC_CFLAGS = -std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude
-EVHTP_CFLAGS = -I$(EVHTP_PREFIX)/include -I$(EVHTP_PREFIX)/include/evhtp
-EVHTP_LIBS   = $(EVHTP_PREFIX)/lib/libevhtp.a -levent -levent_openssl -levent_pthreads -lssl -lcrypto -lpthread
+# Only include/, as libevhtp's pkg-config file says: its headers are included
+# as <evhtp/...>, and include/evhtp itself holds names (string.h) that would
+# shadow the system headers.
+EVHTP_CFLAGS = -I$(EVHTP_PREFIX)/include
+EVHTP_LIBS   = $(EVHTP_PREFIX)/lib/libevhtp.a $(EXTRA_LIBS) -levent -levent_openssl -levent_pthreads -lssl -lcrypto -lpthread
 
 all: reverse_proxy echo_server full_duplex_client
 
