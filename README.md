@@ -399,6 +399,14 @@ EVHTP_PREFIX = /opt/evhtp
 EXTRA_LIBS   = -lnghttp2 -lonig
 ```
 
+**Editors (clangd, e.g. VS Code's clangd extension).** Run
+`make compile_commands.json` once in the top directory. It writes the exact
+compile command for every source file, using your `config.mk` settings, so
+clangd finds `include/` and libevhtp's headers. Rerun it after changing
+`config.mk` or adding source files. The file holds this machine's paths and
+is git-ignored. In VS Code, reload the window, or run "clangd: Restart
+language server" from the command palette, to pick it up.
+
 If libevhtp was built with `-DEVHTP_DISABLE_SSL=ON`, the engine still builds
 (drop `-levent_openssl -lssl -lcrypto` from `EVHTP_LIBS`). `https` targets then
 fail with "https is not supported", and `hc_server_enable_tls()` returns -1.
