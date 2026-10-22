@@ -1458,12 +1458,29 @@ cli_fail(hc_client_exchange *cx, const char *reason)
     }
 }
 
+/* Method name -> libevhtp enum, by enumerator name: the numeric order
+ * differs between libevhtp versions (upstream puts htp_method_UNKNOWN last,
+ * the ziebarthw fork first), so never iterate over the enum. */
 static int
 method_from_string(const char *m)
 {
-    for (int i = 0; i < htp_method_UNKNOWN; i++) {
-        if (strcmp(htparser_get_methodstr_m((htp_method)i), m) == 0) {
-            return i;
+    static const struct {
+        const char *name;
+        htp_method  method;
+    } methods[] = {
+        { "GET", htp_method_GET },         { "HEAD", htp_method_HEAD },
+        { "POST", htp_method_POST },       { "PUT", htp_method_PUT },
+        { "DELETE", htp_method_DELETE },   { "OPTIONS", htp_method_OPTIONS },
+        { "PATCH", htp_method_PATCH },     { "TRACE", htp_method_TRACE },
+        { "CONNECT", htp_method_CONNECT }, { "MKCOL", htp_method_MKCOL },
+        { "COPY", htp_method_COPY },       { "MOVE", htp_method_MOVE },
+        { "PROPFIND", htp_method_PROPFIND }, { "PROPPATCH", htp_method_PROPPATCH },
+        { "LOCK", htp_method_LOCK },       { "UNLOCK", htp_method_UNLOCK },
+    };
+
+    for (size_t i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
+        if (strcmp(methods[i].name, m) == 0) {
+            return (int)methods[i].method;
         }
     }
 
