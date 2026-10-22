@@ -1121,12 +1121,32 @@ srv_task_cb(evutil_socket_t fd, short what, void *arg)
     }
 }
 
+/* Discard a bufferevent's unsent output. libevent freezes the start of a
+ * socket bufferevent's output buffer (only the bufferevent may remove data),
+ * so a plain evbuffer_drain() silently does nothing: unfreeze around it. */
+static void
+drop_output(struct bufferevent *bev)
+{
+    struct evbuffer *out = bufferevent_get_output(bev);
+
+    evbuffer_unfreeze(out, 1);
+    evbuffer_drain(out, evbuffer_get_length(out));
+    evbuffer_freeze(out, 1);
+}
+
 static evhtp_res
 srv_conn_fini(evhtp_connection_t *c, void *arg)
 {
     srv_conn *n = arg;
 
-    (void)c;
+    /* Freed because of an error (peer gone, I/O failure): queued output can
+     * no longer be delivered, so drop it. Some libevhtp versions (the
+     * ziebarthw fork) otherwise defer the free until that output flushes,
+     * with no event callback to notice the write failing - the bufferevent
+     * and its socket would never be freed. Normal closes still flush. */
+    if ((c->flags & EVHTP_CONN_FLAG_ERROR) && c->bev) {
+        drop_output(c->bev);
+    }
 
     if (n->prev) {
         n->prev->next = n->next;
@@ -1282,7 +1302,13 @@ hc_server_free(hc_server *s)
         s->closing = 1;
 
         while (s->conns) {
-            evhtp_connection_free(s->conns->c);     /* fini unlinks it */
+            evhtp_connection_t *c = s->conns->c;
+
+            /* Hard close: drop unsent output. Some libevhtp versions (the
+             * ziebarthw fork) defer freeing a connection until its output
+             * has flushed, which needs a loop that will not run again. */
+            drop_output(evhtp_connection_get_bev(c));
+            evhtp_connection_free(c);               /* fini unlinks it */
         }
 
         evhtp_free(s->htp);
