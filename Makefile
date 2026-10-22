@@ -63,6 +63,26 @@ check: all tests/pool_test tests/support_test
 	tests/support_test tests/tls
 	tests/run.sh
 
+# Editor support (clangd, e.g. the VS Code clangd extension): a compilation
+# database listing the exact command for every source file, so the editor
+# finds include/ and libevhtp's headers. It holds this machine's paths
+# (config.mk), so it is git-ignored; rerun after changing config.mk.
+ENGINE_SRCS = src/hc_evhtp.c
+PLAIN_SRCS  = $(filter-out $(ENGINE_SRCS),$(sort $(wildcard src/*.c examples/*.c tests/*.c)))
+
+compile_commands.json: Makefile $(wildcard config.mk)
+	@{ printf '['; sep=''; \
+	   for f in $(ENGINE_SRCS); do \
+	     printf '%s\n  {"directory": "%s", "file": "%s", "command": "%s"}' "$$sep" "$(CURDIR)" "$$f" \
+	       "$(CC) $(HC_CFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE $(EVHTP_CFLAGS) -c $$f"; sep=','; \
+	   done; \
+	   for f in $(PLAIN_SRCS); do \
+	     printf '%s\n  {"directory": "%s", "file": "%s", "command": "%s"}' "$$sep" "$(CURDIR)" "$$f" \
+	       "$(CC) $(HC_CFLAGS) $(CFLAGS) -c $$f"; sep=','; \
+	   done; \
+	   printf '\n]\n'; } > $@
+	@echo "wrote $@ ($(words $(ENGINE_SRCS) $(PLAIN_SRCS)) files)"
+
 clean:
 	rm -f src/*.o examples/*.o reverse_proxy echo_server full_duplex_client tests/pool_test tests/support_test
 
