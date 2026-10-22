@@ -20,7 +20,7 @@ HC_CFLAGS = -std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude
 EVHTP_CFLAGS = -I$(EVHTP_PREFIX)/include
 EVHTP_LIBS   = $(EVHTP_PREFIX)/lib/libevhtp.a $(EXTRA_LIBS) -levent -levent_openssl -levent_pthreads -lssl -lcrypto -lpthread
 
-all: reverse_proxy echo_server full_duplex_client
+all: reverse_proxy echo_server full_duplex_client full_duplex_server
 
 src/hc_evhtp.o: src/hc_evhtp.c include/hc.h include/hc_pool.h
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE $(EVHTP_CFLAGS) -c -o $@ $<
@@ -48,6 +48,9 @@ echo_server: examples/echo_server.o $(HC_OBJS)
 	$(CC) -o $@ $^ $(EVHTP_LIBS)
 
 full_duplex_client: examples/full_duplex_client.o $(HC_OBJS)
+	$(CC) -o $@ $^ $(EVHTP_LIBS)
+
+full_duplex_server: examples/full_duplex_server.o $(HC_OBJS)
 	$(CC) -o $@ $^ $(EVHTP_LIBS)
 
 # Pool unit tests: fake connections, no sockets.
@@ -84,6 +87,6 @@ compile_commands.json: Makefile $(wildcard config.mk)
 	@echo "wrote $@ ($(words $(ENGINE_SRCS) $(PLAIN_SRCS)) files)"
 
 clean:
-	rm -f src/*.o examples/*.o reverse_proxy echo_server full_duplex_client tests/pool_test tests/support_test
+	rm -f src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server tests/pool_test tests/support_test
 
 .PHONY: all clean check

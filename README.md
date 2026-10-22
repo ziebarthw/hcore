@@ -2,10 +2,12 @@
 
 A C99 port of the *shape* of Apache HttpCore 5's async API: exchange
 handlers, a route-based connection pool, a requester, request producers and
-response consumers, interim (1xx) responses and TLS. It comes with ports of
-[`AsyncReverseProxyExample`](https://github.com/apache/httpcomponents-core/blob/rel/v5.1/httpcore5/src/test/java/org/apache/hc/core5/http/examples/AsyncReverseProxyExample.java)
+response consumers, URI-pattern routing, interim (1xx) responses and TLS.
+It comes with ports of three HttpCore examples:
+[`AsyncReverseProxyExample`](https://github.com/apache/httpcomponents-core/blob/rel/v5.1/httpcore5/src/test/java/org/apache/hc/core5/http/examples/AsyncReverseProxyExample.java),
+[`AsyncFullDuplexClientExample`](https://github.com/apache/httpcomponents-core/blob/rel/v5.1/httpcore5/src/test/java/org/apache/hc/core5/http/examples/AsyncFullDuplexClientExample.java)
 and
-[`AsyncFullDuplexClientExample`](https://github.com/apache/httpcomponents-core/blob/rel/v5.1/httpcore5/src/test/java/org/apache/hc/core5/http/examples/AsyncFullDuplexClientExample.java).
+[`AsyncFullDuplexServerExample`](https://github.com/apache/httpcomponents-core/blob/rel/v5.1/httpcore5/src/test/java/org/apache/hc/core5/http/examples/AsyncFullDuplexServerExample.java).
 
 ```
 include/hc.h            the "interfaces" an app implements, channels it calls, hc_host (no libevhtp types)
@@ -17,9 +19,10 @@ src/hc_host.c           hc_host / URI parsing } hc.h only
 src/hc_support.c        producers/consumers   }
 examples/reverse_proxy.c       port of AsyncReverseProxyExample (pooled, http/https origins, relays 1xx)
 examples/full_duplex_client.c  port of AsyncFullDuplexClientExample (producers/consumers, http/https)
+examples/full_duplex_server.c  port of AsyncFullDuplexServerExample (routing, stream listener, http/https)
 examples/echo_server.c         minimal server handler: streams the request body back (http/https)
 tests/pool_test.c       pool + hc_host unit tests with fake connections
-tests/support_test.c    in-process integration tests: support API, TLS, 1xx (HTTP + HTTPS servers)
+tests/support_test.c    in-process integration tests: support API, TLS, 1xx, routing (HTTP + HTTPS servers)
 tests/run.sh            end-to-end tests (curl / client -> proxy -> tests/origin.py, echo_server)
 tests/tls/              self-signed test certificates (localhost, other.example)
 ```
@@ -67,6 +70,8 @@ Java's `Supplier<AsyncServerExchangeHandler>`: one handler per exchange.
 | `AsyncClientExchangeHandler.consumeResponse`  | `hc_client_handler_vtbl.consume_response`  |
 | `AsyncClientExchangeHandler.consumeInformation` | `hc_client_handler_vtbl.consume_information` |
 | `ResponseChannel.sendInformation`             | `hc_response_send_information()`           |
+| `AsyncServerBootstrap.register(uriPattern, supplier)` | `hc_server_register()`             |
+| `Http1StreamListener` (server)                | `hc_server_listener` / `hc_server_set_listener()` |
 | `HttpHost`                                    | `hc_host` (scheme, name, port)             |
 | `consume` / `streamEnd` / `produce`           | `consume` / `stream_end` / `produce`       |
 | `failed` / `releaseResources`                 | `failed` / `release`                       |
@@ -250,6 +255,47 @@ consumer, plugged into the same basic handler.
 
 TLS connections are pooled and reused exactly like plain ones, and full
 duplex works the same over TLS.
+
+## Routing and the full-duplex server
+
+`hc_server_register(server, pattern, factory, arg)` routes requests by path,
+like `AsyncServerBootstrap.register()`, and matches like HttpCore's
+`UriPatternMatcher`:
+- a pattern is an exact path (`/echo`), a prefix (`/api*`), a suffix
+  (`*.html`) or `*`;
+- an exact match wins; otherwise the longest matching pattern wins, and
+  between two of equal length the one ending in `*`;
+- the query string isn't part of the path.
+
+Requests that match nothing go to the factory passed to `hc_server_new()`. If
+that's `NULL`, they get `404 Resource not found`, as from HttpCore's
+bootstrap. Servers that register nothing behave as before.
+
+`hc_server_set_listener()` is the server side of `Http1StreamListener`. It
+reports the request head, the response head, and each exchange that completes
+normally, with whether the connection stays open. Every callback gets the
+client's `address:port`.
+
+`examples/full_duplex_server.c` ports `AsyncFullDuplexServerExample`.
+`/echo` is the only registered route. The response head is sent as soon as
+the request head arrives, carrying the request's entity details, so a
+`Content-Length` request gets a `Content-Length` response with the same
+`Content-Type`. Body bytes are relayed as they arrive, through a buffer that
+starts at 2048 bytes like the Java one; client input is suspended while the
+buffer is full and resumed once `produce()` drains it. The listener prints
+what Java's prints:
+
+```
+Listening on 0.0.0.0:8080
+127.0.0.1:42950 POST /echo HTTP/1.1
+127.0.0.1:42950 HTTP/1.1 200
+127.0.0.1:42950 exchange completed (connection kept alive)
+```
+
+Run it as `full_duplex_server [port] [--tls CERT KEY]`; `--tls` is an
+addition, since the Java example is plain HTTP. With the full-duplex client
+against it, both directions stream at once: 32 MB echoes back byte for
+byte, over HTTP and HTTPS.
 
 ## Full-duplex client
 
@@ -493,8 +539,8 @@ They found one real bug: an expired slot that got a new connection kept its
 old expiry, so the new connection was dropped on its first release. Java's
 `assignConnection` resets the timestamps, and now so does this.
 
-**Integration tests** (`tests/support_test`, 37 checks) run an HTTP and an
-HTTPS server and a requester in one process. They cover:
+**Integration tests** (`tests/support_test`, 65 checks) run HTTP, HTTPS and
+routing servers and a requester in one process. They cover:
 - a string producer and a 3 MB bytes producer round trip;
 - a GET without a body;
 - a buffer consumer over its limit: the callback fails and the connection
@@ -505,11 +551,16 @@ HTTPS server and a requester in one process. They cover:
 - HTTPS round trips with verification and TLS connection reuse;
 - IP-address mismatch;
 - connection refused;
-- bad URIs.
+- bad URIs;
+- routing: exact beats wildcard, prefix and suffix patterns, longest pattern
+  wins, a tie goes to the `*`-ending pattern, the query string is ignored, and
+  unmatched paths get 404;
+- the server listener: one request head, response head and keep-alive
+  completion per request, with the client's address.
 
 **End to end:** `tests/run.sh` (after `make`) runs curl and the full-duplex
 client against the proxy, `echo_server` (HTTP and HTTPS) and a Python origin
-(`tests/origin.py`), 54 checks. Pool behaviour is measured
+(`tests/origin.py`), 59 checks. Pool behaviour is measured
 with a connection counter in the origin:
 - 10 sequential requests share 1 origin connection;
 - the connection is reused after a HEAD and after a streamed 3 MB upload;
@@ -539,6 +590,13 @@ The TLS and 1xx checks cover:
 - the client seeing `100` and `103` (with its `Link` header);
 - the proxy relaying `103` to curl;
 - through the proxy: the proxy's own `100`, then the origin's `103`, then `200`.
+
+The full-duplex server checks cover:
+- 2 x 8 MB full duplex with the ported client on one connection;
+- 8 MB full duplex over HTTPS;
+- curl's 3 MB echo keeping `Content-Length` and `Content-Type`;
+- 404 for unregistered paths;
+- the listener's request, response and completion lines.
 
 Two server regression checks cover bugs that the TLS work exposed:
 - a 2 MB upload with `Expect` to a handler that responds from
