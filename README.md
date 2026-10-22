@@ -1,4 +1,4 @@
-# ptcore: HttpCore-style async exchange handlers in C, on libevhtp
+# hcore: HttpCore-style async exchange handlers in C, on libevhtp
 
 A C99 port of the *shape* of Apache HttpCore 5's async API: exchange
 handlers, a route-based connection pool, a requester, request producers and
@@ -414,7 +414,7 @@ cd libevhtp && mkdir build && cd build
 PKG_CONFIG_PATH=$HOME/local-ng2/lib/pkgconfig cmake .. -DEVHTP_DISABLE_REGEX=ON \
          -DCMAKE_INSTALL_PREFIX=$HOME/local-fork && make && make install
 
-# ptcore
+# hcore
 make EVHTP_PREFIX=$HOME/local-fork EXTRA_LIBS=$HOME/local-ng2/lib/libnghttp2.a check
 ```
 
