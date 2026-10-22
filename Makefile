@@ -10,9 +10,13 @@
 
 EVHTP_PREFIX ?= /usr/local
 EXTRA_LIBS   ?=
-# Where `make install` puts the headers (PREFIX/include) and libhcore.a
-# (PREFIX/lib). DESTDIR is prepended for staged installs (packaging, Docker).
+# Where `make install` puts the headers (PREFIX/include), libhcore.a
+# (PREFIX/lib) and libhcore.pc (PKGCONFIGDIR, for pkg-config and meson's
+# dependency('libhcore')). DESTDIR is prepended for staged installs
+# (packaging, Docker).
 PREFIX       ?= /usr/local
+PKGCONFIGDIR ?= $(PREFIX)/lib/pkgconfig
+HC_VERSION    = 0.1.0
 DESTDIR      ?=
 
 CC      ?= cc
@@ -97,14 +101,38 @@ compile_commands.json: Makefile $(wildcard config.mk)
 	   printf '\n]\n'; } > $@
 	@echo "wrote $@ ($(words $(ENGINE_SRCS) $(PLAIN_SRCS)) files)"
 
-# Copies the public headers and libhcore.a under PREFIX (nothing else). Run it
-# again after changing hcore, so projects using the installed copy see it.
-install: libhcore.a
-	install -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib
+# Copies the public headers, libhcore.a and libhcore.pc under PREFIX (nothing
+# else). Run it again after changing hcore, so projects using the installed
+# copy see it.
+install: libhcore.a libhcore.pc
+	install -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PKGCONFIGDIR)
 	install -m 644 $(HC_HDRS) $(DESTDIR)$(PREFIX)/include
 	install -m 644 libhcore.a $(DESTDIR)$(PREFIX)/lib
+	install -m 644 libhcore.pc $(DESTDIR)$(PKGCONFIGDIR)
+
+# pkg-config file, regenerated on every install because it records PREFIX and
+# EVHTP_PREFIX, which may come from the command line. libhcore.a is a static
+# library, so what it needs from libevhtp, libevent and OpenSSL is in the
+# .private fields: pkg-config --static (and meson with static: true) adds
+# them; a plain lookup gives just -lhcore, for applications that link those
+# libraries themselves.
+libhcore.pc:
+	@printf '%s\n' \
+	  'prefix=$(PREFIX)' \
+	  'includedir=$${prefix}/include' \
+	  'libdir=$${prefix}/lib' \
+	  '' \
+	  'Name: libhcore' \
+	  'Description: HttpCore-style async HTTP/1.1 client and server on libevhtp' \
+	  'Version: $(HC_VERSION)' \
+	  'URL: https://github.com/ziebarthw/hcore' \
+	  'Requires.private: libevent libevent_openssl libevent_pthreads openssl' \
+	  'Cflags: -I$${includedir}' \
+	  'Libs: -L$${libdir} -lhcore' \
+	  'Libs.private: $(EVHTP_PREFIX)/lib/libevhtp.a $(EXTRA_LIBS) -lpthread' > $@
+	@echo "wrote $@"
 
 clean:
-	rm -f libhcore.a src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server tests/pool_test tests/support_test
+	rm -f libhcore.a libhcore.pc src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server tests/pool_test tests/support_test
 
-.PHONY: all clean check install
+.PHONY: all clean check install libhcore.pc

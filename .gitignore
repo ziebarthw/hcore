@@ -1,6 +1,7 @@
 # build outputs
 *.o
 /libhcore.a
+/libhcore.pc
 /reverse_proxy
 /echo_server
 /full_duplex_client

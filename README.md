@@ -446,19 +446,24 @@ EXTRA_LIBS   = -lnghttp2 -lonig
 ```
 
 **Installing for another project.** `make install` copies `hc.h`,
-`hc_pool.h` and `hc_support.h` to `$(PREFIX)/include` and `libhcore.a` to
-`$(PREFIX)/lib`. `PREFIX` defaults to `/usr/local`; set it in `config.mk` to
-install next to your application's other dependencies:
+`hc_pool.h` and `hc_support.h` to `$(PREFIX)/include`, `libhcore.a` to
+`$(PREFIX)/lib`, and a pkg-config file, `libhcore.pc`, to
+`$(PREFIX)/lib/pkgconfig` (or `PKGCONFIGDIR`). `PREFIX` defaults to
+`/usr/local`; set it in `config.mk` to install next to your application's
+other dependencies:
 
 ```make
 PREFIX = /home/me/projects/myapp-deps
 ```
 
-The application then compiles with `-I$(PREFIX)/include` and links with
-`-L$(PREFIX)/lib -lhcore`, followed by libevhtp and its libraries (the
-`EVHTP_LIBS` line in the Makefile, plus `EXTRA_LIBS`). Rerun `make install`
-after changing hcore; nothing updates the installed copy otherwise.
-`DESTDIR` is prepended for staged installs (`make install DESTDIR=/tmp/stage`).
+With that directory on `PKG_CONFIG_PATH`, meson finds it with
+`dependency('libhcore')`, and `pkg-config --cflags --libs libhcore` gives
+`-I$(PREFIX)/include -L$(PREFIX)/lib -lhcore`. The application also links
+libevhtp, libevent and OpenSSL; `pkg-config --static --libs libhcore` (or
+meson's `static: true`) adds them for applications that do not already.
+Rerun `make install` after changing hcore; nothing updates the installed copy
+otherwise. `DESTDIR` is prepended for staged installs
+(`make install DESTDIR=/tmp/stage`).
 
 **Editors (clangd, e.g. VS Code's clangd extension).** Run
 `make compile_commands.json` once in the top directory. It writes the exact
