@@ -8,11 +8,13 @@ WRAP=${WRAP:-}
 pass=0; fail=0
 check() { if [ "$2" == "$3" ]; then echo "PASS $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
 
-pkill -x reverse_proxy; pkill -x echo_server; sleep 0.3
+pkill -x reverse_proxy; pkill -x echo_server; pkill -f "[f]ull_duplex_server 92"; sleep 0.3
 pgrep -f "^python3 .*origin.py 9000" >/dev/null || { python3 $HERE/origin.py 9000 </dev/null >/dev/null 2>&1 & sleep 0.5; }
 $B/echo_server 9001 </dev/null >/dev/null 2>$S/echo.err &
 $B/echo_server --tls $HERE/tls/localhost.pem $HERE/tls/localhost.key 9443 </dev/null >/dev/null 2>$S/echo_tls.err &
 $B/echo_server --tls $HERE/tls/other.pem $HERE/tls/other.key 9444 </dev/null >/dev/null 2>>$S/echo_tls.err &
+$WRAP $B/full_duplex_server 9200 </dev/null >$S/fds.log 2>$S/fds.err &
+$WRAP $B/full_duplex_server 9201 --tls $HERE/tls/localhost.pem $HERE/tls/localhost.key </dev/null >$S/fds_tls.log 2>$S/fds_tls.err &
 $WRAP $B/reverse_proxy --cafile $HERE/tls/localhost.pem https://localhost:9443 8086 </dev/null >$S/p8086.log 2>$S/p8086.err &
 $WRAP $B/reverse_proxy https://localhost:9443 8087 --quiet </dev/null >/dev/null 2>$S/p8087.err &
 $WRAP $B/reverse_proxy 127.0.0.1:9000 8080 </dev/null >$S/p8080.log 2>$S/p8080.err &
@@ -21,7 +23,7 @@ $WRAP $B/reverse_proxy 127.0.0.1:9999 8083 --quiet </dev/null >/dev/null 2>$S/p8
 # wait until each port accepts connections (valgrind startup can be slow)
 wait_ports() { local p i; for p in "$@"; do for i in $(seq 1 600); do
   (exec 3<>/dev/tcp/127.0.0.1/$p) 2>/dev/null && break; sleep 0.1; done; done; }
-wait_ports 9000 9001 9443 9444 8080 8082 8083 8086 8087
+wait_ports 9000 9001 9443 9444 8080 8082 8083 8086 8087 9200 9201
 [ -f $S/up.bin ] || head -c 3000000 /dev/urandom > $S/up.bin
 UPSUM="$(stat -c%s $S/up.bin) $(sha256sum < $S/up.bin | cut -d' ' -f1)"
 T=${T:-10}
@@ -132,6 +134,15 @@ check "1xx: proxy relays 103 to curl" "$(curl -s -m$T -i http://127.0.0.1:8080/e
 out=$($FD --expect http://127.0.0.1:8080/early 2>&1)
 check "1xx: via proxy: proxy's 100, origin's 103, then 200" "$(echo "$out" | grep -o -- '->[0-9]*' | tr '\n' ' ')" "->100 ->103 ->200 "
 
+# --- full-duplex server (examples/full_duplex_server.c) --------------------
+out=$($FD -n 2 --duplex 8 http://127.0.0.1:9200/echo 2>&1); rc=$?
+check "server: 2 x 8MB full duplex with the ported client, one connection" "$rc $(echo "$out" | grep -c 'echo verified') $(echo "$out" | grep -c 'full duplex: both') $(echo "$out" | grep -c 'reusing pooled')" "0 2 2 1"
+out=$($FD --duplex 8 --cafile $CA https://localhost:9201/echo 2>&1); rc=$?
+check "server: 8MB full duplex over https" "$rc $(echo "$out" | grep -c 'echo verified') $(echo "$out" | grep -c 'full duplex: both')" "0 1 1"
+check "server: curl 3MB echo keeps Content-Length and Content-Type" "$(curl -s -m$T -D $S/fds.hdr -H 'Content-Type: application/x-test' --data-binary @$S/up.bin http://127.0.0.1:9200/echo | sha256sum | cut -d' ' -f1) $(tr -d '\r' < $S/fds.hdr | grep -ciE '^content-length: 3000000|^content-type: application/x-test')" "${UPSUM#* } 2"
+check "server: unregistered path -> 404 Resource not found" "$(curl -s -m$T -w ' %{http_code}' http://127.0.0.1:9200/other)" "Resource not found 404"
+check "server: listener logs request, response, keep-alive completion" "$(grep -c ' POST /echo HTTP/1.1$' $S/fds.log) $(grep -c ' HTTP/1.1 200$' $S/fds.log) $(grep -c 'exchange completed (connection kept alive)' $S/fds.log) $(grep -c ' GET /other HTTP/1.1$' $S/fds.log) $(grep -c ' HTTP/1.1 404$' $S/fds.log)" "3 3 4 1 1"
+
 # Client-side connections must all be gone. Pooled origin connections may
 # stay open, but only healthy (ESTABLISHED): CLOSE_WAIT would mean the pool
 # failed to notice the origin closing an idle connection.
@@ -152,5 +163,5 @@ check "pooled origin connections all healthy ($up_idle idle)" "$up_bad" "0"
 # across reads (the parser waits for the rest; libevhtp's read callback
 # takes that for pipelining and tries to resume an unpaused connection,
 # which is a no-op). Harmless there; stalls would fail the checks above.
-check "no libevhtp errors" "$(cat $S/p8080.err $S/p8082.err $S/p8083.err $S/p8085.err $S/p8086.err $S/p8087.err $S/echo.err $S/echo_tls.err | grep -v 'ODDITY, resuming when not paused' | grep -c 'ERROR\|shutting down')" "0"
+check "no libevhtp errors" "$(cat $S/p8080.err $S/p8082.err $S/p8083.err $S/p8085.err $S/p8086.err $S/p8087.err $S/echo.err $S/echo_tls.err $S/fds.err $S/fds_tls.err | grep -v 'ODDITY, resuming when not paused' | grep -c 'ERROR\|shutting down')" "0"
 echo "passed=$pass failed=$fail"
