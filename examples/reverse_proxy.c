@@ -43,7 +43,7 @@ static hc_host     target;              /* Java: HttpHost targetHost */
 static char        target_authority[300];
 
 static void
-log_line(const char *fmt, ...)
+log_line_at(const char *func, int line, const char *fmt, ...)
 {
     char      date[64];
     time_t    now = time(NULL);
@@ -56,13 +56,16 @@ log_line(const char *fmt, ...)
 
     gmtime_r(&now, &tm);
     strftime(date, sizeof(date), "%a, %d %b %Y %H:%M:%S GMT", &tm);
-    printf("%s | ", date);
+    printf("%s | %s:%d | ", date, func, line);
     va_start(ap, fmt);
     vprintf(fmt, ap);
     va_end(ap);
     putchar('\n');
     fflush(stdout);
 }
+
+/* Every log_line(...) call records where it was made. */
+#define log_line(...) log_line_at(__func__, __LINE__, __VA_ARGS__)
 
 /* ------------------------------------------------------------------------ */
 /* ProxyBuffer: a growable FIFO of bytes                                    */
