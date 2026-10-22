@@ -16,6 +16,7 @@
 
 #define HTTP_PORT  9301
 #define HTTPS_PORT 9302
+#define ROUTER_PORT 9303
 
 static hc_reactor   *R;
 static hc_requester *RQ;
@@ -115,6 +116,99 @@ srv_factory(void *arg)
 }
 
 /* ======================================================================== */
+/* Router test server: each route answers with its own tag                  */
+/* ======================================================================== */
+
+typedef struct tag_handler {
+    hc_server_handler base;
+    const char       *tag;
+} tag_handler;
+
+static void
+tag_handle_request(hc_server_handler *self, hc_server_exchange *ex,
+                   const hc_request_head *head, const hc_entity *entity,
+                   hc_response_channel *rc)
+{
+    (void)ex;
+    (void)head;
+    (void)entity;
+    hc_response_send_simple(rc, 200, "text/plain", ((tag_handler *)(void *)self)->tag, 0);
+}
+
+static void
+tag_consume(hc_server_handler *self, const void *data, size_t len)
+{
+    (void)self;
+    (void)data;
+    (void)len;
+}
+
+static void
+tag_stream_end(hc_server_handler *self, const hc_headers *trailers)
+{
+    (void)self;
+    (void)trailers;
+}
+
+static void
+tag_release(hc_server_handler *self)
+{
+    free(self);
+}
+
+static const hc_server_handler_vtbl tag_vtbl = {
+    .handle_request = tag_handle_request,
+    .consume        = tag_consume,
+    .stream_end     = tag_stream_end,
+    .release        = tag_release,
+};
+
+static hc_server_handler *
+tag_factory(void *arg)
+{
+    tag_handler *t = calloc(1, sizeof(*t));
+
+    t->base.vtbl = &tag_vtbl;
+    t->tag       = arg;
+
+    return &t->base;
+}
+
+static struct {
+    int  requests, responses, completed, kept_alive;
+    int  last_status;
+    char last_target[128];
+    char remote[64];
+} L;
+
+static void
+l_request(void *arg, const char *remote, const hc_request_head *head)
+{
+    (void)arg;
+    L.requests++;
+    snprintf(L.last_target, sizeof(L.last_target), "%s", head->target);
+    snprintf(L.remote, sizeof(L.remote), "%s", remote);
+}
+
+static void
+l_response(void *arg, const char *remote, const hc_response_head *head)
+{
+    (void)arg;
+    (void)remote;
+    L.responses++;
+    L.last_status = head->status;
+}
+
+static void
+l_complete(void *arg, const char *remote, int keep_alive)
+{
+    (void)arg;
+    (void)remote;
+    L.completed++;
+    L.kept_alive += keep_alive;
+}
+
+/* ======================================================================== */
 /* Cases                                                                    */
 /* ======================================================================== */
 
@@ -131,6 +225,8 @@ static outcome   O;
 static int       step;
 static hc_timer *last_timer;
 static void      next_case(void);
+static void      next_route_case(void);
+static int       route_step;      /* > 0 while the routing cases run */
 
 static void
 next_case_cb(void *arg)
@@ -232,6 +328,11 @@ next_case(void)
         last_timer = NULL;
     }
 
+    if (route_step > 0) {
+        next_route_case();
+        return;
+    }
+
     switch (step++) {
         case 0:
             puts("string producer POST, buffer consumer");
@@ -317,9 +418,85 @@ next_case(void)
             puts("bad URI is rejected up front");
             CHECK(hc_request_producer_new("GET", "ftp://x/", hc_string_entity_producer_new("x", NULL)) == NULL);
             CHECK(hc_request_producer_new("GET", "no-scheme", NULL) == NULL);
-            hc_reactor_stop(R);
+            puts("routing: exact, prefix, suffix, longest wins, tie -> '*' suffix pattern, 404");
+            next_route_case();
             break;
     }
+}
+
+/* Routing: one request per entry, checked as each completes. */
+static const struct {
+    const char *path;
+    int         status;
+    const char *body;
+} ROUTES[] = {
+    { "/echo",          200, "exact" },     /* exact beats the "/e*" wildcard     */
+    { "/echo?x=1",      200, "exact" },     /* query is not part of the path      */
+    { "/echoes",        200, "e-prefix" },  /* "/e*"                              */
+    { "/api/x",         200, "api" },       /* "/api*"                            */
+    { "/api/v2/x",      200, "v2" },        /* "/api/v2*" is longer than "/api*"  */
+    { "/f.txt",         200, "txt" },       /* "*.txt"                            */
+    { "/api/x.txt",     200, "api" },       /* tie "/api*" vs "*.txt": '*'-ending */
+    { "/nothing/here",  404, "Resource not found" },
+};
+
+static void
+route_completed(void *arg, const hc_message *m)
+{
+    size_t      len;
+    const char *body = hc_buffer_entity_consumer_data(m->body, &len);
+    int         i    = route_step - 1;
+
+    (void)arg;
+    CHECK(m->head->status == ROUTES[i].status);
+    CHECK(strcmp(body, ROUTES[i].body) == 0);
+
+    if (m->head->status != ROUTES[i].status || strcmp(body, ROUTES[i].body) != 0) {
+        fprintf(stderr, "    route %s -> %d \"%s\"\n", ROUTES[i].path, m->head->status, body);
+    }
+}
+
+static void
+route_failed(void *arg, const char *reason)
+{
+    (void)arg;
+    fprintf(stderr, "    route %s failed: %s\n", ROUTES[route_step - 1].path, reason);
+    CHECK(!"route request failed");
+}
+
+static void
+route_released(void *arg)
+{
+    (void)arg;
+    last_timer = hc_timer_new(R, next_case_cb, NULL);
+    hc_timer_start(last_timer, 0);
+}
+
+static void
+next_route_case(void)
+{
+    static const hc_result_callback cb = { route_completed, route_failed, NULL, route_released, NULL };
+    char                            url[128];
+    hc_request_producer            *req;
+
+    if (route_step == (int)(sizeof(ROUTES) / sizeof(ROUTES[0]))) {
+        int n = route_step;
+
+        /* listener: one request head, response head and normal completion
+         * per request, all on one kept-alive connection */
+        CHECK(L.requests == n && L.responses == n && L.completed == n);
+        CHECK(L.kept_alive == n);
+        CHECK(L.last_status == 404 && strcmp(L.last_target, "/nothing/here") == 0);
+        CHECK(strncmp(L.remote, "127.0.0.1:", 10) == 0);
+        step = -1;                          /* done */
+        hc_reactor_stop(R);
+        return;
+    }
+
+    snprintf(url, sizeof(url), "http://127.0.0.1:%d%s", ROUTER_PORT, ROUTES[route_step++].path);
+    req = hc_request_producer_new("GET", url, NULL);
+    CHECK(req && hc_requester_execute_request(RQ, req, hc_buffer_entity_consumer_new(0),
+                                              10000, &cb) == 0);
 }
 
 static void
@@ -334,7 +511,8 @@ main(int argc, char **argv)
 {
     char                cert[512], key[512];
     hc_requester_config cfg = { 0 };
-    hc_server          *http, *https;
+    hc_server          *http, *https, *router;
+    hc_server_listener  lis = { l_request, l_response, l_complete, NULL };
     hc_timer           *start;
 
     if (argc < 2) {
@@ -356,10 +534,18 @@ main(int argc, char **argv)
     RQ    = hc_requester_new(R, &cfg);
     http  = hc_server_new(R, srv_factory, NULL);
     https = hc_server_new(R, srv_factory, NULL);
+    router = hc_server_new(R, NULL, NULL);          /* unmatched: 404 */
+    hc_server_set_listener(router, &lis);
 
     if (!RQ || hc_server_listen(http, "127.0.0.1", HTTP_PORT) != 0 ||
         hc_server_enable_tls(https, cert, key) != 0 ||
-        hc_server_listen(https, "127.0.0.1", HTTPS_PORT) != 0) {
+        hc_server_listen(https, "127.0.0.1", HTTPS_PORT) != 0 ||
+        hc_server_register(router, "/echo", tag_factory, "exact") != 0 ||
+        hc_server_register(router, "/e*", tag_factory, "e-prefix") != 0 ||
+        hc_server_register(router, "/api*", tag_factory, "api") != 0 ||
+        hc_server_register(router, "/api/v2*", tag_factory, "v2") != 0 ||
+        hc_server_register(router, "*.txt", tag_factory, "txt") != 0 ||
+        hc_server_listen(router, "127.0.0.1", ROUTER_PORT) != 0) {
         fprintf(stderr, "setup failed\n");
         return 1;
     }
@@ -373,10 +559,11 @@ main(int argc, char **argv)
     hc_requester_free(RQ);
     hc_server_free(http);
     hc_server_free(https);
+    hc_server_free(router);
     hc_reactor_free(R);
     free(big);
 
     printf("%d checks, %d failed\n", checks, failures);
 
-    return failures || step != 11 ? 1 : 0;
+    return failures || step != -1 ? 1 : 0;
 }

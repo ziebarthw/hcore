@@ -631,14 +631,23 @@ typedef struct srv_conn {
     evhtp_connection_t *c;
 } srv_conn;
 
+typedef struct srv_route {
+    char                     *pattern;
+    hc_server_handler_factory factory;
+    void                     *arg;
+} srv_route;
+
 struct hc_server {
     hc_reactor               *r;
     evhtp_t                  *htp;
     srv_conn                 *conns;
     int                       closing;  /* hc_server_free() in progress */
     evhtp_callback_t         *cb;
-    hc_server_handler_factory factory;
+    hc_server_handler_factory factory;  /* unmatched requests (NULL: 404) */
     void                     *arg;
+    srv_route                *routes;
+    size_t                    n_routes;
+    hc_server_listener        listener;
 #ifdef HC_HAVE_TLS
     evhtp_ssl_cfg_t           tls;     /* libevhtp keeps a pointer to it */
 #endif
@@ -666,7 +675,9 @@ struct hc_server_exchange {
     int                  failed;
     int                  released;
     int                  input_suspended;
+    int                  keep_alive;   /* connection stays open afterwards */
     const char          *reason;
+    char                 remote[64];   /* "address:port", for the listener */
 };
 
 static void srv_task_cb(evutil_socket_t fd, short what, void *arg);
@@ -689,8 +700,9 @@ srv_try_finalize(hc_server_exchange *ex)
         return;
     }
 
-    ex->finished = 1;
-    bev          = evhtp_connection_get_bev(ex->conn);
+    ex->finished   = 1;
+    ex->keep_alive = (ex->req->flags & EVHTP_REQ_FLAG_KEEPALIVE) != 0;
+    bev            = evhtp_connection_get_bev(ex->conn);
 
     evhtp_send_reply_end(ex->req);
 
@@ -742,6 +754,10 @@ hc_response_send(hc_response_channel *rc, const hc_response_head *head,
 
     ex->resp_started = 1;
     bev              = evhtp_connection_get_bev(ex->conn);
+
+    if (ex->srv->listener.on_response_head) {
+        ex->srv->listener.on_response_head(ex->srv->listener.arg, ex->remote, head);
+    }
 
     headers_to_evhtp(head->headers, req->headers_out);
 
@@ -997,6 +1013,167 @@ srv_on_complete(evhtp_request_t *req, void *arg)
     }
 }
 
+/* --- routing (Java: UriPatternMatcher) -------------------------------- */
+
+static int
+route_matches(const char *pattern, const char *path)
+{
+    size_t pl = strlen(pattern), l = strlen(path);
+
+    if (strcmp(pattern, "*") == 0) {
+        return 1;
+    }
+
+    if (pattern[0] == '*') {                            /* "*suffix" */
+        return l >= pl - 1 && strcmp(path + l - (pl - 1), pattern + 1) == 0;
+    }
+
+    if (pl > 0 && pattern[pl - 1] == '*') {             /* "prefix*" */
+        return strncmp(path, pattern, pl - 1) == 0;
+    }
+
+    return 0;                                           /* exact: see below */
+}
+
+static const srv_route *
+route_lookup(const hc_server *s, const char *path)
+{
+    const srv_route *best = NULL;
+
+    for (size_t i = 0; i < s->n_routes; i++) {
+        if (strcmp(s->routes[i].pattern, path) == 0) {
+            return &s->routes[i];                       /* exact match wins */
+        }
+    }
+
+    for (size_t i = 0; i < s->n_routes; i++) {
+        const char *p = s->routes[i].pattern;
+        size_t      n = strlen(p);
+
+        if (!route_matches(p, path)) {
+            continue;
+        }
+
+        if (best == NULL || strlen(best->pattern) < n ||
+            (strlen(best->pattern) == n && p[n - 1] == '*')) {
+            best = &s->routes[i];
+        }
+    }
+
+    return best;
+}
+
+int
+hc_server_register(hc_server *s, const char *uri_pattern,
+                   hc_server_handler_factory factory, void *arg)
+{
+    srv_route *r;
+    char      *copy;
+
+    if (uri_pattern == NULL || *uri_pattern == '\0' || factory == NULL) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < s->n_routes; i++) {          /* replace */
+        if (strcmp(s->routes[i].pattern, uri_pattern) == 0) {
+            s->routes[i].factory = factory;
+            s->routes[i].arg     = arg;
+            return 0;
+        }
+    }
+
+    if ((copy = malloc(strlen(uri_pattern) + 1)) == NULL ||
+        (r = realloc(s->routes, (s->n_routes + 1) * sizeof(*r))) == NULL) {
+        free(copy);
+        return -1;
+    }
+
+    strcpy(copy, uri_pattern);
+    s->routes                   = r;
+    s->routes[s->n_routes].pattern = copy;
+    s->routes[s->n_routes].factory = factory;
+    s->routes[s->n_routes].arg     = arg;
+    s->n_routes++;
+
+    return 0;
+}
+
+void
+hc_server_set_listener(hc_server *s, const hc_server_listener *l)
+{
+    if (l) {
+        s->listener = *l;
+    } else {
+        memset(&s->listener, 0, sizeof(s->listener));
+    }
+}
+
+/* Unmatched requests without a default factory: "404 Resource not found",
+ * as HttpCore's server bootstrap answers. Stateless, so one shared instance;
+ * any request body is read and discarded. */
+static void
+nf_handle_request(hc_server_handler *self, hc_server_exchange *ex,
+                  const hc_request_head *head, const hc_entity *entity,
+                  hc_response_channel *rc)
+{
+    (void)self;
+    (void)ex;
+    (void)head;
+    (void)entity;
+    hc_response_send_simple(rc, 404, "text/plain", "Resource not found", 0);
+}
+
+static void
+nf_consume(hc_server_handler *self, const void *data, size_t len)
+{
+    (void)self;
+    (void)data;
+    (void)len;
+}
+
+static void
+nf_stream_end(hc_server_handler *self, const hc_headers *trailers)
+{
+    (void)self;
+    (void)trailers;
+}
+
+static void
+nf_release(hc_server_handler *self)
+{
+    (void)self;
+}
+
+static const hc_server_handler_vtbl not_found_vtbl = {
+    .handle_request = nf_handle_request,
+    .consume        = nf_consume,
+    .stream_end     = nf_stream_end,
+    .release        = nf_release,
+};
+
+static hc_server_handler not_found_handler = { &not_found_vtbl };
+
+static void
+format_remote(const evhtp_connection_t *c, char *buf, size_t len)
+{
+    const struct sockaddr *sa = c ? c->saddr : NULL;
+    char                   ip[INET6_ADDRSTRLEN];
+
+    if (sa && sa->sa_family == AF_INET) {
+        const struct sockaddr_in *in = (const struct sockaddr_in *)(const void *)sa;
+
+        evutil_inet_ntop(AF_INET, &in->sin_addr, ip, sizeof(ip));
+        snprintf(buf, len, "%s:%u", ip, (unsigned)ntohs(in->sin_port));
+    } else if (sa && sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)(const void *)sa;
+
+        evutil_inet_ntop(AF_INET6, &in6->sin6_addr, ip, sizeof(ip));
+        snprintf(buf, len, "[%s]:%u", ip, (unsigned)ntohs(in6->sin6_port));
+    } else {
+        snprintf(buf, len, "unknown");
+    }
+}
+
 static evhtp_res
 srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
 {
@@ -1020,7 +1197,20 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
     ex->conn   = evhtp_request_get_connection(req);
     ex->rc.ex  = ex;
     ex->task   = event_new(srv->r->base, -1, 0, srv_task_cb, ex);
-    ex->h      = srv->factory(srv->arg);
+
+    {
+        const srv_route *route = route_lookup(srv, req->uri->path->full);
+
+        if (route) {
+            ex->h = route->factory(route->arg);
+        } else if (srv->factory) {
+            ex->h = srv->factory(srv->arg);
+        } else {
+            ex->h = &not_found_handler;
+        }
+    }
+
+    format_remote(ex->conn, ex->remote, sizeof(ex->remote));
 
     if (ex->task == NULL || ex->h == NULL) {
         if (ex->task) {
@@ -1075,6 +1265,10 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
     head.version   = req->proto == EVHTP_PROTO_10 ? 10 : 11;
     head.headers   = h;
 
+    if (srv->listener.on_request_head) {
+        srv->listener.on_request_head(srv->listener.arg, ex->remote, &head);
+    }
+
     ex->h->vtbl->handle_request(ex->h, ex, &head, entity, &ex->rc);
 
     free(target);
@@ -1111,6 +1305,11 @@ srv_task_cb(evutil_socket_t fd, short what, void *arg)
 
             if (ex->failed && ex->h->vtbl->failed) {
                 ex->h->vtbl->failed(ex->h, ex->reason);
+            }
+
+            if (ex->finished && !ex->failed && ex->srv->listener.on_exchange_complete) {
+                ex->srv->listener.on_exchange_complete(ex->srv->listener.arg, ex->remote,
+                                                       ex->keep_alive);
             }
 
             ex->h->vtbl->release(ex->h);
@@ -1316,6 +1515,11 @@ hc_server_free(hc_server *s)
         free(s->tls.pemfile);
         free(s->tls.privfile);
 #endif
+        for (size_t i = 0; i < s->n_routes; i++) {
+            free(s->routes[i].pattern);
+        }
+
+        free(s->routes);
         free(s);
     }
 }
