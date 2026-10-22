@@ -20,6 +20,8 @@
  *     consumeInformation(response)         ->consume_information()
  *   ResponseChannel.sendResponse()       hc_response_send()
  *   ResponseChannel.sendInformation()    hc_response_send_information()
+ *   AsyncServerBootstrap.register()      hc_server_register()
+ *   Http1StreamListener (server)         hc_server_listener
  *   HttpHost                             hc_host
  *   HttpAsyncRequester (pooled)          hc_requester_* (pool: hc_pool.h)
  *   RequestChannel.sendRequest()         hc_request_send()
@@ -233,8 +235,32 @@ void hc_server_abort(hc_server_exchange *ex);
 
 typedef struct hc_server hc_server;
 
+/* factory handles every request that no hc_server_register() pattern
+ * matches. It may be NULL: unmatched requests then get
+ * "404 Resource not found" (as with Java's AsyncServerBootstrap). */
 hc_server *hc_server_new(hc_reactor *r, hc_server_handler_factory factory,
                          void *arg);
+
+/* Route requests by URI path. Java: AsyncServerBootstrap.register(uriPattern,
+ * supplier), matched like UriPatternMatcher: a pattern is an exact path
+ * ("/echo"), a prefix ("/api*"), a suffix ("*.html") or "*". An exact match
+ * wins; otherwise the longest matching pattern, and between equally long
+ * ones the pattern ending in '*'. The query string is not part of the path.
+ * Registering the same pattern again replaces it. Returns -1 on failure. */
+int        hc_server_register(hc_server *s, const char *uri_pattern,
+                              hc_server_handler_factory factory, void *arg);
+
+/* Java: Http1StreamListener on the server. remote is "address:port". Every
+ * callback is optional. on_exchange_complete reports exchanges that finished
+ * normally, and whether the connection stays open for another request. */
+typedef struct hc_server_listener {
+    void (*on_request_head)(void *arg, const char *remote, const hc_request_head *head);
+    void (*on_response_head)(void *arg, const char *remote, const hc_response_head *head);
+    void (*on_exchange_complete)(void *arg, const char *remote, int keep_alive);
+    void  *arg;
+} hc_server_listener;
+
+void       hc_server_set_listener(hc_server *s, const hc_server_listener *l);
 /* Serve HTTPS: PEM certificate (chain) and private key files. Call before
  * hc_server_listen(). Returns -1 if they cannot be loaded or TLS support
  * was not compiled in. */
