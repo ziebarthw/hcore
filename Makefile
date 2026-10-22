@@ -10,6 +10,10 @@
 
 EVHTP_PREFIX ?= /usr/local
 EXTRA_LIBS   ?=
+# Where `make install` puts the headers (PREFIX/include) and libhcore.a
+# (PREFIX/lib). DESTDIR is prepended for staged installs (packaging, Docker).
+PREFIX       ?= /usr/local
+DESTDIR      ?=
 
 CC      ?= cc
 CFLAGS  ?= -O2 -g
@@ -20,7 +24,7 @@ HC_CFLAGS = -std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude
 EVHTP_CFLAGS = -I$(EVHTP_PREFIX)/include
 EVHTP_LIBS   = $(EVHTP_PREFIX)/lib/libevhtp.a $(EXTRA_LIBS) -levent -levent_openssl -levent_pthreads -lssl -lcrypto -lpthread
 
-all: reverse_proxy echo_server full_duplex_client full_duplex_server
+all: libhcore.a reverse_proxy echo_server full_duplex_client full_duplex_server
 
 src/hc_evhtp.o: src/hc_evhtp.c include/hc.h include/hc_pool.h
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE $(EVHTP_CFLAGS) -c -o $@ $<
@@ -36,6 +40,13 @@ src/hc_support.o: src/hc_support.c include/hc_support.h include/hc.h
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -c -o $@ $<
 
 HC_OBJS = src/hc_evhtp.o src/hc_pool.o src/hc_host.o src/hc_support.o
+HC_HDRS = include/hc.h include/hc_pool.h include/hc_support.h
+
+# The library other projects link with: -lhcore, then libevhtp and what it needs
+# (the EVHTP_LIBS list below).
+libhcore.a: $(HC_OBJS)
+	rm -f $@
+	$(AR) rcs $@ $^
 
 # The examples compile against hc*.h only - no libevhtp/libevent/OpenSSL headers.
 examples/%.o: examples/%.c include/hc.h include/hc_pool.h include/hc_support.h
@@ -86,7 +97,14 @@ compile_commands.json: Makefile $(wildcard config.mk)
 	   printf '\n]\n'; } > $@
 	@echo "wrote $@ ($(words $(ENGINE_SRCS) $(PLAIN_SRCS)) files)"
 
-clean:
-	rm -f src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server tests/pool_test tests/support_test
+# Copies the public headers and libhcore.a under PREFIX (nothing else). Run it
+# again after changing hcore, so projects using the installed copy see it.
+install: libhcore.a
+	install -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib
+	install -m 644 $(HC_HDRS) $(DESTDIR)$(PREFIX)/include
+	install -m 644 libhcore.a $(DESTDIR)$(PREFIX)/lib
 
-.PHONY: all clean check
+clean:
+	rm -f libhcore.a src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server tests/pool_test tests/support_test
+
+.PHONY: all clean check install

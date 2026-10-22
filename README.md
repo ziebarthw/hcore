@@ -445,6 +445,21 @@ EVHTP_PREFIX = /opt/evhtp
 EXTRA_LIBS   = -lnghttp2 -lonig
 ```
 
+**Installing for another project.** `make install` copies `hc.h`,
+`hc_pool.h` and `hc_support.h` to `$(PREFIX)/include` and `libhcore.a` to
+`$(PREFIX)/lib`. `PREFIX` defaults to `/usr/local`; set it in `config.mk` to
+install next to your application's other dependencies:
+
+```make
+PREFIX = /home/me/projects/myapp-deps
+```
+
+The application then compiles with `-I$(PREFIX)/include` and links with
+`-L$(PREFIX)/lib -lhcore`, followed by libevhtp and its libraries (the
+`EVHTP_LIBS` line in the Makefile, plus `EXTRA_LIBS`). Rerun `make install`
+after changing hcore; nothing updates the installed copy otherwise.
+`DESTDIR` is prepended for staged installs (`make install DESTDIR=/tmp/stage`).
+
 **Editors (clangd, e.g. VS Code's clangd extension).** Run
 `make compile_commands.json` once in the top directory. It writes the exact
 compile command for every source file, using your `config.mk` settings, so
