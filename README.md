@@ -386,6 +386,19 @@ make EVHTP_PREFIX=$HOME/local
 make EVHTP_PREFIX=$HOME/local check     # unit + integration + end-to-end tests
 ```
 
+**Local settings.** Rather than editing the Makefile, copy
+`config.mk.example` to `config.mk` and set `EVHTP_PREFIX`, `EXTRA_LIBS` and
+`CFLAGS` there. `config.mk` is read when it exists and is ignored by git, so
+machine-specific paths stay out of the repository. A plain `make` or
+`make check` then uses those values, and anything given on the command line
+still overrides them. For example, for a libevhtp built with HTTP/2 and regex
+support and installed under `/opt/evhtp`:
+
+```make
+EVHTP_PREFIX = /opt/evhtp
+EXTRA_LIBS   = -lnghttp2 -lonig
+```
+
 If libevhtp was built with `-DEVHTP_DISABLE_SSL=ON`, the engine still builds
 (drop `-levent_openssl -lssl -lcrypto` from `EVHTP_LIBS`). `https` targets then
 fail with "https is not supported", and `hc_server_enable_tls()` returns -1.

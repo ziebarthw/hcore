@@ -2,6 +2,12 @@
 # libevhtp.a in lib). libevent 2.1 and OpenSSL headers/libs must be on the
 # default paths. EXTRA_LIBS adds libraries your libevhtp build needs, e.g.
 # EXTRA_LIBS=-lnghttp2 for a libevhtp with HTTP/2 (ziebarthw/libevhtp).
+#
+# Local settings: put them in config.mk (see config.mk.example). It is read
+# if present and ignored by git, so machine-specific paths never end up in
+# the repository. Values given on the make command line still win.
+-include config.mk
+
 EVHTP_PREFIX ?= /usr/local
 EXTRA_LIBS   ?=
 
