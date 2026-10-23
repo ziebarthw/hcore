@@ -88,6 +88,7 @@ Java's `Supplier<AsyncServerExchangeHandler>`: one handler per exchange.
 | `ResponseChannel.sendInformation`             | `hc_response_send_information()`           |
 | `AsyncServerBootstrap.register(uriPattern, supplier)` | `hc_server_register()`             |
 | `Http1StreamListener` (server)                | `hc_server_listener` / `hc_server_set_listener()` |
+| `EndpointDetails.getRemoteAddress/getLocalAddress` | `hc_server_exchange_remote_address()` / `_local_address()` |
 | `HttpHost`                                    | `hc_host` (scheme, name, port)             |
 | `consume` / `streamEnd` / `produce`           | `consume` / `stream_end` / `produce`       |
 | `failed` / `releaseResources`                 | `failed` / `release`                       |
@@ -587,7 +588,7 @@ They found one real bug: an expired slot that got a new connection kept its
 old expiry, so the new connection was dropped on its first release. Java's
 `assignConnection` resets the timestamps, and now so does this.
 
-**Integration tests** (`tests/support_test`, 65 checks) run HTTP, HTTPS and
+**Integration tests** (`tests/support_test`, 68 checks) run HTTP, HTTPS and
 routing servers and a requester in one process. They cover:
 - a string producer and a 3 MB bytes producer round trip;
 - a GET without a body;
@@ -605,6 +606,9 @@ routing servers and a requester in one process. They cover:
   unmatched paths get 404;
 - the server listener: one request head, response head and keep-alive
   completion per request, with the client's address.
+- the exchange's addresses: the client's matches what the listener reports,
+  the local one is the server's, and a short buffer is handled like
+  `getpeername()`.
 
 **End to end:** `tests/run.sh` (after `make`) runs curl and the full-duplex
 client against the proxy, `echo_server` (HTTP and HTTPS) and a Python origin
