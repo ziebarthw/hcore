@@ -645,9 +645,11 @@ routing servers and a requester in one process. They cover:
   the local one is the server's, and a short buffer is handled like
   `getpeername()`.
 
-**Embedding** (`tests/embed_test`, 19 checks) runs hcore on an event base the
+**Embedding** (`tests/embed_test`, 21 checks) runs hcore on an event base the
 test owns, with a client thread using plain sockets so it sees exactly what
 goes over the wire. It covers:
+- a client's `Connection: close` getting its response and then an
+  immediate close;
 - a second server binding the same port with `reuse_port` (and failing
   without it);
 - a paused server holding a new connection until it resumes;
