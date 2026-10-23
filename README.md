@@ -25,7 +25,23 @@ tests/pool_test.c       pool + hc_host unit tests with fake connections
 tests/support_test.c    in-process integration tests: support API, TLS, 1xx, routing (HTTP + HTTPS servers)
 tests/run.sh            end-to-end tests (curl / client -> proxy -> tests/origin.py, echo_server)
 tests/tls/              self-signed test certificates (localhost, other.example)
+third_party/htstring/   copy of htstring: htstring_t string views, used by the engine's routing
+scripts/update-htstring.sh  refreshes that copy from GitHub
 ```
+
+**htstring.** `third_party/htstring` is a copy of
+[ziebarthw/htstring](https://github.com/ziebarthw/htstring), the non-owning
+string views (`htstring_t`) that the ziebarthw/libevhtp fork's parser is built
+on. hcore uses only its header-only `htstring.h`, and only internally:
+- it is not part of hcore's API;
+- nothing of it is linked into hcore;
+- `make install` does not install it.
+
+Because the copy is in the repository, a fresh clone builds with nothing extra
+to install. To update it, run `scripts/update-htstring.sh`, which takes the
+latest `main`, or pass a tag or branch name. Then review with `git diff`, run
+`make check` and commit. `third_party/htstring/UPSTREAM` records which commit
+the copy came from.
 
 ## The pattern: interfaces as vtables
 
