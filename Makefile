@@ -21,7 +21,10 @@ DESTDIR      ?=
 
 CC      ?= cc
 CFLAGS  ?= -O2 -g
-HC_CFLAGS = -std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude
+# third_party/htstring: htstring_t, vendored with git subtree (see README).
+# Only its header-only htstring.h is used, so nothing of it is linked or
+# installed, and it comes before libevhtp's include path.
+HC_CFLAGS = -std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude -Ithird_party/htstring/include
 # Only include/, as libevhtp's pkg-config file says: its headers are included
 # as <evhtp/...>, and older versions of the ziebarthw/libevhtp fork put a
 # string.h in include/evhtp that would shadow the system header.
@@ -30,7 +33,7 @@ EVHTP_LIBS   = $(EVHTP_PREFIX)/lib/libevhtp.a $(EXTRA_LIBS) -levent -levent_open
 
 all: libhcore.a reverse_proxy echo_server full_duplex_client full_duplex_server
 
-src/hc_evhtp.o: src/hc_evhtp.c include/hc.h include/hc_pool.h
+src/hc_evhtp.o: src/hc_evhtp.c include/hc.h include/hc_pool.h third_party/htstring/include/htstring/htstring.h
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE $(EVHTP_CFLAGS) -c -o $@ $<
 
 # Engine-independent parts: hc.h (and hc_pool.h) only.
