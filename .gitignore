@@ -7,6 +7,7 @@
 /full_duplex_client
 /tests/pool_test
 /tests/support_test
+/tests/embed_test
 
 # local build settings (see config.mk.example)
 /config.mk

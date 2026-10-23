@@ -66,6 +66,12 @@ extern "C" {
 typedef struct hc_reactor hc_reactor;
 
 hc_reactor *hc_reactor_new(void);
+/* A reactor on an event loop the application already runs - e.g. one per
+ * worker thread. |event_base| is a libevent struct event_base *; it stays the
+ * application's: it keeps running the loop (don't call hc_reactor_run()), and
+ * hc_reactor_free() leaves the base alone. Everything hcore does for this
+ * reactor then happens in that loop's thread. */
+hc_reactor *hc_reactor_new_on_base(void *event_base);
 int         hc_reactor_run(hc_reactor *r);           /* blocks until stopped */
 void        hc_reactor_stop(hc_reactor *r);          /* safe from callbacks  */
 void        hc_reactor_free(hc_reactor *r);
@@ -278,6 +284,33 @@ void       hc_server_set_listener(hc_server *s, const hc_server_listener *l);
 int        hc_server_enable_tls(hc_server *s, const char *cert_file, const char *key_file);
 int        hc_server_listen(hc_server *s, const char *addr, uint16_t port);
 void       hc_server_free(hc_server *s);
+
+/* hc_server_listen() with socket options. NULL options = defaults. */
+typedef struct hc_listen_options {
+    int backlog;        /* listen() backlog; 0: 1024                          */
+    int reuse_port;     /* SO_REUSEPORT: several servers - one per thread -   */
+                        /* listen on the same address; the kernel spreads     */
+                        /* new connections between them                       */
+    int defer_accept;   /* TCP_DEFER_ACCEPT: wake up only once data arrives   */
+} hc_listen_options;
+
+int    hc_server_listen_opts(hc_server *s, const char *addr, uint16_t port,
+                             const hc_listen_options *opts);
+/* Close the listening socket. Open connections carry on. */
+void   hc_server_unlisten(hc_server *s);
+/* Stop / restart accepting new connections; the socket stays bound. Return
+ * 0, or -1 when the server isn't listening. */
+int    hc_server_pause_accept(hc_server *s);
+int    hc_server_resume_accept(hc_server *s);
+/*
+ * Graceful drain: stop accepting, close idle keep-alive connections now, and
+ * close every other connection once its current exchange is complete (a
+ * response not yet started gets "Connection: close"). Nothing is cut off.
+ * Watch hc_server_connection_count() reach 0, then free the server.
+ * hc_server_resume_accept() ends a drain (e.g. a rolled-back reload).
+ */
+void   hc_server_drain(hc_server *s);
+size_t hc_server_connection_count(const hc_server *s);
 
 /* ------------------------------------------------------------------------ */
 /* Client side: AsyncClientExchangeHandler                                  */

@@ -67,10 +67,11 @@ struct hc_reactor {
     struct event_base *base;
     struct evdns_base *dns;
     struct event      *sig[2];
+    int                owns_base;  /* 0: hc_reactor_new_on_base() */
 };
 
-hc_reactor *
-hc_reactor_new(void)
+static hc_reactor *
+reactor_new(struct event_base *base)
 {
     hc_reactor *r = calloc(1, sizeof(*r));
 
@@ -80,7 +81,11 @@ hc_reactor_new(void)
 
     signal(SIGPIPE, SIG_IGN);
 
-    if ((r->base = event_base_new()) == NULL) {
+    if (base) {
+        r->base = base;
+    } else if ((r->base = event_base_new()) != NULL) {
+        r->owns_base = 1;
+    } else {
         free(r);
         return NULL;
     }
@@ -93,6 +98,18 @@ hc_reactor_new(void)
     }
 
     return r;
+}
+
+hc_reactor *
+hc_reactor_new(void)
+{
+    return reactor_new(NULL);
+}
+
+hc_reactor *
+hc_reactor_new_on_base(void *event_base)
+{
+    return event_base ? reactor_new(event_base) : NULL;
 }
 
 int
@@ -223,7 +240,10 @@ hc_reactor_free(hc_reactor *r)
         evdns_base_free(r->dns, 0);
     }
 
-    event_base_free(r->base);
+    if (r->owns_base) {
+        event_base_free(r->base);
+    }
+
     free(r);
 }
 
@@ -650,7 +670,11 @@ struct hc_server {
     hc_reactor               *r;
     evhtp_t                  *htp;
     srv_conn                 *conns;
+    size_t                    n_conns;
     int                       closing;  /* hc_server_free() in progress */
+    int                       draining; /* hc_server_drain(): no more keep-alive */
+    struct hc_server_exchange *exchanges; /* live exchanges (drain: busy connections) */
+    struct event             *drain_ev; /* closes idle connections, from the loop */
     evhtp_callback_t         *cb;
     hc_server_handler_factory factory;  /* unmatched requests (NULL: 404) */
     void                     *arg;
@@ -668,6 +692,7 @@ struct hc_response_channel {
 
 struct hc_server_exchange {
     hc_server           *srv;
+    struct hc_server_exchange *prev, *next;  /* srv->exchanges */
     evhtp_request_t     *req;          /* NULL once libevhtp has freed it */
     evhtp_connection_t  *conn;         /* valid while req != NULL         */
     hc_server_handler   *h;
@@ -715,6 +740,11 @@ srv_try_finalize(hc_server_exchange *ex)
     }
 
     ex->finished   = 1;
+
+    if (ex->srv->draining) {
+        ex->req->flags &= ~EVHTP_REQ_FLAG_KEEPALIVE;    /* close once flushed */
+    }
+
     ex->keep_alive = (ex->req->flags & EVHTP_REQ_FLAG_KEEPALIVE) != 0;
     bev            = evhtp_connection_get_bev(ex->conn);
 
@@ -778,8 +808,8 @@ hc_response_send(hc_response_channel *rc, const hc_response_head *head,
     /* libevhtp writes its own Connection header from the keep-alive flag. */
     conn_hdr = hc_headers_get(head->headers, "connection");
 
-    if (conn_hdr && has_token(conn_hdr, "close")) {
-        req->flags &= ~EVHTP_REQ_FLAG_KEEPALIVE;
+    if ((conn_hdr && has_token(conn_hdr, "close")) || ex->srv->draining) {
+        req->flags &= ~EVHTP_REQ_FLAG_KEEPALIVE;    /* "Connection: close" */
     }
 
     if (entity == NULL) {
@@ -1310,6 +1340,12 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
         return EVHTP_RES_SERVUNAVAIL;
     }
 
+    ex->next = srv->exchanges;              /* unlinked in srv_task_cb */
+    if (srv->exchanges) {
+        srv->exchanges->prev = ex;
+    }
+    srv->exchanges = ex;
+
     /* Re-point the per-request hooks at this exchange. */
     evhtp_request_set_hook(req, evhtp_hook_on_read, (evhtp_hook)srv_on_read, ex);
     evhtp_request_set_hook(req, evhtp_hook_on_error, (evhtp_hook)srv_on_error, ex);
@@ -1404,6 +1440,15 @@ srv_task_cb(evutil_socket_t fd, short what, void *arg)
             ex->h->vtbl->release(ex->h);
         }
 
+        if (ex->prev) {
+            ex->prev->next = ex->next;
+        } else {
+            ex->srv->exchanges = ex->next;
+        }
+        if (ex->next) {
+            ex->next->prev = ex->prev;
+        }
+
         event_free(ex->task);
         free(ex);
     }
@@ -1446,6 +1491,7 @@ srv_conn_fini(evhtp_connection_t *c, void *arg)
         n->next->prev = n->prev;
     }
 
+    n->srv->n_conns--;
     free(n);
 
     return EVHTP_RES_OK;
@@ -1470,6 +1516,7 @@ srv_post_accept(evhtp_connection_t *c, void *arg)
     }
 
     s->conns = n;
+    s->n_conns++;
     evhtp_connection_set_hook(c, evhtp_hook_on_connection_fini, (evhtp_hook)srv_conn_fini, n);
 
     return EVHTP_RES_OK;
@@ -1579,13 +1626,132 @@ hc_server_enable_tls(hc_server *s, const char *cert_file, const char *key_file)
 int
 hc_server_listen(hc_server *s, const char *addr, uint16_t port)
 {
-    return evhtp_bind_socket(s->htp, addr, port, 1024);
+    return hc_server_listen_opts(s, addr, port, NULL);
+}
+
+int
+hc_server_listen_opts(hc_server *s, const char *addr, uint16_t port,
+                      const hc_listen_options *opts)
+{
+    int backlog = opts && opts->backlog > 0 ? opts->backlog : 1024;
+
+    if (opts && opts->reuse_port) {
+        evhtp_enable_flag(s->htp, EVHTP_FLAG_ENABLE_REUSEPORT);
+    }
+
+    if (opts && opts->defer_accept) {
+        evhtp_enable_flag(s->htp, EVHTP_FLAG_ENABLE_DEFER_ACCEPT);
+    }
+
+    return evhtp_bind_socket(s->htp, addr, port, backlog);
+}
+
+void
+hc_server_unlisten(hc_server *s)
+{
+    if (s && s->htp->server) {
+        evhtp_unbind_socket(s->htp);
+        s->htp->server = NULL;
+    }
+}
+
+int
+hc_server_pause_accept(hc_server *s)
+{
+    return s && s->htp->server ? evconnlistener_disable(s->htp->server) : -1;
+}
+
+int
+hc_server_resume_accept(hc_server *s)
+{
+    if (s == NULL) {
+        return -1;
+    }
+
+    s->draining = 0;
+    return s->htp->server ? evconnlistener_enable(s->htp->server) : -1;
+}
+
+/* From the loop, not from the caller's stack: the caller may be inside one of
+ * these connections' callbacks. */
+static void
+srv_drain_cb(evutil_socket_t fd, short what, void *arg)
+{
+    hc_server *s = arg;
+    srv_conn  *n, *next;
+
+    (void)fd;
+    (void)what;
+
+    if (!s->draining) {
+        return;                         /* resumed before we ran */
+    }
+
+    for (n = s->conns; n; n = next) {
+        evhtp_connection_t *c    = n->c;
+        hc_server_exchange *busy = NULL;
+
+        next = n->next;                 /* freeing c unlinks n */
+
+        /* Busy while one of our exchanges still has its request: libevhtp
+         * frees the request once the response has gone out. (Not
+         * c->request: some libevhtp versions keep an empty one on idle
+         * keep-alive connections.) Drains are rare; the scan is fine. */
+        for (hc_server_exchange *ex = s->exchanges; ex; ex = ex->next) {
+            if (ex->conn == c && ex->req) {
+                busy = ex;
+                break;
+            }
+        }
+
+        if (busy == NULL) {
+            /* Idle: between keep-alive requests, or a request whose head
+             * hasn't fully arrived - like any server closing an idle
+             * keep-alive connection, the client retries. */
+            drop_output(evhtp_connection_get_bev(c));
+            evhtp_connection_free(c);
+        } else if (busy->finished) {
+            /* Finished before the drain, still flushing: don't let
+             * libevhtp keep it alive for another request. */
+            busy->req->flags &= ~EVHTP_REQ_FLAG_KEEPALIVE;
+        }
+        /* Otherwise the exchange is under way: srv_try_finalize() closes it. */
+    }
+}
+
+void
+hc_server_drain(hc_server *s)
+{
+    if (s == NULL) {
+        return;
+    }
+
+    s->draining = 1;
+    hc_server_pause_accept(s);
+
+    if (s->drain_ev == NULL) {
+        s->drain_ev = event_new(s->r->base, -1, 0, srv_drain_cb, s);
+    }
+
+    if (s->drain_ev) {
+        event_active(s->drain_ev, EV_TIMEOUT, 0);
+    }
+}
+
+size_t
+hc_server_connection_count(const hc_server *s)
+{
+    return s ? s->n_conns : 0;
 }
 
 void
 hc_server_free(hc_server *s)
 {
     if (s) {
+        if (s->drain_ev) {
+            event_free(s->drain_ev);
+        }
+
         evhtp_unbind_socket(s->htp);
         s->closing = 1;
 
