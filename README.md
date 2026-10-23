@@ -23,6 +23,7 @@ examples/full_duplex_server.c  port of AsyncFullDuplexServerExample (routing, st
 examples/echo_server.c         minimal server handler: streams the request body back (http/https)
 tests/pool_test.c       pool + hc_host unit tests with fake connections
 tests/support_test.c    in-process integration tests: support API, TLS, 1xx, routing (HTTP + HTTPS servers)
+tests/embed_test.c      hcore in the application's event loop: reuse_port, pause/resume accept, graceful drain
 tests/run.sh            end-to-end tests (curl / client -> proxy -> tests/origin.py, echo_server)
 tests/tls/              self-signed test certificates (localhost, other.example)
 third_party/htstring/   copy of htstring: htstring_t string views, used by the engine's routing
@@ -363,6 +364,40 @@ engine returns the finished connection to the pool synchronously, before
 that `release()` returns, so the next lease always finds it idle and reuse
 doesn't depend on event ordering.
 
+## Embedding: your event loop, several threads, graceful drain
+
+An application that already runs libevent loops, one per worker thread for
+example, can run hcore inside them, with every thread listening on the same
+port:
+
+```c
+hc_reactor *r = hc_reactor_new_on_base(thread_event_base);   /* not owned */
+hc_server  *s = hc_server_new(r, factory, arg);
+hc_listen_options o = { .backlog = 1024, .reuse_port = 1, .defer_accept = 1 };
+hc_server_listen_opts(s, "0.0.0.0", 8080, &o);               /* in each thread */
+```
+
+- **Who runs the loop:** the application does. Don't call `hc_reactor_run()`.
+  `hc_reactor_free()` leaves the base alone. Everything hcore does for that
+  reactor happens in the thread running that loop.
+- **`reuse_port`:** sets `SO_REUSEPORT`. Every thread's server binds the same
+  address, and the kernel spreads new connections between them.
+- **Accepting:** `hc_server_pause_accept()` and `hc_server_resume_accept()`
+  stop and restart accepting; the socket stays bound. `hc_server_unlisten()`
+  closes it.
+- **Graceful drain, for a config reload or shutdown:** call
+  `hc_server_drain()`. It stops accepting, closes idle keep-alive connections
+  immediately, and closes every other connection once its current exchange
+  is complete. A response that hasn't started yet carries
+  `Connection: close`, and nothing is cut off.
+- **When the drain is done:** `hc_server_connection_count()` reaches 0, and
+  the server can then be freed. `hc_server_resume_accept()` cancels a drain,
+  for example when a reload is rolled back.
+
+A connection whose request head is still arriving counts as idle. Like any
+server closing an idle keep-alive connection, it is closed, and the client
+retries.
+
 ## How the engine maps onto libevhtp
 
 | hc.h event                    | libevhtp mechanism                                                   |
@@ -609,6 +644,21 @@ routing servers and a requester in one process. They cover:
 - the exchange's addresses: the client's matches what the listener reports,
   the local one is the server's, and a short buffer is handled like
   `getpeername()`.
+
+**Embedding** (`tests/embed_test`, 19 checks) runs hcore on an event base the
+test owns, with a client thread using plain sockets so it sees exactly what
+goes over the wire. It covers:
+- a second server binding the same port with `reuse_port` (and failing
+  without it);
+- a paused server holding a new connection until it resumes;
+- a drain: an idle keep-alive connection closes at once; a response not yet
+  started carries `Connection: close` and the connection then closes; a
+  response already under way completes and then closes;
+- the connection count reaching 0, and a resume ending the drain;
+- the base still working after `hc_reactor_free()`.
+
+Breaking any of the three drain rules fails the matching check, against
+both libevhtps.
 
 **End to end:** `tests/run.sh` (after `make`) runs curl and the full-duplex
 client against the proxy, `echo_server` (HTTP and HTTPS) and a Python origin
