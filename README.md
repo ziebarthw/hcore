@@ -453,12 +453,12 @@ make EVHTP_PREFIX=$HOME/local check     # unit + integration + end-to-end tests
 `CFLAGS` there. `config.mk` is read when it exists and is ignored by git, so
 machine-specific paths stay out of the repository. A plain `make` or
 `make check` then uses those values, and anything given on the command line
-still overrides them. For example, for a libevhtp built with HTTP/2 and regex
-support and installed under `/opt/evhtp`:
+still overrides them. For example, for the ziebarthw/libevhtp fork built with
+HTTP/2 and regex support, with it and htstring installed under `/opt/evhtp`:
 
 ```make
 EVHTP_PREFIX = /opt/evhtp
-EXTRA_LIBS   = -lnghttp2 -lonig
+EXTRA_LIBS   = /opt/evhtp/lib/libhtstring.a -lnghttp2 -lonig
 ```
 
 **Installing for another project.** `make install` copies `hc.h`,
@@ -512,16 +512,28 @@ git clone -b v1.64.0 https://github.com/nghttp2/nghttp2 && cd nghttp2 && mkdir b
 cmake .. -DENABLE_LIB_ONLY=ON -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=OFF \
          -DBUILD_STATIC_LIBS=ON -DCMAKE_INSTALL_PREFIX=$HOME/local-ng2 && make install
 
+# htstring (https://github.com/ziebarthw/htstring): the fork's URI parser
+# and header tokenizer live there now
+git clone https://github.com/ziebarthw/htstring && cd htstring
+make check && make install PREFIX=$HOME/local-fork
+
 # the fork
 cd libevhtp && mkdir build && cd build
-PKG_CONFIG_PATH=$HOME/local-ng2/lib/pkgconfig cmake .. -DEVHTP_DISABLE_REGEX=ON \
-         -DCMAKE_INSTALL_PREFIX=$HOME/local-fork && make && make install
+PKG_CONFIG_PATH=$HOME/local-ng2/lib/pkgconfig:$HOME/local-fork/lib/pkgconfig \
+    cmake .. -DEVHTP_DISABLE_REGEX=ON -DCMAKE_INSTALL_PREFIX=$HOME/local-fork && make && make install
 
-# hcore
-make EVHTP_PREFIX=$HOME/local-fork EXTRA_LIBS=$HOME/local-ng2/lib/libnghttp2.a check
+# hcore: libevhtp.a needs libhtstring.a, listed first in EXTRA_LIBS
+make EVHTP_PREFIX=$HOME/local-fork \
+     EXTRA_LIBS="$HOME/local-fork/lib/libhtstring.a $HOME/local-ng2/lib/libnghttp2.a" check
 ```
 
 (Use `lib64` in those paths if that is where nghttp2 installs.)
+
+Without `libhtstring.a` in `EXTRA_LIBS`, linking fails with undefined
+references to `parse_uri_view` and `parsed_uri_get_host_port`. Fork versions
+from before htstring was split out need only nghttp2. hcore's own copy of
+htstring, in `third_party/htstring`, is used for compiling only, and doesn't
+supply these: they live in htstring's library, not in its header.
 
 Differences the engine accounts for:
 - **Method enum order.** `htp_method_UNKNOWN` is first in the fork and last

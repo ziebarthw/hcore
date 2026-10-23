@@ -10,6 +10,8 @@
 EVHTP_PREFIX = /usr/local
 
 # Libraries your libevhtp build needs in addition to libevent and OpenSSL:
+#   -lhtstring  for the ziebarthw/libevhtp fork since it uses htstring
+#               (https://github.com/ziebarthw/htstring); list it first
 #   -lnghttp2   if it was built with HTTP/2 (nghttp2 found at its configure time)
 #   -lonig      if it was built with regex support (oniguruma found)
 # A full path to a library file works too, e.g. /opt/nghttp2/lib/libnghttp2.a
