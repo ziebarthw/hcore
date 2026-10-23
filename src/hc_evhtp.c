@@ -27,6 +27,7 @@
  */
 #include "hc.h"
 #include "hc_pool.h"
+#include "htstring/htstring.h"     /* third_party/htstring */
 
 #include <errno.h>
 #include <time.h>
@@ -631,8 +632,16 @@ typedef struct srv_conn {
     evhtp_connection_t *c;
 } srv_conn;
 
+/* A registered pattern, classified once at registration so a lookup is only
+ * length and byte comparisons: "*" (any), "*suffix", "prefix*", or a path
+ * that only matches exactly. */
+typedef enum { ROUTE_EXACT, ROUTE_PREFIX, ROUTE_SUFFIX, ROUTE_ANY } route_kind;
+
 typedef struct srv_route {
-    char                     *pattern;
+    char                     *pattern;      /* owned copy */
+    htstring_t                whole;        /* all of pattern */
+    htstring_t                stem;         /* pattern without its '*' */
+    route_kind                kind;
     hc_server_handler_factory factory;
     void                     *arg;
 } srv_route;
@@ -1015,48 +1024,62 @@ srv_on_complete(evhtp_request_t *req, void *arg)
 
 /* --- routing (Java: UriPatternMatcher) -------------------------------- */
 
-static int
-route_matches(const char *pattern, const char *path)
+static void
+route_classify(srv_route *r)
 {
-    size_t pl = strlen(pattern), l = strlen(path);
+    r->whole = htstring_ctor(r->pattern, strlen(r->pattern));
+    r->stem  = r->whole;
 
-    if (strcmp(pattern, "*") == 0) {
-        return 1;
+    if (r->whole.len == 1 && r->pattern[0] == '*') {
+        r->kind = ROUTE_ANY;
+    } else if (r->pattern[0] == '*') {
+        r->kind = ROUTE_SUFFIX;
+        htstring_consume(&r->stem, 1);
+    } else if (r->pattern[r->whole.len - 1] == '*') {
+        r->kind = ROUTE_PREFIX;
+        r->stem.len--;
+    } else {
+        r->kind = ROUTE_EXACT;
+    }
+}
+
+/* Wildcard match; exact matches are checked separately, before these. */
+static int
+route_matches(const srv_route *r, htstring_t path)
+{
+    switch (r->kind) {
+    case ROUTE_ANY:    return 1;
+    case ROUTE_SUFFIX: return htstring_has_suffix(path, r->stem);
+    case ROUTE_PREFIX: return htstring_has_prefix(path, r->stem);
+    case ROUTE_EXACT:  break;
     }
 
-    if (pattern[0] == '*') {                            /* "*suffix" */
-        return l >= pl - 1 && strcmp(path + l - (pl - 1), pattern + 1) == 0;
-    }
-
-    if (pl > 0 && pattern[pl - 1] == '*') {             /* "prefix*" */
-        return strncmp(path, pattern, pl - 1) == 0;
-    }
-
-    return 0;                                           /* exact: see below */
+    return 0;
 }
 
 static const srv_route *
-route_lookup(const hc_server *s, const char *path)
+route_lookup(const hc_server *s, const char *path_cstr)
 {
+    htstring_t       path = htstring_ctor(path_cstr, strlen(path_cstr));
     const srv_route *best = NULL;
 
     for (size_t i = 0; i < s->n_routes; i++) {
-        if (strcmp(s->routes[i].pattern, path) == 0) {
+        if (htstring_equals(s->routes[i].whole, path)) {
             return &s->routes[i];                       /* exact match wins */
         }
     }
 
     for (size_t i = 0; i < s->n_routes; i++) {
-        const char *p = s->routes[i].pattern;
-        size_t      n = strlen(p);
+        const srv_route *r = &s->routes[i];
 
-        if (!route_matches(p, path)) {
+        if (!route_matches(r, path)) {
             continue;
         }
 
-        if (best == NULL || strlen(best->pattern) < n ||
-            (strlen(best->pattern) == n && p[n - 1] == '*')) {
-            best = &s->routes[i];
+        /* the longest pattern; on equal length, the one ending in '*' */
+        if (best == NULL || best->whole.len < r->whole.len ||
+            (best->whole.len == r->whole.len && htstring_has_suffix(r->whole, HTSTRING_LIT("*")))) {
+            best = r;
         }
     }
 
@@ -1075,7 +1098,7 @@ hc_server_register(hc_server *s, const char *uri_pattern,
     }
 
     for (size_t i = 0; i < s->n_routes; i++) {          /* replace */
-        if (strcmp(s->routes[i].pattern, uri_pattern) == 0) {
+        if (htstring_equals(s->routes[i].whole, htstring_ctor(uri_pattern, strlen(uri_pattern)))) {
             s->routes[i].factory = factory;
             s->routes[i].arg     = arg;
             return 0;
@@ -1093,6 +1116,7 @@ hc_server_register(hc_server *s, const char *uri_pattern,
     s->routes[s->n_routes].pattern = copy;
     s->routes[s->n_routes].factory = factory;
     s->routes[s->n_routes].arg     = arg;
+    route_classify(&s->routes[s->n_routes]);
     s->n_routes++;
 
     return 0;
