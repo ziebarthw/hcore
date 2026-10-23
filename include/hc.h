@@ -50,6 +50,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -232,6 +233,16 @@ void hc_server_suspend_input(hc_server_exchange *ex);
 void hc_server_resume_input(hc_server_exchange *ex);
 /* Drop the client connection. ->failed() and ->release() follow. */
 void hc_server_abort(hc_server_exchange *ex);
+
+/* The exchange's connection: the client's address (remote), and our end of
+ * it, the address the client connected to (local). Like getpeername() and
+ * getsockname(): copies at most *len bytes into out and sets *len to the
+ * address's full length (a struct sockaddr_storage always fits). Returns 0,
+ * or -1 when the address is unknown. Callable from handle_request() until
+ * release(); the remote address stays available even after the connection
+ * has gone. */
+int hc_server_exchange_remote_address(hc_server_exchange *ex, struct sockaddr *out, socklen_t *len);
+int hc_server_exchange_local_address(hc_server_exchange *ex, struct sockaddr *out, socklen_t *len);
 
 typedef struct hc_server hc_server;
 

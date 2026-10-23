@@ -10,6 +10,8 @@
 #include "hc_pool.h"
 #include "hc_support.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -124,12 +126,56 @@ typedef struct tag_handler {
     const char       *tag;
 } tag_handler;
 
+/* What hc_server_exchange_remote/local_address() reported, per request. */
+static struct {
+    int  calls, ok;
+    char remote[64], local[64];
+} A;
+
+static void
+sockaddr_str(const struct sockaddr_in *sin, char *buf, size_t len)
+{
+    char ip[INET_ADDRSTRLEN];
+
+    inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
+    snprintf(buf, len, "%s:%u", ip, (unsigned)ntohs(sin->sin_port));
+}
+
+static void
+record_addresses(hc_server_exchange *ex)
+{
+    struct sockaddr_storage remote, local;
+    struct sockaddr_in      small;
+    socklen_t               rlen = sizeof(remote), llen = sizeof(local), slen = 4;
+    int                     ok;
+
+    A.calls++;
+    ok = hc_server_exchange_remote_address(ex, (struct sockaddr *)&remote, &rlen) == 0 &&
+         hc_server_exchange_local_address(ex, (struct sockaddr *)&local, &llen) == 0 &&
+         remote.ss_family == AF_INET && rlen == sizeof(struct sockaddr_in) &&
+         local.ss_family == AF_INET && llen == sizeof(struct sockaddr_in);
+
+    /* like getpeername(): a short buffer gets a prefix, *len the full size */
+    ok = ok && hc_server_exchange_remote_address(ex, (struct sockaddr *)&small, &slen) == 0 &&
+         slen == sizeof(struct sockaddr_in);
+    /* asking again uses the cached local address */
+    llen = sizeof(local);
+    ok = ok && hc_server_exchange_local_address(ex, (struct sockaddr *)&local, &llen) == 0;
+    ok = ok && hc_server_exchange_remote_address(ex, NULL, &rlen) == -1;
+
+    if (ok) {
+        A.ok++;
+        sockaddr_str((struct sockaddr_in *)&remote, A.remote, sizeof(A.remote));
+        sockaddr_str((struct sockaddr_in *)&local, A.local, sizeof(A.local));
+    }
+}
+
 static void
 tag_handle_request(hc_server_handler *self, hc_server_exchange *ex,
                    const hc_request_head *head, const hc_entity *entity,
                    hc_response_channel *rc)
 {
-    (void)ex;
+    record_addresses(ex);
     (void)head;
     (void)entity;
     hc_response_send_simple(rc, 200, "text/plain", ((tag_handler *)(void *)self)->tag, 0);
@@ -488,6 +534,18 @@ next_route_case(void)
         CHECK(L.kept_alive == n);
         CHECK(L.last_status == 404 && strcmp(L.last_target, "/nothing/here") == 0);
         CHECK(strncmp(L.remote, "127.0.0.1:", 10) == 0);
+
+        /* exchange addresses: every handler saw both; the remote one is the
+         * client the listener reported, the local one this server */
+        {
+            char local_expected[32];
+
+            snprintf(local_expected, sizeof(local_expected), "127.0.0.1:%d", ROUTER_PORT);
+            CHECK(A.calls == n - 1 && A.ok == A.calls);   /* the 404 has no tag handler */
+            CHECK(strcmp(A.remote, L.remote) == 0);
+            CHECK(strcmp(A.local, local_expected) == 0);
+            printf("  exchange addresses: remote %s, local %s\n", A.remote, A.local);
+        }
         step = -1;                          /* done */
         hc_reactor_stop(R);
         return;

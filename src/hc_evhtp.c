@@ -687,6 +687,11 @@ struct hc_server_exchange {
     int                  keep_alive;   /* connection stays open afterwards */
     const char          *reason;
     char                 remote[64];   /* "address:port", for the listener */
+    struct sockaddr_storage remote_addr;   /* copied when the request arrives */
+    socklen_t            remote_len;   /* 0: unknown                       */
+    struct sockaddr_storage local_addr;    /* looked up on first use          */
+    socklen_t            local_len;
+    int                  local_state;  /* 0 not looked up, 1 known, -1 unknown */
 };
 
 static void srv_task_cb(evutil_socket_t fd, short what, void *arg);
@@ -1198,6 +1203,65 @@ format_remote(const evhtp_connection_t *c, char *buf, size_t len)
     }
 }
 
+/* Copies an IPv4/IPv6 address; returns its length, 0 for anything else. */
+static socklen_t
+copy_sockaddr(struct sockaddr_storage *dst, const struct sockaddr *sa)
+{
+    socklen_t n;
+
+    switch (sa ? sa->sa_family : AF_UNSPEC) {
+    case AF_INET:  n = sizeof(struct sockaddr_in);  break;
+    case AF_INET6: n = sizeof(struct sockaddr_in6); break;
+    default:       return 0;
+    }
+
+    memcpy(dst, sa, n);
+    return n;
+}
+
+/* getpeername()-style result: copy at most *len bytes, report the full length. */
+static int
+give_sockaddr(const struct sockaddr_storage *addr, socklen_t n,
+              struct sockaddr *out, socklen_t *len)
+{
+    if (n == 0 || out == NULL || len == NULL) {
+        return -1;
+    }
+
+    memcpy(out, addr, *len < n ? *len : n);
+    *len = n;
+    return 0;
+}
+
+int
+hc_server_exchange_remote_address(hc_server_exchange *ex, struct sockaddr *out, socklen_t *len)
+{
+    return ex ? give_sockaddr(&ex->remote_addr, ex->remote_len, out, len) : -1;
+}
+
+int
+hc_server_exchange_local_address(hc_server_exchange *ex, struct sockaddr *out, socklen_t *len)
+{
+    if (ex == NULL) {
+        return -1;
+    }
+
+    if (ex->local_state == 0) {
+        struct sockaddr_storage ss;
+        socklen_t               n = sizeof(ss);
+
+        ex->local_state = -1;
+
+        if (ex->req && ex->conn &&
+            getsockname(ex->conn->sock, (struct sockaddr *)&ss, &n) == 0 &&
+            (ex->local_len = copy_sockaddr(&ex->local_addr, (struct sockaddr *)&ss)) != 0) {
+            ex->local_state = 1;
+        }
+    }
+
+    return ex->local_state == 1 ? give_sockaddr(&ex->local_addr, ex->local_len, out, len) : -1;
+}
+
 static evhtp_res
 srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
 {
@@ -1235,6 +1299,7 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
     }
 
     format_remote(ex->conn, ex->remote, sizeof(ex->remote));
+    ex->remote_len = copy_sockaddr(&ex->remote_addr, ex->conn ? ex->conn->saddr : NULL);
 
     if (ex->task == NULL || ex->h == NULL) {
         if (ex->task) {
