@@ -1,0 +1,14 @@
+# build outputs
+*.o
+/libhtstring.a
+/htstring.pc
+/tests/htstring_test
+/tests/parsed_uri_test
+/tests/tokenizer_test
+
+# local build settings (see config.mk.example)
+/config.mk
+
+# editor support: `make compile_commands.json`, plus clangd's index
+/compile_commands.json
+/.cache/

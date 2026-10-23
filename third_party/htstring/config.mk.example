@@ -1,0 +1,19 @@
+# Copy to config.mk and edit. config.mk is ignored by git: it is for settings
+# that only make sense on your machine.
+#
+#   cp config.mk.example config.mk
+#
+# Then plain `make`, `make check`, `make install` use these values. Anything
+# given on the command line (make PREFIX=...) still overrides them.
+
+# Where `make install` copies the headers (include/htstring/), libhtstring.a
+# (lib/) and htstring.pc, e.g. the directory your application's other
+# dependencies are installed in.
+# PREFIX = /usr/local
+
+# htstring.pc goes to PREFIX/lib/pkgconfig unless PKGCONFIGDIR says otherwise;
+# use whichever directory is on your PKG_CONFIG_PATH.
+# PKGCONFIGDIR = $(PREFIX)/lib64/pkgconfig
+
+# Compiler flags (the default is -O2 -g).
+# CFLAGS = -O0 -g
