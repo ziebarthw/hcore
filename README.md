@@ -511,10 +511,10 @@ Differences the engine accounts for:
 - **Method enum order.** `htp_method_UNKNOWN` is first in the fork and last
   upstream, so the engine maps method names through the enumerators by name
   and never iterates over the enum.
-- **Header layout.** The fork installs `include/evhtp/string.h`, so only
-  `include/` may be on the include path, not `include/evhtp/`. Otherwise
-  `<string.h>` resolves to the fork's header, as an earlier Makefile here
-  allowed.
+- **Header layout.** Only `include/` goes on the include path, not
+  `include/evhtp/`, matching libevhtp's own pkg-config file. Fork versions
+  before the rename to `include/evhtp/htstring.h` installed
+  `include/evhtp/string.h`, which `<string.h>` would otherwise resolve to.
 - **HTTP/2 through ALPN.** The fork negotiates h2 when offered. The engine
   frames bodies and writes 1xx responses itself, which is only valid on
   HTTP/1.1, so it pins ALPN to `http/1.1` on both sides: servers answer only

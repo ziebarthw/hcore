@@ -23,8 +23,8 @@ CC      ?= cc
 CFLAGS  ?= -O2 -g
 HC_CFLAGS = -std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude
 # Only include/, as libevhtp's pkg-config file says: its headers are included
-# as <evhtp/...>, and include/evhtp itself holds names (string.h) that would
-# shadow the system headers.
+# as <evhtp/...>, and older versions of the ziebarthw/libevhtp fork put a
+# string.h in include/evhtp that would shadow the system header.
 EVHTP_CFLAGS = -I$(EVHTP_PREFIX)/include
 EVHTP_LIBS   = $(EVHTP_PREFIX)/lib/libevhtp.a $(EXTRA_LIBS) -levent -levent_openssl -levent_pthreads -lssl -lcrypto -lpthread
 
