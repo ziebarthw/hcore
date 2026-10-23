@@ -236,6 +236,8 @@ sees_eof(int fd)
 
 static volatile struct {   /* shared with the client thread */
     int    plain_ok, plain_close;
+    int    close_ok;
+    double close_waited;
     int    pause_ok;
     double pause_waited;
     int    idle_closed;
@@ -252,6 +254,14 @@ client_main(void *arg)
     double t0;
 
     (void)arg;
+
+    /* the client asks to close: response, then the server closes at once */
+    fd = connect_to();
+    t0 = now_s();
+    (void)!write(fd, "GET /plain HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n", 54);
+    C.close_ok     = read_response(fd, buf, sizeof(buf)) > 0 && strcasestr(buf, "Connection: close") && sees_eof(fd);
+    C.close_waited = now_s() - t0;
+    close(fd);
 
     /* keep-alive request; the connection then sits idle */
     idle = connect_to();
@@ -369,6 +379,8 @@ main(void)
     C.phase = (C.phase == 4) ? 4 : 3;           /* release a waiting client */
     pthread_join(th, NULL);
 
+    CHECK(C.close_ok);                          /* "Connection: close" honoured */
+    CHECK(C.close_waited < 1.0);                /* ... at once, not on a timeout */
     CHECK(C.plain_ok && !C.plain_close);
     CHECK(C.pause_ok);
     CHECK(C.pause_waited >= 0.25);              /* held while paused */
@@ -381,6 +393,7 @@ main(void)
     CHECK(hc_server_connection_count(S) == 0);
 
     printf("  pause held a new connection for %.0f ms\n", C.pause_waited * 1000);
+    printf("  \"Connection: close\" closed after %.0f ms\n", C.close_waited * 1000);
 
     hc_timer_free(poll_timer);
     hc_timer_free(resume_timer);
