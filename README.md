@@ -24,6 +24,7 @@ examples/echo_server.c         minimal server handler: streams the request body 
 tests/pool_test.c       pool + hc_host unit tests with fake connections
 tests/support_test.c    in-process integration tests: support API, TLS, 1xx, routing (HTTP + HTTPS servers)
 tests/embed_test.c      hcore in the application's event loop: reuse_port, pause/resume accept, graceful drain
+tests/shutdown_test.c   freeing a requester (and server) while the application's loop keeps running
 tests/run.sh            end-to-end tests (curl / client -> proxy -> tests/origin.py, echo_server)
 tests/tls/              self-signed test certificates (localhost, other.example)
 third_party/htstring/   copy of htstring: htstring_t string views, used by the engine's routing
@@ -661,6 +662,22 @@ goes over the wire. It covers:
 
 Breaking any of the three drain rules fails the matching check, against
 both libevhtps.
+
+**Shutdown while running** (`tests/shutdown_test`, 34 checks) frees a
+requester while the event loop it runs on carries on, the way an embedding
+replaces its proxy on a config reload. The origin reads requests but never
+answers. `hc_requester_free()` must finish, before it returns and exactly
+once each:
+- an exchange in flight, and one whose cancel is still queued on the loop;
+- requests waiting for a pool slot, served or not yet;
+- an endpoint released but not yet handed back, one the application still
+  holds, and a connect not yet answered;
+- a reverse proxy's request: the server is freed first (its handler cancels
+  the upstream exchange), then the requester.
+
+Retrying from `failed()` is refused, the loop runs on with nothing firing,
+and a new requester on the same loop works. Under valgrind (no errors, no
+leaks) it shows the use-after-free a running loop would otherwise hit.
 
 **End to end:** `tests/run.sh` (after `make`) runs curl and the full-duplex
 client against the proxy, `echo_server` (HTTP and HTTPS) and a Python origin

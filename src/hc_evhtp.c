@@ -1816,6 +1816,11 @@ struct hc_requester {
     SSL_CTX    *tls_ctx;
     int         tls_no_verify;
 #endif
+    /* Everything hc_requester_free() must finish before the pool goes:
+     * its tasks and timers would otherwise run later on the loop. */
+    struct hc_connect_op *ops;
+    struct hc_endpoint   *eps;
+    int                   closing;  /* hc_requester_free() in progress */
 };
 
 struct hc_connect_op {
@@ -1828,6 +1833,7 @@ struct hc_connect_op {
     hc_pool_entry *entry;
     hc_pconn      *pc;           /* while connecting */
     hc_timer      *timer;        /* connect timeout */
+    hc_connect_op *prev, *next;  /* rq->ops */
 };
 
 struct hc_endpoint {
@@ -1838,6 +1844,7 @@ struct hc_endpoint {
     int                 release_pending;
     int                 reuse;
     hc_timer           *task;
+    hc_endpoint        *prev, *next;    /* rq->eps */
 };
 
 enum {
@@ -2996,6 +3003,21 @@ hc_client_execute(hc_reactor *r, const hc_host *target, hc_client_handler *h)
 /* ======================================================================== */
 
 
+/* rq->ops / rq->eps: intrusive doubly linked lists, head insertion. */
+#define RQ_LINK(head, n) do {                                              \
+        (n)->prev = NULL;                                                  \
+        (n)->next = (head);                                                \
+        if (head) { (head)->prev = (n); }                                  \
+        (head) = (n);                                                      \
+    } while (0)
+
+#define RQ_UNLINK(head, n) do {                                            \
+        if ((n)->prev) { (n)->prev->next = (n)->next; }                    \
+        else { (head) = (n)->next; }                                       \
+        if ((n)->next) { (n)->next->prev = (n)->prev; }                    \
+        (n)->prev = (n)->next = NULL;                                      \
+    } while (0)
+
 static hc_endpoint *
 ep_new(hc_requester *rq, hc_pool_entry *e, hc_pconn *pc)
 {
@@ -3014,6 +3036,8 @@ ep_new(hc_requester *rq, hc_pool_entry *e, hc_pconn *pc)
         return NULL;
     }
 
+    RQ_LINK(rq->eps, ep);
+
     return ep;
 }
 
@@ -3028,6 +3052,7 @@ op_finish(hc_connect_op *op, hc_endpoint *ep, const char *error)
     /* error may point into memory freed below (the pconn's message) */
     snprintf(why, sizeof(why), "%s", error ? error : ep ? "" : "out of memory");
 
+    RQ_UNLINK(op->rq->ops, op);
     hc_timer_free(op->timer);
     free(op);
     cb(arg, ep, ep ? NULL : why);
@@ -3147,9 +3172,9 @@ hc_connect_op *
 hc_requester_connect(hc_requester *rq, const hc_host *target, int64_t timeout_ms,
                      hc_connect_cb cb, void *arg)
 {
-    hc_connect_op *op = calloc(1, sizeof(*op));
+    hc_connect_op *op;
 
-    if (op == NULL) {
+    if (rq->closing || (op = calloc(1, sizeof(*op))) == NULL) {
         return NULL;
     }
 
@@ -3170,6 +3195,8 @@ hc_requester_connect(hc_requester *rq, const hc_host *target, int64_t timeout_ms
         return NULL;
     }
 
+    RQ_LINK(rq->ops, op);
+
     return op;
 }
 
@@ -3186,6 +3213,7 @@ hc_connect_cancel(hc_connect_op *op)
         hc_pool_release(op->rq->pool, op->entry, 0);
     }
 
+    RQ_UNLINK(op->rq->ops, op);
     hc_timer_free(op->timer);
     free(op);
 }
@@ -3195,7 +3223,8 @@ hc_endpoint_execute(hc_endpoint *ep, hc_client_handler *h)
 {
     hc_client_exchange *cx;
 
-    if (ep->cx || ep->release_pending || (cx = cx_new(ep->rq->r, h)) == NULL) {
+    if (ep->cx || ep->release_pending || ep->rq->closing ||
+        (cx = cx_new(ep->rq->r, h)) == NULL) {
         return NULL;
     }
 
@@ -3264,6 +3293,7 @@ ep_task_cb(void *arg)
     }
 
     hc_pool_release(ep->rq->pool, ep->entry, keep);    /* !keep: closes pc */
+    RQ_UNLINK(ep->rq->eps, ep);
     hc_timer_free(ep->task);
     free(ep);
 }
@@ -3360,17 +3390,66 @@ hc_requester_pool(hc_requester *rq)
     return rq->pool;
 }
 
+/* Finish an exchange now, as its queued T_FINISH would later: the handler
+ * sees failed + release, and the endpoint (if released) is handed back. */
+static void
+cx_finish_now(hc_client_exchange *cx, const char *reason)
+{
+    cli_fail(cx, reason);
+    cx->pending = T_FINISH;     /* nothing else queued may run now */
+    cli_task_cb(-1, 0, cx);     /* frees cx (and its queued task) */
+}
+
 void
 hc_requester_free(hc_requester *rq)
 {
-    if (rq) {
-        hc_timer_free(rq->housekeeping);
-        hc_pool_free(rq->pool);
-#ifdef HC_HAVE_TLS
-        SSL_CTX_free(rq->tls_ctx);
-#endif
-        free(rq);
+    static const char why[] = "requester shut down";
+
+    if (rq == NULL || rq->closing) {
+        return;
     }
+
+    /* The application's loop may keep running after this (an embedding
+     * that replaces its requester, e.g. on a config reload), so everything
+     * still queued on it for this requester is finished here and now.
+     * Callbacks run from here cannot start anything new on it. */
+    rq->closing = 1;
+    hc_timer_free(rq->housekeeping);
+    rq->housekeeping = NULL;
+
+    /* Connect requests: waiting for a pool slot, or connecting. */
+    while (rq->ops) {
+        hc_connect_op *op = rq->ops;
+
+        if (op->lease) {
+            hc_pool_lease_cancel(op->lease);
+            op->lease = NULL;
+            op_finish(op, NULL, why);
+        } else {
+            op_fail(op, why);       /* closes the connection being made */
+        }
+    }
+
+    /* Endpoints: an exchange in flight (perhaps with its abort queued) is
+     * finished first; that hands a released endpoint back. One still held
+     * by the application is discarded: its pointer is invalid from now. */
+    while (rq->eps) {
+        hc_endpoint *ep = rq->eps;
+
+        if (ep->cx) {
+            cx_finish_now(ep->cx, why);     /* sets ep->cx = NULL */
+            continue;
+        }
+
+        ep->reuse = ep->release_pending ? ep->reuse : 0;
+        ep_task_cb(ep);                     /* unlinks and frees ep */
+    }
+
+    hc_pool_free(rq->pool);     /* closes the idle connections */
+#ifdef HC_HAVE_TLS
+    SSL_CTX_free(rq->tls_ctx);
+#endif
+    free(rq);
 }
 
 hc_client_exchange *

@@ -8,6 +8,7 @@
 /tests/pool_test
 /tests/support_test
 /tests/embed_test
+/tests/shutdown_test
 
 # local build settings (see config.mk.example)
 /config.mk

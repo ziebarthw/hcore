@@ -387,8 +387,14 @@ typedef struct hc_requester_config {
 } hc_requester_config;
 
 hc_requester *hc_requester_new(hc_reactor *r, const hc_requester_config *cfg);
-/* Closes every pooled connection; outstanding endpoints must already have
- * been released. */
+/* Closes every pooled connection. Safe while the event loop keeps running
+ * (an embedding replacing its requester, e.g. on a config reload): work
+ * still outstanding is finished before it returns, with the reason
+ * "requester shut down" - exchanges in flight get ->failed() + ->release(),
+ * pending hc_requester_connect() callbacks an error, and endpoints still
+ * held by the application are discarded (their pointers become invalid).
+ * Nothing new can be started on the requester from those callbacks.
+ * Do not call it from inside one of its own callbacks. */
 void          hc_requester_free(hc_requester *rq);
 /* The underlying pool: limits, statistics, listener, close_idle. */
 hc_pool      *hc_requester_pool(hc_requester *rq);
