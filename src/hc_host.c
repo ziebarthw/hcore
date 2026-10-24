@@ -35,9 +35,30 @@ hc_host_init(hc_host *h, const char *scheme, const char *name, uint16_t port)
     /* scheme is known to fit: "http" / "https", stored lower-case */
     snprintf(h->scheme, sizeof(h->scheme), "%s", dp == 443 ? "https" : "http");
     memcpy(h->name, name, nl + 1);
-    h->port = port ? port : dp;
+    h->port        = port ? port : dp;
+    h->tls_name[0] = '\0';
 
     return 0;
+}
+
+int
+hc_host_set_tls_name(hc_host *h, const char *tls_name)
+{
+    size_t n = tls_name ? strlen(tls_name) : 0;
+
+    if (n >= sizeof(h->tls_name)) {
+        return -1;
+    }
+
+    memcpy(h->tls_name, n ? tls_name : "", n + 1);
+
+    return 0;
+}
+
+const char *
+hc_host_tls_name(const hc_host *h)
+{
+    return h->tls_name[0] ? h->tls_name : h->name;
 }
 
 /* Parse "[scheme://]authority" up to end (exclusive). */
@@ -165,8 +186,10 @@ hc_host_is_tls(const hc_host *h)
 int
 hc_host_equals(const hc_host *a, const hc_host *b)
 {
+    /* the TLS name as used: unset and "same as name" are one route */
     return a->port == b->port && strcmp(a->scheme, b->scheme) == 0 &&
-           strcasecmp(a->name, b->name) == 0;
+           strcasecmp(a->name, b->name) == 0 &&
+           strcasecmp(hc_host_tls_name(a), hc_host_tls_name(b)) == 0;
 }
 
 size_t

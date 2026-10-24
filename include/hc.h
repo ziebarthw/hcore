@@ -135,11 +135,17 @@ typedef struct hc_entity {
 
 /* A target host: scheme + name + port. A plain value (no allocation): copy
  * it freely. It is also the pool's route key, so http://h:443 and
- * https://h:443 are different routes. */
+ * https://h:443 are different routes, and so are two https routes to one
+ * address with different TLS server names. */
 typedef struct hc_host {
     char     scheme[8];         /* "http" or "https"                       */
     char     name[256];         /* host name or IP literal, no brackets    */
     uint16_t port;              /* never 0 once initialised                */
+    /* https: the server name to send (SNI) and to verify the certificate
+     * against, when it differs from name - e.g. name is the origin's IP
+     * address, the site is "www.example.com". Empty: name is used. Set it
+     * with hc_host_set_tls_name(); hc_host_init/parse clear it. */
+    char     tls_name[256];
 } hc_host;
 
 /* port 0: the scheme's default (80/443). Returns -1 for an unknown scheme
@@ -151,7 +157,14 @@ int    hc_host_parse(hc_host *h, const char *s);
 /* "scheme://authority[/path...]" -> host + request-target ("/" if none). */
 int    hc_uri_parse(const char *uri, hc_host *h, char *target, size_t target_len);
 int    hc_host_is_tls(const hc_host *h);
-int    hc_host_equals(const hc_host *a, const hc_host *b);  /* name: case-insensitive */
+/* Java: SNIHostName on the connection's SSLParameters. NULL or "" clears it.
+ * Returns -1 if it does not fit. An IP literal is used for certificate
+ * verification only: SNI carries host names. */
+int    hc_host_set_tls_name(hc_host *h, const char *tls_name);
+/* The name TLS presents and verifies: tls_name if set, else name. */
+const char *hc_host_tls_name(const hc_host *h);
+/* scheme, port, and name and tls_name case-insensitively */
+int    hc_host_equals(const hc_host *a, const hc_host *b);
 /* Host header value: name, with ":port" unless it is the scheme default. */
 size_t hc_host_authority(const hc_host *h, char *buf, size_t len);
 /* "scheme://authority" */

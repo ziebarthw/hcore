@@ -2143,6 +2143,7 @@ pc_resolved(int err, struct evutil_addrinfo *res, void *arg)
     char               ip[INET_ADDRSTRLEN];
     char               why[512];
     SSL               *ssl;
+    const char        *tls_name;
 
     if (err == EVUTIL_EAI_CANCEL) {         /* pc is being destroyed */
         if (res) {
@@ -2179,15 +2180,19 @@ pc_resolved(int err, struct evutil_addrinfo *res, void *arg)
      * engine does not drive (see srv_alpn_http11). */
     SSL_set_alpn_protos(ssl, (const unsigned char *)"\x08http/1.1", 9);
 
-    if (!is_ip_literal(pc->target.name)) {
-        SSL_set_tlsext_host_name(ssl, pc->target.name);     /* SNI */
+    /* The name the site goes by: the target's tls_name (connecting to an
+     * address, presenting a host name), else the name connected to. */
+    tls_name = hc_host_tls_name(&pc->target);
+
+    if (!is_ip_literal(tls_name)) {
+        SSL_set_tlsext_host_name(ssl, tls_name);            /* SNI */
     }
 
     if (!pc->rq->tls_no_verify) {
-        if (is_ip_literal(pc->target.name)) {
-            X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), pc->target.name);
+        if (is_ip_literal(tls_name)) {
+            X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), tls_name);
         } else {
-            SSL_set1_host(ssl, pc->target.name);
+            SSL_set1_host(ssl, tls_name);
         }
     }
 
