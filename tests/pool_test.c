@@ -452,6 +452,59 @@ test_scheme_is_part_of_route(void)
 }
 
 static void
+test_tls_name_is_part_of_route(void)
+{
+    hc_pool *p = make_pool(10, 1, 0, HC_POOL_REUSE_LIFO);
+    hc_host  a_site, b_site, plain, same;
+    result   a, b, c;
+
+    puts("routes: one address, different TLS server names -> separate connections");
+    hc_host_init(&a_site, "https", "192.0.2.1", 443);
+    hc_host_init(&b_site, "https", "192.0.2.1", 443);
+    CHECK(hc_host_set_tls_name(&a_site, "a.example") == 0);
+    CHECK(hc_host_set_tls_name(&b_site, "b.example") == 0);
+    CHECK(!hc_host_equals(&a_site, &b_site));
+    CHECK(strcmp(hc_host_tls_name(&a_site), "a.example") == 0);
+
+    hc_host_init(&plain, "https", "a.example", 443);
+    hc_host_init(&same, "https", "a.example", 443);
+    CHECK(hc_host_set_tls_name(&same, "A.EXAMPLE") == 0);   /* = its name */
+    CHECK(hc_host_equals(&plain, &same));                   /* unset == name */
+    CHECK(strcmp(hc_host_tls_name(&plain), "a.example") == 0);
+    CHECK(hc_host_set_tls_name(&same, NULL) == 0 && same.tls_name[0] == '\0');
+    {
+        char long_name[300];
+
+        memset(long_name, 'x', sizeof(long_name) - 1);
+        long_name[sizeof(long_name) - 1] = '\0';
+        CHECK(hc_host_set_tls_name(&same, long_name) == -1);
+    }
+    CHECK(hc_host_parse(&same, "https://a.example") == 0 && same.tls_name[0] == '\0');
+
+    memset(&a, 0, sizeof(a));
+    hc_pool_lease(p, &a_site, NULL, 0, on_lease, &a);
+    run_for(5);
+    hc_pool_entry_assign(a.e, new_conn());
+    hc_pool_release(p, a.e, 1);
+
+    memset(&b, 0, sizeof(b));
+    hc_pool_lease(p, &b_site, NULL, 0, on_lease, &b);
+    run_for(5);
+    CHECK(b.e && hc_pool_entry_conn(b.e) == NULL);          /* not a.example's */
+    CHECK(strcmp(hc_pool_entry_route(b.e)->tls_name, "b.example") == 0);
+    hc_pool_entry_assign(b.e, new_conn());
+    hc_pool_release(p, b.e, 1);
+
+    memset(&c, 0, sizeof(c));
+    hc_pool_lease(p, &a_site, NULL, 0, on_lease, &c);
+    run_for(5);
+    CHECK(c.e && hc_pool_entry_conn(c.e) != NULL);          /* a.example's again */
+    CHECK(strcmp(hc_pool_entry_route(c.e)->tls_name, "a.example") == 0);
+    hc_pool_release(p, c.e, 1);
+    hc_pool_free(p);
+}
+
+static void
 test_host_parsing(void)
 {
     hc_host h;
@@ -496,6 +549,7 @@ main(void)
     test_cancel_and_state();
     test_listener_and_shutdown();
     test_scheme_is_part_of_route();
+    test_tls_name_is_part_of_route();
     test_host_parsing();
 
     hc_reactor_free(R);

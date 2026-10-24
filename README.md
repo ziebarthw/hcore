@@ -25,6 +25,7 @@ tests/pool_test.c       pool + hc_host unit tests with fake connections
 tests/support_test.c    in-process integration tests: support API, TLS, 1xx, routing (HTTP + HTTPS servers)
 tests/embed_test.c      hcore in the application's event loop: reuse_port, pause/resume accept, graceful drain
 tests/shutdown_test.c   freeing a requester (and server) while the application's loop keeps running
+tests/tls_name_test.c   https to an address, presenting and verifying a host name (hc_host.tls_name)
 tests/run.sh            end-to-end tests (curl / client -> proxy -> tests/origin.py, echo_server)
 tests/tls/              self-signed test certificates (localhost, other.example)
 third_party/htstring/   copy of htstring: htstring_t string views, used by the engine's routing
@@ -662,6 +663,15 @@ goes over the wire. It covers:
 
 Breaking any of the three drain rules fails the matching check, against
 both libevhtps.
+
+**TLS server name** (`tests/tls_name_test`, 19 checks) connects over https
+to 127.0.0.1, where a plain OpenSSL server answers with the SNI it received.
+With `hc_host_set_tls_name(&target, "localhost")` the origin sees SNI
+"localhost" and the certificate verifies against that name; without one, no
+SNI is sent (an IP is never sent as SNI) and verification checks the IP; a
+name the certificate does not cover fails verification, and with
+verification off reaches the origin as given. Different TLS names to one
+address are separate pool routes (`tests/pool_test`).
 
 **Shutdown while running** (`tests/shutdown_test`, 34 checks) frees a
 requester while the event loop it runs on carries on, the way an embedding

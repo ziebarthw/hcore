@@ -89,11 +89,16 @@ tests/embed_test: tests/embed_test.c $(HC_OBJS)
 tests/shutdown_test: tests/shutdown_test.c $(HC_OBJS)
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -o $@ $^ $(EVHTP_LIBS)
 
-check: all tests/pool_test tests/support_test tests/embed_test tests/shutdown_test
+# https to an address, presenting and verifying a host name (hc_host.tls_name).
+tests/tls_name_test: tests/tls_name_test.c $(HC_OBJS)
+	$(CC) $(HC_CFLAGS) $(CFLAGS) -o $@ $^ $(EVHTP_LIBS)
+
+check: all tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test
 	tests/pool_test
 	tests/support_test tests/tls
 	tests/embed_test
 	tests/shutdown_test
+	tests/tls_name_test tests/tls
 	tests/run.sh
 
 # Editor support (clangd, e.g. the VS Code clangd extension): a compilation
@@ -148,6 +153,6 @@ libhcore.pc:
 	@echo "wrote $@"
 
 clean:
-	rm -f libhcore.a libhcore.pc src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server tests/pool_test tests/support_test tests/embed_test tests/shutdown_test
+	rm -f libhcore.a libhcore.pc src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test
 
 .PHONY: all clean check install libhcore.pc
