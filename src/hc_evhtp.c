@@ -473,7 +473,10 @@ entity_from_headers(const hc_headers *h, hc_entity *e, int body_possible,
 
 struct hc_data_channel {
     struct bufferevent       *bev;     /* NULL once detached                 */
-    struct evbuffer          *out;
+    struct evbuffer          *out;     /* bev's output; HTTP/2: the stream's
+                                        * req->buffer_out                    */
+    evhtp_request_t          *h2req;   /* HTTP/2 server reply, else NULL     */
+    struct evbuffer          *stage;   /* HTTP/2: hands data to libevhtp     */
     struct evbuffer_cb_entry *cbe;
     int                       chunked;
     int                       discard; /* HEAD response: accept, send nothing */
@@ -504,8 +507,32 @@ chan_attach(hc_data_channel *ch, struct bufferevent *bev, int chunked,
 {
     ch->bev        = bev;
     ch->out        = bufferevent_get_output(bev);
+    ch->h2req      = NULL;
+    ch->stage      = NULL;
     ch->chunked    = chunked;
     ch->remaining  = chunked ? -1 : length;
+    ch->ended      = 0;
+    ch->full       = 0;
+    ch->owner      = owner;
+    ch->on_produce = on_produce;
+    ch->on_end     = on_end;
+    ch->cbe        = evbuffer_add_cb(ch->out, chan_drain_cb, ch);
+}
+
+/* HTTP/2 server reply: the body goes through evhtp_send_reply_body() into
+ * the stream's own buffer (req->buffer_out), which libevhtp empties as the
+ * peer's flow-control window allows; watching that buffer gives per-stream
+ * backpressure. No chunk framing: DATA frames delimit the body. */
+static void
+chan_attach_h2(hc_data_channel *ch, evhtp_request_t *req, int64_t length,
+               void *owner, void (*on_produce)(void *), void (*on_end)(void *))
+{
+    ch->bev        = evhtp_connection_get_bev(evhtp_request_get_connection(req));
+    ch->out        = req->buffer_out;
+    ch->h2req      = req;
+    ch->stage      = evbuffer_new();
+    ch->chunked    = 0;
+    ch->remaining  = length;
     ch->ended      = 0;
     ch->full       = 0;
     ch->owner      = owner;
@@ -521,9 +548,15 @@ chan_detach(hc_data_channel *ch)
         evbuffer_remove_cb_entry(ch->out, ch->cbe);
     }
 
-    ch->bev = NULL;
-    ch->out = NULL;
-    ch->cbe = NULL;
+    if (ch->stage) {
+        evbuffer_free(ch->stage);
+    }
+
+    ch->bev   = NULL;
+    ch->out   = NULL;
+    ch->cbe   = NULL;
+    ch->h2req = NULL;
+    ch->stage = NULL;
 }
 
 long
@@ -549,7 +582,11 @@ hc_data_write(hc_data_channel *ch, const void *data, size_t len)
         ch->remaining -= (int64_t)len;
     }
 
-    if (ch->chunked) {
+    if (ch->h2req) {
+        /* appends to req->buffer_out and wakes the stream */
+        evbuffer_add(ch->stage, data, len);
+        evhtp_send_reply_body(ch->h2req, ch->stage);
+    } else if (ch->chunked) {
         evbuffer_add_printf(ch->out, "%zx\r\n", len);
         evbuffer_add(ch->out, data, len);
         evbuffer_add(ch->out, "\r\n", 2);
@@ -602,6 +639,8 @@ hc_data_end(hc_data_channel *ch, const hc_headers *trailers)
         return -1;              /* fewer bytes than declared */
     }
 
+    /* Trailers go out with HTTP/1.1 chunked framing only; an HTTP/2 reply
+     * ends without them (libevhtp has no HTTP/2 trailer support). */
     if (ch->chunked && !ch->discard) {
         const char *k, *v;
 
@@ -643,6 +682,20 @@ schedule(struct event *task, unsigned *pending, unsigned what)
 /* Server side                                                              */
 /* ======================================================================== */
 
+/* An HTTP/2 connection (the ziebarthw libevhtp fork, built with nghttp2).
+ * Its requests are streams: libevhtp frames their replies, so everything
+ * this engine does at the connection level for HTTP/1.x - pausing it,
+ * enabling/disabling reads, poking the write callback, writing body bytes
+ * and chunk framing to its output - must not happen; a request's body goes
+ * through evhtp_send_reply_body() and waits in req->buffer_out until the
+ * stream's flow-control window takes it. */
+#ifdef EVHTP_CONN_FLAG_IS_HTTP2
+#define HC_HAVE_H2 1
+#define conn_is_h2(c) ((c) != NULL && ((c)->flags & EVHTP_CONN_FLAG_IS_HTTP2) != 0)
+#else
+#define conn_is_h2(c) 0
+#endif
+
 /* Accepted connections, so hc_server_free() can close them: libevhtp does
  * not track them and evhtp_free() leaves them open. */
 typedef struct srv_conn {
@@ -681,6 +734,7 @@ struct hc_server {
     srv_route                *routes;
     size_t                    n_routes;
     hc_server_listener        listener;
+    int                       http2;   /* offer h2 in TLS ALPN (if built in) */
 #ifdef HC_HAVE_TLS
     evhtp_ssl_cfg_t           tls;     /* libevhtp keeps a pointer to it */
 #endif
@@ -710,6 +764,7 @@ struct hc_server_exchange {
     int                  released;
     int                  input_suspended;
     int                  keep_alive;   /* connection stays open afterwards */
+    int                  h2;           /* an HTTP/2 stream                 */
     const char          *reason;
     char                 remote[64];   /* "address:port", for the listener */
     struct sockaddr_storage remote_addr;   /* copied when the request arrives */
@@ -740,6 +795,15 @@ srv_try_finalize(hc_server_exchange *ex)
     }
 
     ex->finished   = 1;
+
+    if (ex->h2) {
+        /* A stream: END_STREAM follows the last DATA frame, libevhtp frees
+         * the request when the stream closes, and the connection stays for
+         * its other streams (a drain closes it once they are done). */
+        ex->keep_alive = 1;
+        evhtp_send_reply_end(ex->req);
+        return;
+    }
 
     if (ex->srv->draining) {
         ex->req->flags &= ~EVHTP_REQ_FLAG_KEEPALIVE;    /* close once flushed */
@@ -826,8 +890,23 @@ hc_response_send(hc_response_channel *rc, const hc_response_head *head,
         }
 
         evhtp_send_reply_start(req, (evhtp_res)head->status);
-        chan_attach(&ex->out, bev, 0, -1, ex, srv_schedule_produce, srv_on_response_end);
+        if (ex->h2) {
+            chan_attach_h2(&ex->out, req, -1, ex, srv_schedule_produce, srv_on_response_end);
+        } else {
+            chan_attach(&ex->out, bev, 0, -1, ex, srv_schedule_produce, srv_on_response_end);
+        }
         ex->out.discard = 1;
+    } else if (ex->h2) {
+        /* DATA frames delimit the body: Content-Length is optional */
+        if (entity->content_length >= 0) {
+            snprintf(num, sizeof(num), "%lld", (long long)entity->content_length);
+            evhtp_headers_add_header(req->headers_out,
+                evhtp_header_new("Content-Length", num, 0, 1));
+        }
+
+        evhtp_send_reply_start(req, (evhtp_res)head->status);
+        chan_attach_h2(&ex->out, req, entity->content_length, ex,
+                       srv_schedule_produce, srv_on_response_end);
     } else if (entity->content_length >= 0) {
         snprintf(num, sizeof(num), "%lld", (long long)entity->content_length);
         evhtp_headers_add_header(req->headers_out,
@@ -926,7 +1005,10 @@ hc_response_send_simple(hc_response_channel *rc, int status,
 void
 hc_server_suspend_input(hc_server_exchange *ex)
 {
-    if (ex->req && !ex->req_done && !ex->input_suspended) {
+    /* HTTP/2: reading the connection serves every stream on it, so it is
+     * never stopped for one (as libevhtp's own pause does on HTTP/2); the
+     * request body is delivered as it arrives. */
+    if (ex->req && !ex->req_done && !ex->input_suspended && !ex->h2) {
         ex->input_suspended = 1;
         bufferevent_disable(evhtp_connection_get_bev(ex->conn), EV_READ);
     }
@@ -935,7 +1017,7 @@ hc_server_suspend_input(hc_server_exchange *ex)
 void
 hc_server_resume_input(hc_server_exchange *ex)
 {
-    if (ex->req && !ex->req_done && ex->input_suspended) {
+    if (ex->req && !ex->req_done && ex->input_suspended && !ex->h2) {
         ex->input_suspended = 0;
         bufferevent_enable(evhtp_connection_get_bev(ex->conn), EV_READ);
     }
@@ -1049,9 +1131,10 @@ srv_on_complete(evhtp_request_t *req, void *arg)
      * expects a synchronous reply to be finished, so no pause is needed. */
     srv_try_finalize(ex);
 
-    if (!ex->finished && ex->req) {
+    if (!ex->finished && ex->req && !ex->h2) {
         /* Reply will come later: stop libevhtp from reading the next
-         * request on this connection until we are done. */
+         * request on this connection until we are done. (HTTP/2: other
+         * streams go on; there is no next request on this one.) */
         ex->paused = 1;
         evhtp_request_pause(req);
     }
@@ -1328,6 +1411,8 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
         }
     }
 
+    ex->h2 = conn_is_h2(ex->conn);
+
     format_remote(ex->conn, ex->remote, sizeof(ex->remote));
     ex->remote_len = copy_sockaddr(&ex->remote_addr, ex->conn ? ex->conn->saddr : NULL);
 
@@ -1387,7 +1472,7 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
     head.method    = method;
     head.target    = target;
     head.authority = hc_headers_get(h, "host");
-    head.version   = req->proto == EVHTP_PROTO_10 ? 10 : 11;
+    head.version   = ex->h2 ? 20 : req->proto == EVHTP_PROTO_10 ? 10 : 11;
     head.headers   = h;
 
     if (srv->listener.on_request_head) {
@@ -1447,6 +1532,12 @@ srv_task_cb(evutil_socket_t fd, short what, void *arg)
         }
         if (ex->next) {
             ex->next->prev = ex->prev;
+        }
+
+        /* Draining: an HTTP/2 connection does not close by itself after a
+         * stream (HTTP/1.x ones do, keep-alive off); look again. */
+        if (ex->h2 && ex->srv->draining && ex->srv->drain_ev && !ex->srv->closing) {
+            event_active(ex->srv->drain_ev, EV_TIMEOUT, 0);
         }
 
         event_free(ex->task);
@@ -1532,6 +1623,9 @@ hc_server_new(hc_reactor *r, hc_server_handler_factory factory, void *arg)
     }
 
     s->r       = r;
+#ifdef HC_HAVE_H2
+    s->http2   = 1;             /* as libevhtp: h2 when TLS is on */
+#endif
     s->factory = factory;
     s->arg     = arg;
 
@@ -1560,11 +1654,10 @@ dup_cstr(const char *s)
 }
 
 #ifdef HC_HAVE_TLS
-/* ALPN: this engine speaks HTTP/1.1 only (it frames bodies and writes 1xx
- * responses itself). libevhtp builds with HTTP/2 support register an ALPN
- * callback that prefers h2, which would switch connections to a protocol
- * the engine does not drive; this replaces it. Without ALPN in the build,
- * it simply answers http/1.1 when a client offers it. */
+/* ALPN, HTTP/1.1 only: for builds without HTTP/2 support, and servers with
+ * HTTP/2 switched off (hc_server_set_http2). libevhtp builds with HTTP/2
+ * register an ALPN callback preferring h2; this replaces it. Without ALPN
+ * in the build, it simply answers http/1.1 when a client offers it. */
 static int
 srv_alpn_http11(SSL *ssl, const unsigned char **out, unsigned char *outlen,
                 const unsigned char *in, unsigned int inlen, void *arg)
@@ -1611,6 +1704,11 @@ hc_server_enable_tls(hc_server *s, const char *cert_file, const char *key_file)
         return -1;
     }
 
+#ifdef HC_HAVE_H2
+    /* Built with HTTP/2: libevhtp's ALPN callback (installed by
+     * evhtp_ssl_init(), preferring h2) stays, unless switched off. */
+    if (!s->http2)
+#endif
     SSL_CTX_set_alpn_select_cb(ctx, srv_alpn_http11, NULL);
 
     return 0;
@@ -1620,6 +1718,27 @@ hc_server_enable_tls(hc_server *s, const char *cert_file, const char *key_file)
     (void)key_file;
 
     return -1;
+#endif
+}
+
+int
+hc_server_set_http2(hc_server *s, int enabled)
+{
+    if (s == NULL) {
+        return -1;
+    }
+
+#ifdef HC_HAVE_TLS
+    if (s->tls.pemfile) {
+        return -1;              /* decided when TLS was enabled */
+    }
+#endif
+
+#ifdef HC_HAVE_H2
+    s->http2 = enabled != 0;
+    return 0;
+#else
+    return enabled ? -1 : 0;    /* this libevhtp has no HTTP/2 */
 #endif
 }
 
@@ -1704,12 +1823,20 @@ srv_drain_cb(evutil_socket_t fd, short what, void *arg)
             }
         }
 
-        if (busy == NULL) {
+        if (busy == NULL && conn_is_h2(c)) {
+            /* HTTP/2 with no stream of ours left: close it. Its output may
+             * still hold the last streams' frames, so it is not dropped
+             * (libevhtp flushes before freeing). */
+            evhtp_connection_free(c);
+        } else if (busy == NULL) {
             /* Idle: between keep-alive requests, or a request whose head
              * hasn't fully arrived - like any server closing an idle
              * keep-alive connection, the client retries. */
             drop_output(evhtp_connection_get_bev(c));
             evhtp_connection_free(c);
+        } else if (busy->h2) {
+            /* Streams under way: closed when the last one is done (see
+             * srv_task_cb). */
         } else if (busy->finished) {
             /* Finished before the drain, still flushing: don't let
              * libevhtp keep it alive for another request. */

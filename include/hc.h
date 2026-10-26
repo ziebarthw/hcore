@@ -117,7 +117,8 @@ typedef struct hc_request_head {
     const char       *method;     /* "GET", "POST", ...                     */
     const char       *target;     /* request-target: "/path?query"          */
     const char       *authority;  /* Host header value (may be NULL)        */
-    int               version;    /* 10 or 11                               */
+    int               version;    /* 10 or 11; a server request may be 20
+                                   * (HTTP/2)                               */
     const hc_headers *headers;
 } hc_request_head;
 
@@ -300,6 +301,19 @@ void       hc_server_set_listener(hc_server *s, const hc_server_listener *l);
  * hc_server_listen(). Returns -1 if they cannot be loaded or TLS support
  * was not compiled in. */
 int        hc_server_enable_tls(hc_server *s, const char *cert_file, const char *key_file);
+/* HTTP/2 over TLS (ALPN "h2"), on by default when libevhtp has it (the
+ * ziebarthw fork built with nghttp2); 0 offers HTTP/1.1 only. Call before
+ * hc_server_enable_tls(). Returns -1 when asking for HTTP/2 from a
+ * libevhtp without it, or after TLS was enabled.
+ *
+ * On HTTP/2 the API is the same, with these differences: requests report
+ * version 20; libevhtp frames the reply (DATA frames, no chunking);
+ * hc_response_send_information() is not supported (-1); trailers given to
+ * hc_data_end() are not sent; hc_server_suspend_input() does nothing (the
+ * connection is shared by all its streams); hc_server_abort() closes the
+ * whole connection, every stream on it; a drain closes each connection
+ * once its last stream is done. */
+int        hc_server_set_http2(hc_server *s, int enabled);
 int        hc_server_listen(hc_server *s, const char *addr, uint16_t port);
 void       hc_server_free(hc_server *s);
 

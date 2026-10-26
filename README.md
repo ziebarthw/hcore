@@ -26,6 +26,7 @@ tests/support_test.c    in-process integration tests: support API, TLS, 1xx, rou
 tests/embed_test.c      hcore in the application's event loop: reuse_port, pause/resume accept, graceful drain
 tests/shutdown_test.c   freeing a requester (and server) while the application's loop keeps running
 tests/tls_name_test.c   https to an address, presenting and verifying a host name (hc_host.tls_name)
+tests/h2_test.c         the server over HTTP/2 (libevhtp with HTTP/2 only), checked with curl
 tests/run.sh            end-to-end tests (curl / client -> proxy -> tests/origin.py, echo_server)
 tests/tls/              self-signed test certificates (localhost, other.example)
 third_party/htstring/   copy of htstring: htstring_t string views, used by the engine's routing
@@ -663,6 +664,19 @@ goes over the wire. It covers:
 
 Breaking any of the three drain rules fails the matching check, against
 both libevhtps.
+
+**HTTP/2 server** (`tests/h2_test`, 41 checks) runs only when libevhtp has
+HTTP/2 (the ziebarthw fork built with nghttp2; `make check` says "skipped"
+otherwise) and curl does. An HTTPS hcore server answers curl over HTTP/2 and,
+for comparison, the same requests over HTTP/1.1:
+- a small reply; an error reply asking to close the connection (no
+  `Connection` header may reach an HTTP/2 client); HEAD;
+- a 3 MB upload, counted (past the 64 KB HTTP/2 flow-control windows);
+- an 8 MB download of unknown length produced with backpressure, every byte
+  checked;
+- six streams at once on one connection;
+- a drain with a stream under way: it completes, then the connection closes;
+- `hc_server_set_http2(s, 0)`: a client asking for h2 gets HTTP/1.1.
 
 **TLS server name** (`tests/tls_name_test`, 19 checks) connects over https
 to 127.0.0.1, where a plain OpenSSL server answers with the SNI it received.
