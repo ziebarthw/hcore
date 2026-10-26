@@ -11,6 +11,7 @@
 /tests/shutdown_test
 /tests/tls_name_test
 /tests/h2_test
+/tests/processor_test
 
 # local build settings (see config.mk.example)
 /config.mk
