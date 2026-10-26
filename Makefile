@@ -72,6 +72,9 @@ full_duplex_client: examples/full_duplex_client.o $(HC_OBJS)
 full_duplex_server: examples/full_duplex_server.o $(HC_OBJS)
 	$(CC) -o $@ $^ $(EVHTP_LIBS)
 
+hcurl: examples/hcurl.o $(HC_OBJS)
+	$(CC) -o $@ $^ $(EVHTP_LIBS)
+
 # Pool unit tests: fake connections, no sockets.
 tests/pool_test: tests/pool_test.c $(HC_OBJS)
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -o $@ $^ $(EVHTP_LIBS)
