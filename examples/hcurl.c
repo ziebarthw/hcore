@@ -1,3 +1,8 @@
+/*
+ * hcurl.c - a basic url fetcher based on hcore, the C port of httpcore5.
+ *
+ * Usage: hcurl <http[s]://host[:port]/path>
+ */
 
 #include "hc.h"
 #include "hc_pool.h"
@@ -13,8 +18,6 @@
 /* ------------------------------------------------------------------------ */
 
 typedef struct run {
-//    run_stats st;
-//    int       ok;
     hc_reactor *reactor;
     const char *url;
 } run;
@@ -105,10 +108,7 @@ main(int argc, char **argv)
 {
     if (argc < 2) {
         fprintf(stderr,
-                "Usage: %s <http[s]://host[:port]/path>\n"
-                "  e.g. %s http://httpbin.org/post\n"
-                "       %s --duplex 8 http://127.0.0.1:8081/echo   (examples/echo_server)\n",
-                argv[0], argv[0], argv[0]);
+                "Usage: %s <http[s]://host[:port]/path>\n", argv[0]);
         return 2;
     }
 
