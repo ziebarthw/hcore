@@ -26,6 +26,7 @@
  *    the request-fini hook can still unregister from the output buffer.
  */
 #include "hc.h"
+#include "hc_processor.h"
 #include "hc_pool.h"
 #include "htstring/htstring.h"     /* third_party/htstring */
 
@@ -351,6 +352,21 @@ hc_headers_get(const hc_headers *h, const char *name)
     }
 
     return NULL;
+}
+
+hc_headers *
+hc_headers_copy(const hc_headers *h)
+{
+    hc_headers *c = hc_headers_new();
+
+    for (size_t i = 0; c && h && i < h->n; i++) {
+        if (hc_headers_add(c, h->kv[2 * i], h->kv[2 * i + 1]) != 0) {
+            hc_headers_free(c);
+            return NULL;
+        }
+    }
+
+    return c;
 }
 
 size_t
@@ -735,6 +751,7 @@ struct hc_server {
     size_t                    n_routes;
     hc_server_listener        listener;
     int                       http2;   /* offer h2 in TLS ALPN (if built in) */
+    hc_processor             *processor; /* interceptors (own reference) */
 #ifdef HC_HAVE_TLS
     evhtp_ssl_cfg_t           tls;     /* libevhtp keeps a pointer to it */
 #endif
@@ -765,6 +782,8 @@ struct hc_server_exchange {
     int                  input_suspended;
     int                  keep_alive;   /* connection stays open afterwards */
     int                  h2;           /* an HTTP/2 stream                 */
+    hc_processor        *proc;         /* the server's when it began (ref) */
+    hc_context          *ctx;          /* interceptors' and handler's     */
     const char          *reason;
     char                 remote[64];   /* "address:port", for the listener */
     struct sockaddr_storage remote_addr;   /* copied when the request arrives */
@@ -855,9 +874,38 @@ hc_response_send(hc_response_channel *rc, const hc_response_head *head,
     const char         *conn_hdr;
     struct bufferevent *bev;
     char                num[32];
+    hc_headers         *own_headers = NULL;
+    hc_response_head    processed;
 
     if (req == NULL || ex->resp_started || ex->failed) {
         return NULL;
+    }
+
+    /* Interceptors work on a copy (the caller's head is const); they may
+     * change the status and headers. A refusal drops the connection: the
+     * handler's response cannot be replaced at this point. */
+    if (ex->proc) {
+        hc_http_response r;
+
+        if ((own_headers = hc_headers_copy(head->headers)) == NULL) {
+            hc_server_abort(ex);
+            return NULL;
+        }
+
+        r.status   = head->status;
+        r.version  = head->version;
+        r.headers  = own_headers;
+
+        if (hc_processor_process_response(ex->proc, &r, entity, ex->ctx) != 0) {
+            hc_headers_free(own_headers);
+            hc_server_abort(ex);
+            return NULL;
+        }
+
+        processed         = *head;
+        processed.status  = r.status;
+        processed.headers = own_headers;
+        head              = &processed;
     }
 
     ex->resp_started = 1;
@@ -875,6 +923,9 @@ hc_response_send(hc_response_channel *rc, const hc_response_head *head,
     if ((conn_hdr && has_token(conn_hdr, "close")) || ex->srv->draining) {
         req->flags &= ~EVHTP_REQ_FLAG_KEEPALIVE;    /* "Connection: close" */
     }
+
+    hc_headers_free(own_headers);   /* copied into libevhtp's by now */
+    conn_hdr = NULL;
 
     if (entity == NULL) {
         evhtp_send_reply_start(req, (evhtp_res)head->status);
@@ -1295,6 +1346,39 @@ static const hc_server_handler_vtbl not_found_vtbl = {
 
 static hc_server_handler not_found_handler = { &not_found_vtbl };
 
+/* A request an interceptor refused: answered with its status, in place of
+ * the application's handler (which is released unused). Any request body
+ * is read and discarded. */
+typedef struct refused_handler {
+    hc_server_handler base;
+    int               status;
+} refused_handler;
+
+static void
+rf_handle_request(hc_server_handler *self, hc_server_exchange *ex,
+                  const hc_request_head *head, const hc_entity *entity,
+                  hc_response_channel *rc)
+{
+    (void)ex;
+    (void)head;
+    (void)entity;
+    hc_response_send_simple(rc, ((refused_handler *)(void *)self)->status, "text/plain",
+                            "Request refused", 0);
+}
+
+static void
+rf_release(hc_server_handler *self)
+{
+    free(self);
+}
+
+static const hc_server_handler_vtbl refused_vtbl = {
+    .handle_request = rf_handle_request,
+    .consume        = nf_consume,
+    .stream_end     = nf_stream_end,
+    .release        = rf_release,
+};
+
 static void
 format_remote(const evhtp_connection_t *c, char *buf, size_t len)
 {
@@ -1425,6 +1509,11 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
         return EVHTP_RES_SERVUNAVAIL;
     }
 
+    ex->proc = hc_processor_ref(srv->processor);
+    ex->ctx  = hc_context_new(1, NULL, ex->remote);
+    hc_context_set_protocol(ex->ctx, ex->h2 ? 20 : req->proto == EVHTP_PROTO_10 ? 10 : 11,
+                            ex->conn && ex->conn->ssl != NULL);
+
     ex->next = srv->exchanges;              /* unlinked in srv_task_cb */
     if (srv->exchanges) {
         srv->exchanges->prev = ex;
@@ -1474,6 +1563,28 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
     head.authority = hc_headers_get(h, "host");
     head.version   = ex->h2 ? 20 : req->proto == EVHTP_PROTO_10 ? 10 : 11;
     head.headers   = h;
+
+    /* Interceptors: they may change the headers; one may refuse the
+     * request, which is then answered with its status instead of going to
+     * the handler. The listener and the handler see the result. */
+    if (ex->proc) {
+        hc_http_request r = { head.method, head.target, head.authority, head.version, h };
+        int             rv = hc_processor_process_request(ex->proc, &r, entity, ex->ctx);
+
+        if (rv != 0) {
+            refused_handler *rf = calloc(1, sizeof(*rf));
+
+            ex->h->vtbl->release(ex->h);    /* never saw the request */
+
+            if (rf) {
+                rf->base.vtbl = &refused_vtbl;
+                rf->status    = rv;
+                ex->h         = &rf->base;
+            } else {
+                ex->h = &not_found_handler; /* out of memory: still answer */
+            }
+        }
+    }
 
     if (srv->listener.on_request_head) {
         srv->listener.on_request_head(srv->listener.arg, ex->remote, &head);
@@ -1540,6 +1651,8 @@ srv_task_cb(evutil_socket_t fd, short what, void *arg)
             event_active(ex->srv->drain_ev, EV_TIMEOUT, 0);
         }
 
+        hc_context_free(ex->ctx);
+        hc_processor_unref(ex->proc);
         event_free(ex->task);
         free(ex);
     }
@@ -1742,6 +1855,27 @@ hc_server_set_http2(hc_server *s, int enabled)
 #endif
 }
 
+void
+hc_server_set_processor(hc_server *s, hc_processor *p)
+{
+    if (s) {
+        hc_processor *old = s->processor;
+
+        s->processor = hc_processor_ref(p);
+        hc_processor_unref(old);
+    }
+}
+
+hc_context *
+hc_server_exchange_context(hc_server_exchange *ex)
+{
+    if (ex && ex->ctx == NULL) {
+        ex->ctx = hc_context_new(1, NULL, ex->remote);
+    }
+
+    return ex ? ex->ctx : NULL;
+}
+
 int
 hc_server_listen(hc_server *s, const char *addr, uint16_t port)
 {
@@ -1902,6 +2036,7 @@ hc_server_free(hc_server *s)
         }
 
         free(s->routes);
+        hc_processor_unref(s->processor);
         free(s);
     }
 }
@@ -1948,6 +2083,7 @@ struct hc_requester {
     struct hc_connect_op *ops;
     struct hc_endpoint   *eps;
     int                   closing;  /* hc_requester_free() in progress */
+    hc_processor         *processor; /* interceptors (own reference) */
 };
 
 struct hc_connect_op {
@@ -2036,6 +2172,8 @@ struct hc_client_exchange {
     int                 released;
     int                 input_suspended;
     const char         *reason;
+    hc_context         *ctx;           /* interceptors' and handler's       */
+    const hc_processor *proc;          /* the requester's (borrowed), or NULL */
 };
 
 static void cli_task_cb(evutil_socket_t fd, short what, void *arg);
@@ -2674,6 +2812,7 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
     hc_client_exchange *cx   = rc->cx;
     evhtp_connection_t *conn = cx_conn(cx);
     int                 m    = method_from_string(head->method);
+    hc_headers         *own_headers = NULL;
     char                num[32];
 
     if (cx->head_sent || conn == NULL || cx->req == NULL || cx->failed) {
@@ -2688,12 +2827,38 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
 
     cx->head_sent = 1;
 
+    /* Interceptors work on a copy of the headers: the caller's are const. */
+    if (cx->proc) {
+        hc_http_request r;
+
+        if ((own_headers = hc_headers_copy(head->headers)) == NULL) {
+            cli_fail(cx, "out of memory");
+            schedule(cx->task, &cx->pending, T_ABORT);
+            return NULL;
+        }
+
+        r.method    = head->method;
+        r.target    = head->target;
+        r.authority = head->authority;
+        r.version   = head->version;
+        r.headers   = own_headers;
+        hc_context_set_protocol(cx->ctx, head->version, cx->pc && hc_host_is_tls(&cx->pc->target));
+
+        if (hc_processor_process_request(cx->proc, &r, entity, cx->ctx) != 0) {
+            hc_headers_free(own_headers);
+            cli_fail(cx, "request refused by interceptor");
+            schedule(cx->task, &cx->pending, T_ABORT);
+            return NULL;
+        }
+    }
+
     if (head->authority) {
         evhtp_headers_add_header(cx->req->headers_out,
             evhtp_header_new("Host", head->authority, 0, 1));
     }
 
-    headers_to_evhtp(head->headers, cx->req->headers_out);
+    headers_to_evhtp(own_headers ? own_headers : head->headers, cx->req->headers_out);
+    hc_headers_free(own_headers);
 
     if (entity && entity->content_length >= 0) {
         snprintf(num, sizeof(num), "%lld", (long long)entity->content_length);
@@ -2745,6 +2910,16 @@ hc_client_resume_input(hc_client_exchange *cx)
         cx->input_suspended = 0;
         bufferevent_enable(evhtp_connection_get_bev(cx_conn(cx)), EV_READ);
     }
+}
+
+hc_context *
+hc_client_exchange_context(hc_client_exchange *cx)
+{
+    if (cx && cx->ctx == NULL) {
+        cx->ctx = hc_context_new(0, cx->pc ? &cx->pc->target : NULL, NULL);
+    }
+
+    return cx ? cx->ctx : NULL;
 }
 
 void
@@ -2810,6 +2985,24 @@ cli_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
 
     if (cx->keep_alive_ms < 0 && cx->pc && cx->pc->rq) {
         cx->keep_alive_ms = cx->pc->rq->default_keep_alive_ms;
+    }
+
+    /* Interceptors: after the engine has read framing and persistence from
+     * the headers as received, before the handler sees them. */
+    if (cx->proc && !cx->failed && !cx->released) {
+        hc_http_response r = { head.status, head.version, h };
+
+        hc_context_set_protocol(cx->ctx, head.version, cx->pc && hc_host_is_tls(&cx->pc->target));
+
+        if (hc_processor_process_response(cx->proc, &r, entity, cx->ctx) != 0) {
+            cli_fail(cx, "response refused by interceptor");
+            cx->resp_keepalive = 0;
+            schedule(cx->task, &cx->pending, T_ABORT);
+            hc_headers_free(h);
+            return EVHTP_RES_OK;
+        }
+
+        head.status = r.status;
     }
 
     if (!cx->failed && !cx->released) {
@@ -3092,6 +3285,7 @@ cli_task_cb(evutil_socket_t fd, short what, void *arg)
             pc_destroy(pc);     /* unpooled: the connection was ours alone */
         }
 
+        hc_context_free(cx->ctx);
         event_free(cx->task);
         free(cx);
     }
@@ -3123,8 +3317,9 @@ hc_client_execute(hc_reactor *r, const hc_host *target, hc_client_handler *h)
         return NULL;
     }
 
-    cx->pc = pc;
-    pc->cx = cx;
+    cx->pc  = pc;
+    cx->ctx = hc_context_new(0, target, NULL);
+    pc->cx  = cx;
     schedule(cx->task, &cx->pending, T_START);
 
     return cx;
@@ -3362,6 +3557,8 @@ hc_endpoint_execute(hc_endpoint *ep, hc_client_handler *h)
 
     cx->pc     = ep->pc;
     cx->ep     = ep;
+    cx->proc   = ep->rq->processor;     /* the requester outlives its exchanges */
+    cx->ctx    = hc_context_new(0, &ep->pc->target, NULL);
     ep->cx     = cx;
     ep->pc->cx = cx;
 
@@ -3497,6 +3694,7 @@ hc_requester_new(hc_reactor *r, const hc_requester_config *cfg)
     pc.reuse_policy          = c.fifo ? HC_POOL_REUSE_FIFO : HC_POOL_REUSE_LIFO;
 
     rq->r                     = r;
+    rq->processor             = hc_processor_ref(c.processor);
     rq->default_keep_alive_ms = c.default_keep_alive_ms > 0 ? c.default_keep_alive_ms : 180000;
     rq->pool                  = hc_pool_new(r, &pc, &ops, rq);
     rq->housekeeping          = hc_timer_new(r, housekeeping_cb, rq);
@@ -3507,6 +3705,7 @@ hc_requester_new(hc_reactor *r, const hc_requester_config *cfg)
 #ifdef HC_HAVE_TLS
         SSL_CTX_free(rq->tls_ctx);
 #endif
+        hc_processor_unref(rq->processor);
         free(rq);
         return NULL;
     }
@@ -3581,6 +3780,7 @@ hc_requester_free(hc_requester *rq)
 #ifdef HC_HAVE_TLS
     SSL_CTX_free(rq->tls_ctx);
 #endif
+    hc_processor_unref(rq->processor);  /* after its exchanges are done */
     free(rq);
 }
 

@@ -109,6 +109,8 @@ void        hc_headers_free(hc_headers *h);
 int         hc_headers_add(hc_headers *h, const char *name, const char *value);
 size_t      hc_headers_remove(hc_headers *h, const char *name); /* all matches */
 const char *hc_headers_get(const hc_headers *h, const char *name); /* first */
+/* A copy of h (NULL h: an empty list); NULL on allocation failure. */
+hc_headers *hc_headers_copy(const hc_headers *h);
 size_t      hc_headers_count(const hc_headers *h);
 int         hc_headers_at(const hc_headers *h, size_t i,
                           const char **name, const char **value);
@@ -223,6 +225,11 @@ hc_data_channel *hc_request_send(hc_request_channel *ch,
 /* Server side: AsyncServerExchangeHandler                                  */
 /* ------------------------------------------------------------------------ */
 
+/* Interceptors and their processor, and the per-exchange context they
+ * share with the handler: see hc_processor.h. */
+typedef struct hc_processor hc_processor;
+typedef struct hc_context   hc_context;
+
 typedef struct hc_server_exchange hc_server_exchange;  /* opaque, engine side */
 typedef struct hc_server_handler  hc_server_handler;
 
@@ -314,6 +321,14 @@ int        hc_server_enable_tls(hc_server *s, const char *cert_file, const char 
  * whole connection, every stream on it; a drain closes each connection
  * once its last stream is done. */
 int        hc_server_set_http2(hc_server *s, int enabled);
+/* Interceptors for every exchange (hc_processor.h): takes its own
+ * reference, drops the previous one; NULL removes them. Exchanges already
+ * under way keep the processor they started with. */
+void       hc_server_set_processor(hc_server *s, hc_processor *p);
+/* The exchange's context (hc_processor.h): what its interceptors set,
+ * readable and writable by the handler for as long as the exchange lives
+ * (made on first use). NULL only on allocation failure. */
+hc_context *hc_server_exchange_context(hc_server_exchange *ex);
 int        hc_server_listen(hc_server *s, const char *addr, uint16_t port);
 void       hc_server_free(hc_server *s);
 
@@ -393,6 +408,10 @@ void hc_client_resume_input(hc_client_exchange *cx);
 /* Abort the exchange: ->failed("cancelled") then ->release() (unless the
  * exchange already completed). */
 void hc_client_cancel(hc_client_exchange *cx);
+/* The exchange's context (hc_processor.h): what its interceptors set,
+ * readable and writable by the handler for as long as the exchange lives
+ * (made on first use). NULL only on allocation failure. */
+hc_context *hc_client_exchange_context(hc_client_exchange *cx);
 
 /* ------------------------------------------------------------------------ */
 /* Pooled connections: requester + endpoints                                */
@@ -416,6 +435,9 @@ typedef struct hc_requester_config {
      * tls_ca_file (PEM) when set, and must match the host name (or IP). */
     const char *tls_ca_file;
     int         tls_no_verify;     /* 1: skip all verification (testing only) */
+    /* Interceptors for every exchange (hc_processor.h); the requester takes
+     * its own reference. NULL: none. */
+    hc_processor *processor;
 } hc_requester_config;
 
 hc_requester *hc_requester_new(hc_reactor *r, const hc_requester_config *cfg);

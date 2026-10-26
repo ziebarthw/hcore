@@ -34,7 +34,7 @@ EVHTP_LIBS   = $(EVHTP_PREFIX)/lib/libevhtp.a $(EXTRA_LIBS) -levent -levent_open
 
 all: libhcore.a reverse_proxy echo_server full_duplex_client full_duplex_server
 
-src/hc_evhtp.o: src/hc_evhtp.c include/hc.h include/hc_pool.h third_party/htstring/include/htstring/htstring.h
+src/hc_evhtp.o: src/hc_evhtp.c include/hc.h include/hc_pool.h include/hc_processor.h third_party/htstring/include/htstring/htstring.h
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE $(EVHTP_CFLAGS) -c -o $@ $<
 
 # Engine-independent parts: hc.h (and hc_pool.h) only.
@@ -47,8 +47,11 @@ src/hc_host.o: src/hc_host.c include/hc.h
 src/hc_support.o: src/hc_support.c include/hc_support.h include/hc.h
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -c -o $@ $<
 
-HC_OBJS = src/hc_evhtp.o src/hc_pool.o src/hc_host.o src/hc_support.o
-HC_HDRS = include/hc.h include/hc_pool.h include/hc_support.h
+src/hc_processor.o: src/hc_processor.c include/hc_processor.h include/hc.h
+	$(CC) $(HC_CFLAGS) $(CFLAGS) -c -o $@ $<
+
+HC_OBJS = src/hc_evhtp.o src/hc_pool.o src/hc_host.o src/hc_support.o src/hc_processor.o
+HC_HDRS = include/hc.h include/hc_pool.h include/hc_support.h include/hc_processor.h
 
 # The library other projects link with: -lhcore, then libevhtp and what it needs
 # (the EVHTP_LIBS list below).
@@ -57,7 +60,7 @@ libhcore.a: $(HC_OBJS)
 	$(AR) rcs $@ $^
 
 # The examples compile against hc*.h only - no libevhtp/libevent/OpenSSL headers.
-examples/%.o: examples/%.c include/hc.h include/hc_pool.h include/hc_support.h
+examples/%.o: examples/%.c include/hc.h include/hc_pool.h include/hc_support.h include/hc_processor.h
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -c -o $@ $<
 
 reverse_proxy: examples/reverse_proxy.o $(HC_OBJS)
@@ -96,6 +99,10 @@ tests/shutdown_test: tests/shutdown_test.c $(HC_OBJS)
 tests/tls_name_test: tests/tls_name_test.c $(HC_OBJS)
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -o $@ $^ $(EVHTP_LIBS)
 
+# Interceptors and processors on both sides of real exchanges.
+tests/processor_test: tests/processor_test.c $(HC_OBJS)
+	$(CC) $(HC_CFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE -o $@ $^ $(EVHTP_LIBS)
+
 # HTTP/2 server (only with a libevhtp that has HTTP/2: the ziebarthw fork
 # built with nghttp2; needs curl with HTTP/2 to run).
 HAVE_H2 := $(shell grep -qs EVHTP_CONN_FLAG_IS_HTTP2 $(EVHTP_PREFIX)/include/evhtp/evhtp.h && echo yes)
@@ -104,12 +111,13 @@ H2_TEST := $(if $(HAVE_H2),tests/h2_test)
 tests/h2_test: tests/h2_test.c $(HC_OBJS)
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -o $@ $^ $(EVHTP_LIBS)
 
-check: all tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test $(H2_TEST)
+check: all tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/processor_test $(H2_TEST)
 	tests/pool_test
 	tests/support_test tests/tls
 	tests/embed_test
 	tests/shutdown_test
 	tests/tls_name_test tests/tls
+	tests/processor_test
 	$(if $(HAVE_H2),tests/h2_test tests/tls,@echo "h2_test: skipped (libevhtp without HTTP/2)")
 	tests/run.sh
 
@@ -165,6 +173,6 @@ libhcore.pc:
 	@echo "wrote $@"
 
 clean:
-	rm -f libhcore.a libhcore.pc src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/h2_test
+	rm -f libhcore.a libhcore.pc src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/h2_test tests/processor_test
 
 .PHONY: all clean check install libhcore.pc

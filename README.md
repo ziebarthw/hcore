@@ -13,10 +13,12 @@ and
 include/hc.h            the "interfaces" an app implements, channels it calls, hc_host (no libevhtp types)
 include/hc_pool.h       generic route-based connection pool (StrictConnPool model)
 include/hc_support.h    request producers, response consumers, basic client handler (nio.support)
+include/hc_processor.h  request/response interceptors, the HTTP processor, the exchange context (http.protocol)
 src/hc_evhtp.c          engine: drives the interfaces from libevhtp/libevent/OpenSSL
 src/hc_pool.c           the pool              } engine-independent:
 src/hc_host.c           hc_host / URI parsing } hc.h only
 src/hc_support.c        producers/consumers   }
+src/hc_processor.c      interceptors/context  }
 examples/reverse_proxy.c       port of AsyncReverseProxyExample (pooled, http/https origins, relays 1xx)
 examples/full_duplex_client.c  port of AsyncFullDuplexClientExample (producers/consumers, http/https)
 examples/full_duplex_server.c  port of AsyncFullDuplexServerExample (routing, stream listener, http/https)
@@ -27,6 +29,7 @@ tests/embed_test.c      hcore in the application's event loop: reuse_port, pause
 tests/shutdown_test.c   freeing a requester (and server) while the application's loop keeps running
 tests/tls_name_test.c   https to an address, presenting and verifying a host name (hc_host.tls_name)
 tests/h2_test.c         the server over HTTP/2 (libevhtp with HTTP/2 only), checked with curl
+tests/processor_test.c  interceptors and processors on both sides of real exchanges
 tests/run.sh            end-to-end tests (curl / client -> proxy -> tests/origin.py, echo_server)
 tests/tls/              self-signed test certificates (localhost, other.example)
 third_party/htstring/   copy of htstring: htstring_t string views, used by the engine's routing
@@ -245,6 +248,47 @@ does past its limit. The exchange is then cancelled, the connection is not
 reused, and the callback fails with the reason. The full-duplex client's
 duplex mode uses exactly this: a pattern-generating producer and a verifying
 consumer, plugged into the same basic handler.
+
+## Interceptors and the HTTP processor (`hc_processor.h`)
+
+The lightweight way to shape every exchange's headers, as httpcore5's
+`HttpProcessor` with its `HttpRequestInterceptor`s and
+`HttpResponseInterceptor`s. A processor is built once, is immutable and
+reference counted (atomically), so one can serve every requester and server
+on every thread:
+
+```c
+hc_processor_builder *b = hc_processor_builder_new();
+hc_processor_builder_add_target_host(b);                  /* RequestTargetHost */
+hc_processor_builder_add_user_agent(b, "htm8/0.6");       /* RequestUserAgent  */
+hc_processor_builder_add_request_last(b, add_auth, token, free);   /* your own */
+hc_processor *p = hc_processor_builder_build(b);
+
+hc_requester_config cfg = { .processor = p };             /* client side */
+hc_requester *rq = hc_requester_new(r, &cfg);
+hc_processor_unref(p);                                    /* rq keeps its own ref */
+
+hc_processor *sp = hc_processor_server_default("htm8");   /* server side */
+hc_server_set_processor(server, sp);
+hc_processor_unref(sp);
+```
+
+Where they run: client request interceptors just before the request head is
+sent, client response interceptors when the final response head arrives
+(before `consume_response()`); server request interceptors after the head is
+parsed (before `handle_request()`), server response interceptors in
+`hc_response_send()`. They change headers (and a response's status); framing
+headers stay the engine's. Returning a status (400..599) stops the exchange:
+a client request is not sent and fails, a client response fails the
+exchange, a server request is answered with that status instead of reaching
+the handler, and a refused server response drops the connection.
+
+Each exchange has an `hc_context` (`HttpCoreContext`): attributes the
+interceptors and the handler share (`hc_server_exchange_context()`,
+`hc_client_exchange_context()`), the protocol version, TLS, and the target
+(client) or the client's address (server). Standard interceptors: target
+host, user agent, request date, default headers, response date, server;
+`hc_processor_client_default()` / `_server_default()` as `HttpProcessors`.
 
 ## Interim (1xx) responses
 
@@ -677,6 +721,19 @@ for comparison, the same requests over HTTP/1.1:
 - six streams at once on one connection;
 - a drain with a stream under way: it completes, then the connection closes;
 - `hc_server_set_http2(s, 0)`: a client asking for h2 gets HTTP/1.1.
+
+**Interceptors** (`tests/processor_test`, 71 checks): an hcore client and
+server, each with a processor, on one reactor. Server side: request
+interceptors run in builder order (first/last), change and hide headers,
+pass a request id through the context to the handler and to the response
+interceptors; Date/Server are added; a response interceptor rewrites the
+status; a refused request gets 403 without the handler running; a refused
+response drops the connection. Client side: Host from the target,
+User-Agent, default headers, Date only with a body, a custom interceptor
+whose context reaches the response side; a refused request sends nothing; a
+refused response fails the exchange. The client and server keep working
+afterwards; the defaults and a shared, multiply referenced processor are
+checked directly; valgrind: no errors, no leaks.
 
 **TLS server name** (`tests/tls_name_test`, 19 checks) connects over https
 to 127.0.0.1, where a plain OpenSSL server answers with the SNI it received.
