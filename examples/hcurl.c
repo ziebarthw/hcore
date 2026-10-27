@@ -6,6 +6,7 @@
 
 #include "hc.h"
 #include "hc_pool.h"
+#include "hc_processor.h"
 #include "hc_support.h"
 
 #include <stdio.h>
@@ -101,6 +102,41 @@ on_pool_lease(void *arg, const hc_pool_entry *e, hc_pool_stats t)
            t.leased, t.available);
 }
 
+/* ======================================================================== */
+/* Client interceptors                                                      */
+/* ======================================================================== */
+
+static int
+cli_req_cb(void *arg, hc_http_request *req, const hc_entity *e, hc_context *ctx)
+{
+    (void)arg;
+    (void)e;
+
+    printf("%s - context:\n\tis server %d\n\tis tls %d\n\tprotocol version %d\n\tremote \"%s\"\n",
+        __func__, hc_context_is_server(ctx), hc_context_is_tls(ctx), hc_context_protocol_version(ctx), hc_context_remote(ctx));
+
+    printf("%s - req:\n\tmethod \"%s\"\n\ttarget \"%s\"\n\tauthority \"%s\"\n\tversion %d\n",
+        __func__, req->method, req->target, req->authority, req->version);
+
+    const hc_host *target = hc_context_target(ctx);
+    printf("%s - target:\n\tscheme \"%s\"\n\tname \"%s\"\n\tport %u\n\ttls name \"%s\"\n",
+        __func__, target->scheme, target->name, target->port, target->tls_name);
+    return 0;
+}
+
+static int
+cli_resp_cb(void *arg, hc_http_response *resp, const hc_entity *e, hc_context *ctx)
+{
+    (void)arg;
+    (void)e;
+
+    printf("%s - context:\n\tis server %d\n\tis tls %d\n\tprotocol version %d\n\tremote \"%s\"\n",
+        __func__, hc_context_is_server(ctx), hc_context_is_tls(ctx), hc_context_protocol_version(ctx), hc_context_remote(ctx));
+    printf("%s - resp:\n\tstatus %d\n\tversion %d\n",
+        __func__, resp->status, resp->version);
+    return 0;
+}
+
 /* ------------------------------------------------------------------------ */
 
 int
@@ -130,8 +166,24 @@ main(int argc, char **argv)
         return 1;
     }
 
-    hc_requester_config cfg = { 0 };
+    /* client: standard interceptors + a custom one */
+    hc_headers *defaults = hc_headers_new();
+    hc_headers_add(defaults, "Accept", "text/*");
+    hc_processor_builder *b = hc_processor_builder_new();
+    hc_processor_builder_add_target_host(b);
+    hc_processor_builder_add_user_agent(b, "hcurl-httpcore-agent/1.0");
+    hc_processor_builder_add_default_headers(b, defaults);
+    hc_processor_builder_add_request_date(b);
+    hc_processor_builder_add_request_last(b, cli_req_cb, NULL, NULL);
+    hc_processor_builder_add_response_last(b, cli_resp_cb, NULL, NULL);
+    hc_processor *cli_proc = hc_processor_builder_build(b);
+    hc_headers_free(defaults);                          /* copied */
+
+    hc_requester_config cfg = {
+        .processor = cli_proc
+    };
     hc_requester *requester = hc_requester_new(reactor, &cfg);
+    hc_processor_unref(cli_proc);                       /* the requester keeps it */
 
     hc_pool_listener l = {
         on_pool_lease,
