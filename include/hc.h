@@ -59,10 +59,10 @@ extern "C" {
 #define HC_CONTAINER_OF(ptr, type, member) \
     ((type *)(void *)((char *)(ptr) - offsetof(type, member)))
 
-#define HT_SET_FLAG(val, mask)   ((val) |= (mask))
-#define HT_CLEAR_FLAG(val, mask) ((val) &= ~(mask))
-#define HT_TEST_FLAG(val, mask)  (((val) & (mask)) != 0)
-#define HT_TEST_ALL(val, mask)   (((val) & (mask)) == (mask))
+#define HC_SET_FLAG(val, mask)   ((val) |= (mask))
+#define HC_CLEAR_FLAG(val, mask) ((val) &= ~(mask))
+#define HC_TEST_FLAG(val, mask)  (((val) & (mask)) != 0)
+#define HC_TEST_ALL(val, mask)   (((val) & (mask)) == (mask))
 
 /* ------------------------------------------------------------------------ */
 /* Reactor (event loop)                                                     */
