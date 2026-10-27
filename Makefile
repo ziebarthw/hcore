@@ -112,8 +112,11 @@ tests/timeout_test: tests/timeout_test.c $(HC_OBJS)
 HAVE_H2 := $(shell grep -qs EVHTP_CONN_FLAG_IS_HTTP2 $(EVHTP_PREFIX)/include/evhtp/evhtp.h && echo yes)
 H2_TEST := $(if $(HAVE_H2),tests/h2_test)
 
+# hc_server_abort() resetting one stream needs evhtp_request_reset_stream().
+HAVE_RESET := $(shell grep -qs EVHTP_HAVE_REQUEST_RESET_STREAM $(EVHTP_PREFIX)/include/evhtp/evhtp.h && echo yes)
+
 tests/h2_test: tests/h2_test.c $(HC_OBJS)
-	$(CC) $(HC_CFLAGS) $(CFLAGS) -o $@ $^ $(EVHTP_LIBS)
+	$(CC) $(HC_CFLAGS) $(CFLAGS) $(if $(HAVE_RESET),-DHC_TEST_STREAM_RESET) -o $@ $^ $(EVHTP_LIBS)
 
 check: all tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/processor_test tests/timeout_test $(H2_TEST)
 	tests/pool_test

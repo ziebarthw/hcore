@@ -12,6 +12,10 @@
  *   - a drain with a stream under way: the stream completes, then the
  *     connection closes
  *   - hc_server_set_http2(s, 0): the client gets HTTP/1.1
+ *   - hc_server_abort() on one stream (with a libevhtp that has
+ *     evhtp_request_reset_stream()): that stream is reset, another one on
+ *     the same connection completes; a stream reset in the middle of an
+ *     upload leaves the connection able to take the next upload
  *
  * Built only against a libevhtp with HTTP/2 (make check skips it otherwise).
  * Usage: h2_test <tests/tls dir>; needs curl with HTTP/2 on PATH (skipped
@@ -65,6 +69,7 @@ typedef struct th {
     unsigned long        sum;
     size_t               sent, total;   /* download */
     hc_timer            *timer;
+    int                  abort_on_data; /* /abort-upload */
 } th;
 
 #define TH(self) ((th *)(void *)(self))
@@ -81,6 +86,12 @@ slow_cb(void *arg)
     th *t = arg;
 
     reply_text(t, 200, "slow done", 0);
+}
+
+static void
+abort_cb(void *arg)
+{
+    hc_server_abort(((th *)arg)->ex);
 }
 
 static void
@@ -125,6 +136,24 @@ h_request(hc_server_handler *self, hc_server_exchange *ex, const hc_request_head
         hc_timer_start(t->timer, 300);
     } else if (strcmp(t->path, "/upload") == 0) {
         /* answered at stream_end */
+    } else if (strcmp(t->path, "/slow") == 0) {
+        t->timer = hc_timer_new(R, slow_cb, t);
+        hc_timer_start(t->timer, 400);
+    } else if (strcmp(t->path, "/abort") == 0) {
+        /* start a reply, send some of it, give up 100 ms later */
+        hc_headers      *h  = hc_headers_new();
+        hc_response_head rh = { 200, 11, h };
+        hc_entity        e  = { 100000, "text/plain" };
+        hc_data_channel *ch = hc_response_send(rc, &rh, &e);
+
+        hc_headers_free(h);
+        if (ch) {
+            hc_data_write(ch, "partial", 7);
+        }
+        t->timer = hc_timer_new(R, abort_cb, t);
+        hc_timer_start(t->timer, 100);
+    } else if (strcmp(t->path, "/abort-upload") == 0) {
+        t->abort_on_data = 1;
     } else {
         reply_text(t, 404, "?", 0);
     }
@@ -141,6 +170,11 @@ h_consume(hc_server_handler *self, const void *data, size_t len)
     }
 
     t->got += len;
+
+    if (t->abort_on_data && t->got >= 100000) {
+        t->abort_on_data = 0;
+        hc_server_abort(t->ex);
+    }
 }
 
 static void
@@ -427,6 +461,59 @@ main(int argc, char **argv)
         }
         printf("  six downloads correct\n");
     }
+
+#ifdef HC_TEST_STREAM_RESET
+    puts("HTTP/2: hc_server_abort() resets one stream");
+    {
+        int  slow_ok = 0, abort_reset = 0, conns = 0;
+        char file[128], want[64];
+        unsigned long sum;
+
+        /* both on one connection: the aborted stream must not take the
+         * other one with it. Per transfer: url code connects exitcode */
+        snprintf(args, sizeof(args), "--http2 --parallel --parallel-max 2 "
+                 "-w '%%{url_effective} %%{http_code} %%{num_connects} %%{exitcode}\\n' "
+                 "-o /dev/null https://127.0.0.1:%d/slow -o /dev/null https://127.0.0.1:%d/abort",
+                 PORT, PORT);
+        curl(args, out, sizeof(out));
+
+        for (char *l = out; l && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : NULL) {
+            char url[256];
+            int  code, nc, rc;
+
+            if (sscanf(l, "%255s %d %d %d", url, &code, &nc, &rc) == 4) {
+                conns += nc;
+                if (strstr(url, "/slow") && code == 200 && rc == 0) {
+                    slow_ok = 1;
+                }
+                if (strstr(url, "/abort") && rc != 0) {
+                    abort_reset = 1;    /* curl: stream error */
+                }
+            }
+        }
+
+        CHECK(slow_ok);
+        CHECK(abort_reset);
+        CHECK(conns == 1);
+        printf("  aborted stream reset, the other completed on the same connection:\n%s", out);
+
+        /* reset mid-upload, then a full upload on the same connection */
+        snprintf(file, sizeof(file), "%s/up.bin", tmpdir);
+        make_upload(file, 3u * 1024 * 1024, &sum);
+        snprintf(args, sizeof(args), "--http2 -w ' %%{http_code} %%{exitcode}\n' "
+                 "--data-binary @%s https://127.0.0.1:%d/abort-upload --next -k --http2 "
+                 "-w ' %%{num_connects}' --data-binary @%s https://127.0.0.1:%d/upload",
+                 file, PORT, file, PORT);
+        curl(args, out, sizeof(out));
+        snprintf(want, sizeof(want), "n=%u sum=%lu 0", 3u * 1024 * 1024, sum);
+        CHECK(strstr(out, want) != NULL);       /* num_connects 0: reused */
+        CHECK(strstr(out, " 0\nn=") == NULL);   /* the first one was not a success */
+        printf("  upload reset at 100 KB, next upload on the same connection: %s\n",
+               strstr(out, want) ? "ok" : out);
+    }
+#else
+    puts("HTTP/2: stream reset: skipped (libevhtp without evhtp_request_reset_stream)");
+#endif
 
     puts("HTTP/2: drain with a stream under way");
     {

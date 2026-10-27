@@ -263,7 +263,11 @@ typedef hc_server_handler *(*hc_server_handler_factory)(void *arg);
  * from the socket (at most one read buffer) may still be delivered. */
 void hc_server_suspend_input(hc_server_exchange *ex);
 void hc_server_resume_input(hc_server_exchange *ex);
-/* Drop the client connection. ->failed() and ->release() follow. */
+/* Abandon the exchange: HTTP/1.x drops the client connection; HTTP/2 resets
+ * just this stream (RST_STREAM, INTERNAL_ERROR) when libevhtp can
+ * (evhtp_request_reset_stream(), the ziebarthw fork), so the connection's
+ * other streams go on - otherwise it drops the whole connection too.
+ * ->failed("aborted") and ->release() follow. */
 void hc_server_abort(hc_server_exchange *ex);
 
 /* The exchange's connection: the client's address (remote), and our end of
@@ -317,8 +321,9 @@ int        hc_server_enable_tls(hc_server *s, const char *cert_file, const char 
  * version 20; libevhtp frames the reply (DATA frames, no chunking);
  * hc_response_send_information() is not supported (-1); trailers given to
  * hc_data_end() are not sent; hc_server_suspend_input() does nothing (the
- * connection is shared by all its streams); hc_server_abort() closes the
- * whole connection, every stream on it; a drain closes each connection
+ * connection is shared by all its streams); hc_server_abort() resets only
+ * its stream (with a libevhtp that has evhtp_request_reset_stream(); else
+ * it closes the whole connection, every stream on it); a drain closes each connection
  * once its last stream is done. */
 int        hc_server_set_http2(hc_server *s, int enabled);
 /* Interceptors for every exchange (hc_processor.h): takes its own
