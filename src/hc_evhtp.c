@@ -1045,6 +1045,14 @@ hc_response_send(hc_response_channel *rc, const hc_response_head *head,
     ex->resp_started = 1;
     bev              = evhtp_connection_get_bev(ex->conn);
 
+    switch (head->status / 100) {
+    case 1: ex->srv->stats.rq_1xx++; break;
+    case 2: ex->srv->stats.rq_2xx++; break;
+    case 3: ex->srv->stats.rq_3xx++; break;
+    case 4: ex->srv->stats.rq_4xx++; break;
+    case 5: ex->srv->stats.rq_5xx++; break;
+    }
+
     if (ex->srv->listener.on_response_head) {
         ex->srv->listener.on_response_head(ex->srv->listener.arg, ex->remote, head);
     }

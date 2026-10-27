@@ -462,6 +462,7 @@ prefix:
 | `rq_total`, `rq_active`, `rq_http1_total`, `rq_http2_total` | requests |
 | `rq_completed` | responses sent in full (not aborted, not cut off) |
 | `rq_too_large` | `413`s from the body limit |
+| `rq_1xx` … `rq_5xx` | final responses by status class, as sent (after the interceptors) |
 
 They are plain counters, read and updated on the server's reactor thread.
 
@@ -837,12 +838,12 @@ timeout and is reused; an origin that never reads a 64 MiB upload gives
 `"upstream write timeout"`. Run under valgrind with `HC_TEST_SCALE=5`
 (stretches every duration): no errors, no leaks.
 
-**Statistics** (`tests/stats_test`, 59 checks; 50 without HTTP/2) checks
+**Statistics** (`tests/stats_test`, 66 checks; 57 without HTTP/2) checks
 every server counter against what happened on the wire: a plain HTTP/1.1
 connection with two keep-alive requests (received and sent bytes equal
 exactly what the client sent and read), then closed; a response the client
 walks away from (counted, not completed); a body over the limit
-(`rq_too_large`); over TLS, an HTTP/2 connection with two streams moves
+(`rq_too_large`); responses counted by status class (2xx, 3xx, 4xx, 5xx); over TLS, an HTTP/2 connection with two streams moves
 from HTTP/1 to HTTP/2, and an HTTP/1.1-over-TLS connection stays HTTP/1;
 all gauges return to 0. Attachments: a fresh connection has none, a reused
 one has the one set on it, a second connection (the first held) has none,
