@@ -1658,10 +1658,13 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
     hc_request_head     head;
     hc_entity           e;
     const hc_entity    *entity;
-    const char         *method, *query;
-    char               *target;
-    size_t              tlen;
+    const char         *method, *query, *target;
     int                 close_delimited;
+
+    /* The request-target is needed only for this call: path+"?"+query is
+     * built in a stack scratch (heap only if longer than HT_SCRATCH_SIZE),
+     * freed when the function returns. */
+    ht_scratch_auto(tbuf);
 
     if ((ex = calloc(1, sizeof(*ex))) == NULL) {
         return EVHTP_RES_FATAL;
@@ -1727,18 +1730,23 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
     method      = htparser_get_methodstr_m(evhtp_request_get_method(req));
     ex->is_head = strcmp(method, "HEAD") == 0;
     query       = req->uri->query_raw ? (const char *)req->uri->query_raw : NULL;
-    tlen        = strlen(req->uri->path->full) + (query ? strlen(query) + 1 : 0) + 1;
-    target      = malloc(tlen);
-    h           = headers_from_evhtp(hdrs);
+
+    if (query == NULL) {
+        target = req->uri->path->full;      /* already the whole target */
+    } else {
+        const char *path = req->uri->path->full;
+
+        target = htstring_join_cstr_v(&tbuf, htstring_ctor(path, strlen(path)),
+                                      HTSTRING_LIT("?"),
+                                      htstring_ctor(query, strlen(query)));
+    }
+
+    h = headers_from_evhtp(hdrs);
 
     if (target == NULL || h == NULL) {
-        free(target);
         hc_headers_free(h);
         return EVHTP_RES_FATAL;   /* fini hook releases the exchange */
     }
-
-    snprintf(target, tlen, "%s%s%s", req->uri->path->full, query ? "?" : "",
-             query ? query : "");
 
     entity         = entity_from_headers(h, &e, 1, 0, &close_delimited);
 
@@ -1819,7 +1827,6 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
 
     ex->h->vtbl->handle_request(ex->h, ex, &head, entity, &ex->rc);
 
-    free(target);
     hc_headers_free(h);
 
     return EVHTP_RES_OK;
