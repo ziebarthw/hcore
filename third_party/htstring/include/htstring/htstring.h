@@ -3,6 +3,7 @@
 #define HTSTRING_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -204,7 +205,10 @@ htstring_has_suffix(const htstring_t str, const htstring_t suffix)
     return htstring_equals(target, suffix);
 }
 
+/* Override before including this header to change the stack size. */
+#ifndef HT_SCRATCH_SIZE
 #define HT_SCRATCH_SIZE 256
+#endif
 
 typedef struct {
     char *ptr;
@@ -219,27 +223,77 @@ ht_scratch_clear(ht_scratch_t * buf)
     buf->ptr = NULL;
 }
 
-/* Cleanup macro compatible with GLib's g_auto style */
+/*
+ * Cleanup macro compatible with GLib's g_auto style.
+ *
+ * Only ptr is initialized: "= { .ptr = NULL }" would also zero-fill the
+ * whole stack array on every call. Because this expands to a declaration
+ * plus a statement, do not jump over it with goto.
+ */
 #define ht_scratch_auto(name) \
-    ht_scratch_t name __attribute__((cleanup(ht_scratch_clear))) = { .ptr = NULL }
+    ht_scratch_t name __attribute__((cleanup(ht_scratch_clear))); \
+    name.ptr = NULL
+
+/*
+ * Reserves room for n bytes plus a NUL: the stack buffer when it fits,
+ * malloc() otherwise. Any earlier heap buffer in buf is freed first, so a
+ * scratch can be reused; buf->ptr must start out NULL (ht_scratch_auto or
+ * "= { .ptr = NULL }"). Returns NULL on allocation failure or overflow.
+ */
+static inline char *
+ht_scratch_reserve(ht_scratch_t * buf, size_t n)
+{
+    ht_scratch_clear(buf);
+    if (ht_unlikely(n == SIZE_MAX))
+        return NULL;
+    if (ht_likely(n < sizeof(buf->stack)))
+        buf->ptr = buf->stack;
+    else
+        buf->ptr = (char*)malloc(n + 1);
+    return buf->ptr;
+}
+
+/*
+ * Concatenates nparts strings into one NUL-terminated C string in buf
+ * (stack when the total fits, heap otherwise). NULL on failure.
+ */
+static inline const char *
+htstring_join_cstr(ht_scratch_t * buf, const htstring_t * parts, size_t nparts)
+{
+    size_t len = 0;
+    char * p;
+
+    for (size_t i = 0; i < nparts; ++i) {
+        if (ht_unlikely(parts[i].len > SIZE_MAX - 1 - len))
+            return NULL;
+        len += parts[i].len;
+    }
+
+    if ((p = ht_scratch_reserve(buf, len)) == NULL)
+        return NULL;
+
+    for (size_t i = 0; i < nparts; ++i) {
+        if (parts[i].len > 0) {     /* memcpy with a NULL pointer is UB */
+            memcpy(p, parts[i].startp, parts[i].len);
+            p += parts[i].len;
+        }
+    }
+    *p = '\0';
+
+    return buf->ptr;
+}
+
+/* htstring_join_cstr() over an inline list:
+ *   htstring_join_cstr_v(&buf, path, HTSTRING_LIT("?"), query) */
+#define htstring_join_cstr_v(buf, ...)                                   \
+    htstring_join_cstr((buf), (const htstring_t[]){ __VA_ARGS__ },       \
+        sizeof((const htstring_t[]){ __VA_ARGS__ }) / sizeof(htstring_t))
 
 /* Converts an htstring_t into a guaranteed NUL-terminated C string */
 static inline const char *
 htstring_to_cstr(ht_scratch_t * buf, const htstring_t s)
 {
-    if (ht_likely(s.len < sizeof(buf->stack))) {
-        buf->ptr = buf->stack;
-    } else {
-        buf->ptr = (char*)malloc(s.len + 1);
-        if (!buf->ptr) return NULL;
-    }
-
-    if (s.len > 0) {
-        memcpy(buf->ptr, s.startp, s.len);
-    }
-    buf->ptr[s.len] = '\0';
-
-    return buf->ptr;
+    return htstring_join_cstr(buf, &s, 1);
 }
 
 #endif

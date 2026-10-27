@@ -129,6 +129,56 @@ test_to_cstr(void)
     }
 }
 
+static void
+test_join_cstr(void)
+{
+    ht_scratch_t buf = { .ptr = NULL };
+    htstring_t   path  = HTSTRING_LIT("/a/b");
+    htstring_t   query = HTSTRING_LIT("x=1&y=2");
+
+    const char *c = htstring_join_cstr_v(&buf, path, HTSTRING_LIT("?"), query);
+    CHECK(c != NULL && strcmp(c, "/a/b?x=1&y=2") == 0);
+    CHECK(buf.ptr == buf.stack);
+
+    /* empty and NULL-pointer parts contribute nothing */
+    c = htstring_join_cstr_v(&buf, htstring_ctor(NULL, 0), path, HTSTRING_LIT(""));
+    CHECK(c != NULL && strcmp(c, "/a/b") == 0);
+
+    c = htstring_join_cstr(&buf, NULL, 0);
+    CHECK(c != NULL && strcmp(c, "") == 0 && buf.ptr == buf.stack);
+
+    /* total over the stack size goes to the heap... */
+    char big[HT_SCRATCH_SIZE];
+    memset(big, 'q', sizeof(big));
+    c = htstring_join_cstr_v(&buf, path, HTSTRING_LIT("?"), htstring_ctor(big, sizeof(big)));
+    CHECK(c != NULL && buf.ptr != buf.stack && strlen(c) == 5 + sizeof(big));
+
+    /* ...and reusing the scratch frees it and goes back to the stack */
+    c = htstring_join_cstr_v(&buf, path, HTSTRING_LIT("?"), query);
+    CHECK(c != NULL && buf.ptr == buf.stack && strcmp(c, "/a/b?x=1&y=2") == 0);
+
+    /* boundary: total of HT_SCRATCH_SIZE - 1 still fits with its NUL */
+    c = htstring_join_cstr_v(&buf, htstring_ctor(big, 10),
+                             htstring_ctor(big, HT_SCRATCH_SIZE - 11));
+    CHECK(c != NULL && buf.ptr == buf.stack && strlen(c) == HT_SCRATCH_SIZE - 1);
+    c = htstring_join_cstr_v(&buf, htstring_ctor(big, 10),
+                             htstring_ctor(big, HT_SCRATCH_SIZE - 10));
+    CHECK(c != NULL && buf.ptr != buf.stack && strlen(c) == HT_SCRATCH_SIZE);
+    ht_scratch_clear(&buf);
+
+    /* overflowing total length: refused, nothing allocated */
+    htstring_t huge[2] = { htstring_ctor(big, SIZE_MAX / 2 + 1),
+                           htstring_ctor(big, SIZE_MAX / 2 + 1) };
+    CHECK(htstring_join_cstr(&buf, huge, 2) == NULL && buf.ptr == NULL);
+
+    {
+        ht_scratch_auto(autobuf);
+        CHECK(autobuf.ptr == NULL);
+        c = htstring_join_cstr_v(&autobuf, path, htstring_ctor(big, sizeof(big)));
+        CHECK(c != NULL && strlen(c) == 4 + sizeof(big));
+    }
+}
+
 int
 main(void)
 {
@@ -136,5 +186,6 @@ main(void)
     test_trim_and_unenclose();
     test_compare();
     test_to_cstr();
+    test_join_cstr();
     return check_done("htstring_test");
 }

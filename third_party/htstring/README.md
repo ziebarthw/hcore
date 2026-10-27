@@ -35,7 +35,8 @@ typedef struct htstring { const char *startp; size_t len; } htstring_t;
   - `htstring_end(s)` gives the end pointer.
 - **Shrinking it in place:** `htstring_trim` / `ltrim` / `rtrim` remove whitespace. `htstring_unquote` (`"…"` or `'…'`), `htstring_unltgt` (`<…>`) and `htstring_unbracket` (`[…]`) remove the enclosing characters.
 - **Comparing:** `htstring_equals` / `equalsi` and `htstring_has_prefix` / `has_suffix`, plus their `i` variants. The `i` versions ignore ASCII case.
-- **Getting a NUL-terminated copy when an API needs one:** `htstring_to_cstr(&scratch, s)`. It uses a 256-byte stack buffer when the string fits and `malloc` otherwise. `ht_scratch_auto(name)` declares a scratch buffer that is freed automatically when it goes out of scope (GCC/Clang).
+- **Getting a NUL-terminated copy when an API needs one:** `htstring_to_cstr(&scratch, s)`. It uses a 256-byte stack buffer (`HT_SCRATCH_SIZE`, overridable before the include) when the string fits and `malloc` otherwise. `ht_scratch_auto(name)` declares a scratch buffer that is freed automatically when it goes out of scope (GCC/Clang).
+- **Concatenating into a NUL-terminated string:** `htstring_join_cstr(&scratch, parts, n)`, or `htstring_join_cstr_v(&scratch, a, HTSTRING_LIT("?"), b)` for an inline list. Same stack-or-heap rule, applied to the total length. A scratch can be reused: any earlier heap buffer is freed first.
 
 ```c
 const char *line = "Content-Type:  text/html; charset=UTF-8\r\n";
