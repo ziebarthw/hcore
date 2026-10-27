@@ -103,8 +103,8 @@ typedef struct sh {
     hc_server_handler    base;
     hc_server_exchange  *ex;
     hc_response_channel *rc;
-    char                 target[64];
-    char                 seen[512];
+    char                 target[512];
+    char                 seen[1024];
 } sh;
 
 static void
@@ -131,14 +131,14 @@ sh_request(hc_server_handler *self, hc_server_exchange *ex, const hc_request_hea
     }
 
     snprintf(t->seen, sizeof(t->seen),
-             "host=%s ua=%s accept=%s date=%s x-client=%s secret=%s order=%s rid=%s",
+             "host=%s ua=%s accept=%s date=%s x-client=%s secret=%s order=%s rid=%s target=%s",
              head->authority ? head->authority : "-",
              hc_headers_get(head->headers, "user-agent") ? hc_headers_get(head->headers, "user-agent") : "-",
              hc_headers_get(head->headers, "accept") ? hc_headers_get(head->headers, "accept") : "-",
              hc_headers_get(head->headers, "date") ? "yes" : "no",
              hc_headers_get(head->headers, "x-client") ? hc_headers_get(head->headers, "x-client") : "-",
              hc_headers_get(head->headers, "x-secret") ? "seen" : "hidden",
-             order, rid ? rid : "-");
+             order, rid ? rid : "-", t->target);
 }
 
 static void sh_consume(hc_server_handler *s, const void *d, size_t n) { (void)s; (void)d; (void)n; }
@@ -230,7 +230,7 @@ typedef struct outcome {
     int    completed, failed_n;
     int    status;
     char   reason[128];
-    char   body[512];
+    char   body[1024];
     char   rid[32], server[64], date[64], client_seen[8], status_was[8];
 } outcome;
 
@@ -278,7 +278,7 @@ on_released(void *arg)
 static void
 run(const char *method, const char *path, const char *body)
 {
-    char                uri[128];
+    char                uri[512];
     hc_result_callback  cb = { on_completed, on_failed, NULL, on_released, NULL };
     hc_request_producer *req;
 
@@ -351,6 +351,24 @@ main(void)
     CHECK(strlen(O.date) == 29 && strstr(O.date, " GMT") != NULL);
     CHECK(strcmp(O.client_seen, "yes") == 0);           /* client context, request -> response */
     printf("  response: Server: %s, Date: %s, X-Rid: %s\n", O.server, O.date, O.rid);
+    CHECK(strstr(O.body, " target=/hello") != NULL);   /* no query: the path itself */
+
+    puts("request-target with a query reaches the handler as path?query");
+    run("GET", "/q?x=1&y=2", NULL);
+    CHECK(O.completed == 1 && O.status == 200);
+    CHECK(strstr(O.body, " target=/q?x=1&y=2") != NULL);
+    {
+        /* longer than the 256-byte stack scratch: built on the heap */
+        char path[400], want[420];
+
+        memset(path, 0, sizeof(path));
+        strcpy(path, "/long?v=");
+        memset(path + 8, 'z', 300);
+        snprintf(want, sizeof(want), " target=%s", path);
+        run("GET", path, NULL);
+        CHECK(O.completed == 1 && O.status == 200);
+        CHECK(strstr(O.body, want) != NULL);
+    }
 
     puts("POST: Date on a request with a body");
     run("POST", "/post", "data");
