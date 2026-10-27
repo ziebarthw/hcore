@@ -329,6 +329,32 @@ void       hc_server_set_processor(hc_server *s, hc_processor *p);
  * readable and writable by the handler for as long as the exchange lives
  * (made on first use). NULL only on allocation failure. */
 hc_context *hc_server_exchange_context(hc_server_exchange *ex);
+/*
+ * Client connection timeouts, in milliseconds (0: none, the default). Apply
+ * to connections accepted afterwards. A connection is closed when:
+ *   read_ms   the client sends nothing for that long while the server is
+ *             waiting for it: a request head or body, the TLS handshake, or
+ *             the next request on an idle keep-alive connection. It does not
+ *             run while a response is being made or sent (HTTP/1.x reading
+ *             is stopped then; on HTTP/2 it is off while any stream is
+ *             active), so a slow handler is not cut off by it.
+ *   write_ms  the client takes nothing from the server for that long while
+ *             a response is waiting to be sent.
+ * An exchange under way fails with "client read timeout" / "client write
+ * timeout".
+ */
+void       hc_server_set_timeouts(hc_server *s, int64_t read_ms, int64_t write_ms);
+/*
+ * Largest request body accepted, in bytes (0: no limit, the default). A
+ * request whose Content-Length is larger is answered "413 Content Too
+ * Large" without reaching the handler. A body that turns out larger while
+ * it arrives (chunked, or HTTP/2 without Content-Length) fails the
+ * exchange - the handler gets ->failed("request body too large") - and the
+ * client gets a 413 if no response has started yet, else the connection
+ * is closed. HTTP/1.x connections are closed after a 413 (the rest of the
+ * body is not read); on HTTP/2 the rest of the stream is discarded.
+ */
+void       hc_server_set_max_body(hc_server *s, int64_t max_bytes);
 int        hc_server_listen(hc_server *s, const char *addr, uint16_t port);
 void       hc_server_free(hc_server *s);
 
@@ -412,6 +438,21 @@ void hc_client_cancel(hc_client_exchange *cx);
  * readable and writable by the handler for as long as the exchange lives
  * (made on first use). NULL only on allocation failure. */
 hc_context *hc_client_exchange_context(hc_client_exchange *cx);
+/*
+ * Timeouts for this exchange, in milliseconds (0: none), in place of the
+ * requester's defaults (hc_requester_config); -1 keeps the default. The
+ * exchange fails - "upstream read timeout" / "upstream write timeout" -
+ * and its connection is closed when:
+ *   read_ms   the origin sends nothing for that long while a response is
+ *             awaited or arriving. Counted from the end of the request:
+ *             not while a request body is still being sent, and not while
+ *             input is suspended (hc_client_suspend_input()).
+ *   write_ms  the origin takes nothing for that long while request data is
+ *             waiting to be sent.
+ * Call it from ->produce_request() (before hc_request_send()) or later;
+ * a later call takes effect at once.
+ */
+void hc_client_set_timeouts(hc_client_exchange *cx, int64_t read_ms, int64_t write_ms);
 
 /* ------------------------------------------------------------------------ */
 /* Pooled connections: requester + endpoints                                */
@@ -438,6 +479,10 @@ typedef struct hc_requester_config {
     /* Interceptors for every exchange (hc_processor.h); the requester takes
      * its own reference. NULL: none. */
     hc_processor *processor;
+    /* Default read/write timeouts for every exchange, in milliseconds
+     * (0: none); see hc_client_set_timeouts(). Java: the socket timeout. */
+    int64_t read_timeout_ms;
+    int64_t write_timeout_ms;
 } hc_requester_config;
 
 hc_requester *hc_requester_new(hc_reactor *r, const hc_requester_config *cfg);

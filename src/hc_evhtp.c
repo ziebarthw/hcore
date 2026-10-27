@@ -719,6 +719,7 @@ typedef struct srv_conn {
     struct srv_conn    *next;
     hc_server          *srv;
     evhtp_connection_t *c;
+    unsigned            h2_active; /* HTTP/2 streams under way (read timeout off) */
 } srv_conn;
 
 /* A registered pattern, classified once at registration so a lookup is only
@@ -752,6 +753,9 @@ struct hc_server {
     hc_server_listener        listener;
     int                       http2;   /* offer h2 in TLS ALPN (if built in) */
     hc_processor             *processor; /* interceptors (own reference) */
+    struct timeval            read_tv;  /* client timeouts (0: none) */
+    struct timeval            write_tv;
+    int64_t                   max_body; /* request body limit (0: none) */
 #ifdef HC_HAVE_TLS
     evhtp_ssl_cfg_t           tls;     /* libevhtp keeps a pointer to it */
 #endif
@@ -782,6 +786,10 @@ struct hc_server_exchange {
     int                  input_suspended;
     int                  keep_alive;   /* connection stays open afterwards */
     int                  h2;           /* an HTTP/2 stream                 */
+    int                  h2_counted;   /* in its srv_conn's h2_active      */
+    int                  too_large;    /* body over the limit: 413 / close */
+    int64_t              body_read;    /* request body bytes so far        */
+    struct evbuffer_cb_entry *flush_cbe; /* close once the output is sent  */
     hc_processor        *proc;         /* the server's when it began (ref) */
     hc_context          *ctx;          /* interceptors' and handler's     */
     const char          *reason;
@@ -794,6 +802,75 @@ struct hc_server_exchange {
 };
 
 static void srv_task_cb(evutil_socket_t fd, short what, void *arg);
+
+static void
+ms_to_tv(int64_t ms, struct timeval *tv)
+{
+    if (ms < 0) {
+        ms = 0;
+    }
+
+    tv->tv_sec  = (time_t)(ms / 1000);
+    tv->tv_usec = (suseconds_t)((ms % 1000) * 1000);
+}
+
+static int
+tv_is_set(const struct timeval *tv)
+{
+    return tv->tv_sec != 0 || tv->tv_usec != 0;
+}
+
+/* The engine's record of an accepted connection (its fini hook's arg);
+ * NULL once the connection is being freed. */
+static srv_conn *
+srv_conn_of(const evhtp_connection_t *c)
+{
+    return (c && c->hooks) ? (srv_conn *)c->hooks->on_connection_fini_arg : NULL;
+}
+
+/* HTTP/2: the connection's read timeout is for a client that leaves the
+ * server waiting. While a stream has its request and awaits its response,
+ * the server is the one working (a slow handler, a slow origin) and the
+ * client may rightly stay silent, so the read timeout is off until the
+ * last such stream ends. (HTTP/1.x gets the same effect from reading being
+ * stopped while a response is made.) */
+static void
+srv_h2_busy(hc_server_exchange *ex)
+{
+    srv_conn *n;
+
+    if (!ex->h2 || ex->h2_counted || !tv_is_set(&ex->srv->read_tv) ||
+        (n = srv_conn_of(ex->conn)) == NULL) {
+        return;
+    }
+
+    ex->h2_counted = 1;
+
+    if (n->h2_active++ == 0) {
+        evhtp_connection_set_timeouts(ex->conn, NULL,
+            tv_is_set(&ex->srv->write_tv) ? &ex->srv->write_tv : NULL);
+    }
+}
+
+static void
+srv_h2_idle(hc_server_exchange *ex)
+{
+    srv_conn *n;
+
+    if (!ex->h2_counted) {
+        return;
+    }
+
+    ex->h2_counted = 0;
+
+    if ((n = srv_conn_of(ex->conn)) == NULL || --n->h2_active > 0 ||
+        ex->srv->closing || (ex->conn->flags & EVHTP_CONN_FLAG_ERROR)) {
+        return;
+    }
+
+    evhtp_connection_set_timeouts(ex->conn, &ex->srv->read_tv,
+        tv_is_set(&ex->srv->write_tv) ? &ex->srv->write_tv : NULL);
+}
 
 static void
 srv_schedule_produce(void *owner)
@@ -857,11 +934,62 @@ srv_try_finalize(hc_server_exchange *ex)
 }
 
 static void
+srv_flush_cb(struct evbuffer *buf, const struct evbuffer_cb_info *info, void *arg)
+{
+    hc_server_exchange *ex = arg;
+
+    (void)info;
+
+    if (evbuffer_get_length(buf) == 0) {
+        schedule(ex->task, &ex->pending, T_ABORT);
+    }
+}
+
+/* HTTP/1.x: stop reading, and close the connection once everything written
+ * to it has been sent (libevhtp's evhtp_connection_free() drops unsent
+ * output in some versions, so it is only called once there is none). A
+ * client that does not take the output is closed by the write timeout. */
+static void
+srv_close_after_flush(hc_server_exchange *ex)
+{
+    struct bufferevent *bev = evhtp_connection_get_bev(ex->conn);
+    struct evbuffer    *out = bufferevent_get_output(bev);
+
+    bufferevent_disable(bev, EV_READ);
+
+    if (evbuffer_get_length(out) == 0) {
+        schedule(ex->task, &ex->pending, T_ABORT);
+    } else if (ex->flush_cbe == NULL) {
+        ex->flush_cbe = evbuffer_add_cb(out, srv_flush_cb, ex);
+    }
+}
+
+static void
+srv_flush_watch_end(hc_server_exchange *ex)
+{
+    if (ex->flush_cbe && ex->conn) {
+        evbuffer_remove_cb_entry(bufferevent_get_output(evhtp_connection_get_bev(ex->conn)),
+                                 ex->flush_cbe);
+    }
+
+    ex->flush_cbe = NULL;
+}
+
+static void
 srv_on_response_end(void *owner)
 {
     hc_server_exchange *ex = owner;
 
     ex->resp_done = 1;
+
+    /* The body is over the limit and the rest of it will not be read: close
+     * the connection once the response has gone out. HTTP/2 discards the
+     * rest of the stream instead. */
+    if (ex->too_large && !ex->req_done && !ex->h2 && ex->conn) {
+        srv_close_after_flush(ex);
+        return;
+    }
+
     srv_try_finalize(ex);
 }
 
@@ -1091,6 +1219,36 @@ hc_server_abort(hc_server_exchange *ex)
 
 /* --- libevhtp hooks (server) -------------------------------------------- */
 
+/* The request body went over hc_server_set_max_body() while arriving. */
+static void
+srv_body_too_large(hc_server_exchange *ex)
+{
+    ex->too_large = 1;
+
+    if (ex->failed || ex->req == NULL) {
+        return;                 /* already failing: its body is discarded */
+    }
+
+    if (!ex->resp_started) {
+        /* HTTP/1.x: also closes once sent (srv_on_response_end) */
+        hc_response_send_simple(&ex->rc, 413, "text/plain", "Request body too large\n",
+                                !ex->h2);
+    }
+
+    ex->failed = 1;
+    ex->reason = "request body too large";
+
+    /* A response under way cannot be finished properly: close the
+     * connection. HTTP/1.x after a complete response (the 413, or one the
+     * handler made earlier): close once it is sent - the rest of the body
+     * is not read. */
+    if (!ex->resp_done) {
+        schedule(ex->task, &ex->pending, T_ABORT);
+    } else if (!ex->h2 && !ex->req_done) {
+        srv_close_after_flush(ex);
+    }
+}
+
 static evhtp_res
 srv_on_read(evhtp_request_t *req, struct evbuffer *buf, void *arg)
 {
@@ -1098,6 +1256,12 @@ srv_on_read(evhtp_request_t *req, struct evbuffer *buf, void *arg)
     size_t              len = evbuffer_get_length(buf);
 
     (void)req;
+
+    ex->body_read += (int64_t)len;
+
+    if (ex->srv->max_body > 0 && ex->body_read > ex->srv->max_body && !ex->too_large) {
+        srv_body_too_large(ex);
+    }
 
     if (len && !ex->failed && !ex->released) {
         ex->h->vtbl->consume(ex->h, evbuffer_pullup(buf, (ev_ssize_t)len), len);
@@ -1113,12 +1277,16 @@ static evhtp_res
 srv_on_error(evhtp_request_t *req, evhtp_error_flags errtype, void *arg)
 {
     hc_server_exchange *ex = arg;
-
-    (void)errtype;
+    short               ev = (short)errtype;  /* bufferevent events, or -1 */
 
     if (!ex->failed) {
         ex->failed = 1;
-        ex->reason = "client connection error";
+
+        if (errtype != (evhtp_error_flags)-1 && (ev & BEV_EVENT_TIMEOUT)) {
+            ex->reason = (ev & BEV_EVENT_WRITING) ? "client write timeout" : "client read timeout";
+        } else {
+            ex->reason = "client connection error";
+        }
     }
 
     chan_detach(&ex->out);
@@ -1140,6 +1308,8 @@ srv_on_fini(evhtp_request_t *req, void *arg)
     (void)req;
 
     chan_detach(&ex->out);
+    srv_h2_idle(ex);
+    srv_flush_watch_end(ex);
     ex->req  = NULL;
     ex->conn = NULL;
 
@@ -1171,6 +1341,7 @@ srv_on_complete(evhtp_request_t *req, void *arg)
     }
 
     ex->req_done = 1;
+    srv_h2_busy(ex);    /* the client now waits for the server */
 
     if (!ex->failed && !ex->released) {
         ex->h->vtbl->stream_end(ex->h, NULL);
@@ -1352,6 +1523,7 @@ static hc_server_handler not_found_handler = { &not_found_vtbl };
 typedef struct refused_handler {
     hc_server_handler base;
     int               status;
+    int               close;    /* HTTP/1.x: close after the response */
 } refused_handler;
 
 static void
@@ -1359,11 +1531,13 @@ rf_handle_request(hc_server_handler *self, hc_server_exchange *ex,
                   const hc_request_head *head, const hc_entity *entity,
                   hc_response_channel *rc)
 {
-    (void)ex;
+    refused_handler *rf = (refused_handler *)(void *)self;
+
     (void)head;
     (void)entity;
-    hc_response_send_simple(rc, ((refused_handler *)(void *)self)->status, "text/plain",
-                            "Request refused", 0);
+    hc_response_send_simple(rc, rf->status, "text/plain",
+                            rf->status == 413 ? "Request body too large\n" : "Request refused",
+                            rf->close && !ex->h2);
 }
 
 static void
@@ -1544,6 +1718,11 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
 
     entity         = entity_from_headers(h, &e, 1, 0, &close_delimited);
 
+    /* Declared body over the limit: answered 413 below, never read. */
+    if (srv->max_body > 0 && entity && entity->content_length > srv->max_body) {
+        ex->too_large = 1;
+    }
+
     /* "Expect: 100-continue" is answered here, before the handler runs, so
      * that a response the handler starts from handle_request() can never
      * precede it on the wire. (libevhtp's own 100 is disabled: it writes it
@@ -1552,7 +1731,7 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
         const char *expect = hc_headers_get(h, "expect");
 
         if (expect && has_token(expect, "100-continue") && req->proto == EVHTP_PROTO_11 &&
-            entity != NULL) {
+            entity != NULL && !ex->too_large) {
             evbuffer_add(bufferevent_get_output(evhtp_connection_get_bev(ex->conn)),
                          "HTTP/1.1 100 Continue\r\n\r\n", 25);
         }
@@ -1567,9 +1746,16 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
     /* Interceptors: they may change the headers; one may refuse the
      * request, which is then answered with its status instead of going to
      * the handler. The listener and the handler see the result. */
-    if (ex->proc) {
-        hc_http_request r = { head.method, head.target, head.authority, head.version, h };
-        int             rv = hc_processor_process_request(ex->proc, &r, entity, ex->ctx);
+    {
+        int rv = 0;
+
+        if (ex->too_large) {
+            rv = 413;
+        } else if (ex->proc) {
+            hc_http_request r = { head.method, head.target, head.authority, head.version, h };
+
+            rv = hc_processor_process_request(ex->proc, &r, entity, ex->ctx);
+        }
 
         if (rv != 0) {
             refused_handler *rf = calloc(1, sizeof(*rf));
@@ -1579,6 +1765,7 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
             if (rf) {
                 rf->base.vtbl = &refused_vtbl;
                 rf->status    = rv;
+                rf->close     = ex->too_large;
                 ex->h         = &rf->base;
             } else {
                 ex->h = &not_found_handler; /* out of memory: still answer */
@@ -1611,6 +1798,7 @@ srv_task_cb(evutil_socket_t fd, short what, void *arg)
     if (todo & T_ABORT && ex->conn) {
         /* Runs from the event loop, so freeing is safe. The fini hook
          * schedules T_FINISH. */
+        srv_flush_watch_end(ex);
         evhtp_connection_free(ex->conn);
         return;
     }
@@ -1683,6 +1871,12 @@ srv_conn_fini(evhtp_connection_t *c, void *arg)
      * and its socket would never be freed. Normal closes still flush. */
     if ((c->flags & EVHTP_CONN_FLAG_ERROR) && c->bev) {
         drop_output(c->bev);
+    }
+
+    /* Its requests are freed after this hook: srv_conn_of() must not
+     * return the record freed below. */
+    if (c->hooks) {
+        c->hooks->on_connection_fini_arg = NULL;
     }
 
     if (n->prev) {
@@ -1864,6 +2058,21 @@ hc_server_set_processor(hc_server *s, hc_processor *p)
         s->processor = hc_processor_ref(p);
         hc_processor_unref(old);
     }
+}
+
+void
+hc_server_set_timeouts(hc_server *s, int64_t read_ms, int64_t write_ms)
+{
+    ms_to_tv(read_ms, &s->read_tv);
+    ms_to_tv(write_ms, &s->write_tv);
+    /* zero means none: libevhtp only sets the non-zero ones on accept */
+    evhtp_set_timeouts(s->htp, &s->read_tv, &s->write_tv);
+}
+
+void
+hc_server_set_max_body(hc_server *s, int64_t max_bytes)
+{
+    s->max_body = max_bytes > 0 ? max_bytes : 0;
 }
 
 hc_context *
@@ -2084,6 +2293,8 @@ struct hc_requester {
     struct hc_endpoint   *eps;
     int                   closing;  /* hc_requester_free() in progress */
     hc_processor         *processor; /* interceptors (own reference) */
+    int64_t               read_timeout_ms;  /* exchange defaults (0: none) */
+    int64_t               write_timeout_ms;
 };
 
 struct hc_connect_op {
@@ -2172,6 +2383,10 @@ struct hc_client_exchange {
     int                 released;
     int                 input_suspended;
     const char         *reason;
+    int64_t             read_ms;       /* hc_client_set_timeouts(); -1: default */
+    int64_t             write_ms;
+    int                 req_sent;      /* request complete: read timeout runs */
+    int                 timeouts_on;   /* set on the connection             */
     hc_context         *ctx;           /* interceptors' and handler's       */
     const hc_processor *proc;          /* the requester's (borrowed), or NULL */
 };
@@ -2200,10 +2415,15 @@ cli_schedule_produce(void *owner)
     schedule(cx->task, &cx->pending, T_PRODUCE);
 }
 
+static void cx_apply_timeouts(hc_client_exchange *cx);
+
 static void
 cli_on_request_end(void *owner)
 {
-    (void)owner;                /* nothing to do; response may still flow */
+    hc_client_exchange *cx = owner;
+
+    cx->req_sent = 1;           /* the response may still flow */
+    cx_apply_timeouts(cx);
 }
 
 static void
@@ -2347,7 +2567,15 @@ pc_on_conn_fini(evhtp_connection_t *c, void *arg)
 {
     hc_pconn *pc = arg;
 
-    (void)c;
+    /* Unsent request data is useless once the connection goes, and an
+     * origin that stopped reading (write timeout) would never take it:
+     * some libevhtp versions (the ziebarthw fork) keep the bufferevent and
+     * its socket until the output is flushed, so they would never be
+     * freed. Drop it. */
+    if (c->bev) {
+        drop_output(c->bev);
+    }
+
     pc->conn = NULL;
     pc->dead = 1;
 
@@ -2622,9 +2850,11 @@ cx_new(hc_reactor *r, hc_client_handler *h)
         return NULL;
     }
 
-    cx->r     = r;
-    cx->h     = h;
-    cx->rc.cx = cx;
+    cx->r        = r;
+    cx->h        = h;
+    cx->rc.cx    = cx;
+    cx->read_ms  = -1;
+    cx->write_ms = -1;
     cx->task  = event_new(r->base, -1, 0, cli_task_cb, cx);
     cx->req   = evhtp_request_new(cli_on_complete, cx);
 
@@ -2878,6 +3108,8 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
     cli_interpose_begin(cx, evhtp_connection_get_bev(conn));
 
     if (entity == NULL) {
+        cx->req_sent = 1;
+        cx_apply_timeouts(cx);
         return NULL;
     }
 
@@ -2887,7 +3119,10 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
 
     if (entity->content_length == 0) {
         cx->out.ended = 1;
+        cx->req_sent  = 1;
     }
+
+    cx_apply_timeouts(cx);
 
     schedule(cx->task, &cx->pending, T_PRODUCE);
 
@@ -2920,6 +3155,54 @@ hc_client_exchange_context(hc_client_exchange *cx)
     }
 
     return cx ? cx->ctx : NULL;
+}
+
+/* The exchange's timeouts onto its connection: write from the request
+ * head on, read once the request is complete (see hc_client_set_timeouts). */
+static void
+cx_apply_timeouts(hc_client_exchange *cx)
+{
+    evhtp_connection_t *c = cx_conn(cx);
+    int64_t             r = cx->read_ms, w = cx->write_ms;
+    struct timeval      rt, wt;
+
+    if (c == NULL || !cx->head_sent || cx->done || cx->failed || cx->released) {
+        return;
+    }
+
+    if (r < 0) {
+        r = cx->ep ? cx->ep->rq->read_timeout_ms : 0;
+    }
+
+    if (w < 0) {
+        w = cx->ep ? cx->ep->rq->write_timeout_ms : 0;
+    }
+
+    if (!cx->req_sent) {
+        r = 0;
+    }
+
+    if (r <= 0 && w <= 0 && !cx->timeouts_on) {
+        return;
+    }
+
+    ms_to_tv(r, &rt);
+    ms_to_tv(w, &wt);
+    bufferevent_set_timeouts(evhtp_connection_get_bev(c), r > 0 ? &rt : NULL,
+                             w > 0 ? &wt : NULL);
+    cx->timeouts_on = r > 0 || w > 0;
+}
+
+void
+hc_client_set_timeouts(hc_client_exchange *cx, int64_t read_ms, int64_t write_ms)
+{
+    if (cx == NULL || cx->released) {
+        return;
+    }
+
+    cx->read_ms  = read_ms < 0 ? -1 : read_ms;
+    cx->write_ms = write_ms < 0 ? -1 : write_ms;
+    cx_apply_timeouts(cx);
 }
 
 void
@@ -3088,6 +3371,9 @@ cli_raw_event(struct bufferevent *bev, short events, void *arg)
     if (events & BEV_EVENT_EOF) {
         cli_raw_read(bev, cx);
         cx->done = 1;
+    } else if (events & BEV_EVENT_TIMEOUT) {
+        cli_fail(cx, (events & BEV_EVENT_WRITING) ? "upstream write timeout"
+                                                  : "upstream read timeout");
     } else {
         cli_fail(cx, "upstream connection error mid-response");
     }
@@ -3139,11 +3425,13 @@ cli_conn_event(hc_client_exchange *cx, short events)
         return EVHTP_RES_OK;
     }
 
-    if ((events & BEV_EVENT_EOF) && cx->resp_head && cx->close_delimited) {
+    if (events & BEV_EVENT_TIMEOUT) {
+        cli_fail(cx, (events & BEV_EVENT_WRITING) ? "upstream write timeout"
+                                                  : "upstream read timeout");
+    } else if ((events & BEV_EVENT_EOF) && cx->resp_head && cx->close_delimited) {
         cx->done = 1;           /* end of a read-until-close body */
     } else if (!cx->head_sent || !cx->resp_head) {
-        cli_fail(cx, (events & BEV_EVENT_TIMEOUT) ? "timeout"
-                                                  : "connection to upstream failed or closed");
+        cli_fail(cx, "connection to upstream failed or closed");
     } else {
         cli_fail(cx, "upstream closed connection mid-response");
     }
@@ -3238,6 +3526,10 @@ cli_task_cb(evutil_socket_t fd, short what, void *arg)
                 }
 
                 pc->keep_alive_ms = cx->keep_alive_ms;
+
+                if (cx->timeouts_on) {
+                    bufferevent_set_timeouts(bev, NULL, NULL);  /* idle: none */
+                }
 
                 /* No request is attached any more, so libevhtp's parser
                  * must not see input until the next exchange starts. */
@@ -3695,6 +3987,8 @@ hc_requester_new(hc_reactor *r, const hc_requester_config *cfg)
 
     rq->r                     = r;
     rq->processor             = hc_processor_ref(c.processor);
+    rq->read_timeout_ms       = c.read_timeout_ms > 0 ? c.read_timeout_ms : 0;
+    rq->write_timeout_ms      = c.write_timeout_ms > 0 ? c.write_timeout_ms : 0;
     rq->default_keep_alive_ms = c.default_keep_alive_ms > 0 ? c.default_keep_alive_ms : 180000;
     rq->pool                  = hc_pool_new(r, &pc, &ops, rq);
     rq->housekeeping          = hc_timer_new(r, housekeeping_cb, rq);
