@@ -474,7 +474,8 @@ long, not when a whole exchange takes long.
   arriving (chunked, or HTTP/2 without `Content-Length`) fails the exchange,
   `->failed("request body too large")`, and gets a `413` if no response has
   started. HTTP/1.x connections are closed after the `413` (the rest of the
-  body is not read); on HTTP/2 only the stream is affected.
+  body is not read); on HTTP/2 only the stream is affected (a response
+  already under way is cut off with a stream reset, where libevhtp can).
 - **Client read timeout:** the origin sends nothing while a response is
   awaited or arriving. It counts from the end of the request, so a long
   upload doesn't trip it, and it is off while input is suspended (a slow
@@ -673,6 +674,11 @@ Differences the engine accounts for:
   `http/1.1`, clients offer only `http/1.1`. Both are harmless upstream, which
   does no ALPN. HTTP/2 in the engine itself would build on the fork's nghttp2
   integration.
+- **Stream reset.** With `evhtp_request_reset_stream()` (detected through
+  `EVHTP_HAVE_REQUEST_RESET_STREAM`), `hc_server_abort()` on an HTTP/2
+  stream sends `RST_STREAM` (`INTERNAL_ERROR`) and the connection's other
+  streams carry on; libevhtp frees the request once the reset is sent.
+  Without it, an abort closes the whole connection.
 - **Deferred connection free.** The fork's `evhtp_connection_free()` waits for
   pending output to flush before freeing the bufferevent, without an event
   callback that would notice the flush failing. The engine therefore drops
@@ -753,7 +759,7 @@ goes over the wire. It covers:
 Breaking any of the three drain rules fails the matching check, against
 both libevhtps.
 
-**HTTP/2 server** (`tests/h2_test`, 41 checks) runs only when libevhtp has
+**HTTP/2 server** (`tests/h2_test`, 41 checks; 46 with stream reset) runs only when libevhtp has
 HTTP/2 (the ziebarthw fork built with nghttp2; `make check` says "skipped"
 otherwise) and curl does. An HTTPS hcore server answers curl over HTTP/2 and,
 for comparison, the same requests over HTTP/1.1:
@@ -764,7 +770,12 @@ for comparison, the same requests over HTTP/1.1:
   checked;
 - six streams at once on one connection;
 - a drain with a stream under way: it completes, then the connection closes;
-- `hc_server_set_http2(s, 0)`: a client asking for h2 gets HTTP/1.1.
+- `hc_server_set_http2(s, 0)`: a client asking for h2 gets HTTP/1.1;
+- with a libevhtp that has `evhtp_request_reset_stream()` (46 checks):
+  `hc_server_abort()` on a stream with a reply under way resets just that
+  stream while another stream on the same connection completes (one
+  connection opened), and a stream reset 100 KB into a 3 MB upload leaves
+  the connection able to take the next full upload.
 
 **Interceptors** (`tests/processor_test`, 71 checks): an hcore client and
 server, each with a processor, on one reactor. Server side: request

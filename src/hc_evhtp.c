@@ -787,6 +787,7 @@ struct hc_server_exchange {
     int                  keep_alive;   /* connection stays open afterwards */
     int                  h2;           /* an HTTP/2 stream                 */
     int                  h2_counted;   /* in its srv_conn's h2_active      */
+    int                  reset;        /* HTTP/2 stream reset sent         */
     int                  too_large;    /* body over the limit: 413 / close */
     int64_t              body_read;    /* request body bytes so far        */
     struct evbuffer_cb_entry *flush_cbe; /* close once the output is sent  */
@@ -1799,6 +1800,25 @@ srv_task_cb(evutil_socket_t fd, short what, void *arg)
         /* Runs from the event loop, so freeing is safe. The fini hook
          * schedules T_FINISH. */
         srv_flush_watch_end(ex);
+
+#ifdef EVHTP_HAVE_REQUEST_RESET_STREAM
+        /* HTTP/2: reset just this stream; the connection's other streams go
+         * on. libevhtp frees the request once the reset is sent, and the
+         * fini hook schedules T_FINISH as usual. */
+        if (ex->h2 && ex->req) {
+            if (ex->reset) {
+                return;                 /* already on its way */
+            }
+
+            chan_detach(&ex->out);      /* nothing more for this stream */
+
+            if (evhtp_request_reset_stream(ex->req, 0x2 /* INTERNAL_ERROR */) == 0) {
+                ex->reset = 1;
+                return;
+            }
+        }
+#endif
+
         evhtp_connection_free(ex->conn);
         return;
     }
