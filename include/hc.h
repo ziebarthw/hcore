@@ -461,6 +461,22 @@ typedef struct hc_server_stats {
     uint64_t rq_3xx;
     uint64_t rq_4xx;
     uint64_t rq_5xx;
+    /* TLS, as Envoy's listener ssl.* statistics. A connection either
+     * completes its handshake (ssl_handshake, and one ssl_versions_*) or
+     * fails: a missing required client certificate, a client certificate
+     * that does not verify, or anything else (ssl_connection_error: bad
+     * protocol version or ciphers, a client that leaves or times out during
+     * the handshake, ...). */
+    uint64_t ssl_handshake;             /* completed handshakes            */
+    uint64_t ssl_connection_error;      /* failed, other than verification */
+    uint64_t ssl_session_reused;        /* resumed sessions (of handshakes) */
+    uint64_t ssl_no_certificate;        /* handshakes without a client cert */
+    uint64_t ssl_fail_verify_no_cert;   /* required client cert missing    */
+    uint64_t ssl_fail_verify_error;     /* client cert did not verify      */
+    uint64_t ssl_versions_tlsv1;        /* handshakes by version           */
+    uint64_t ssl_versions_tlsv1_1;
+    uint64_t ssl_versions_tlsv1_2;
+    uint64_t ssl_versions_tlsv1_3;
 } hc_server_stats;
 
 /* A copy of the counters (zeroes for NULL). */

@@ -12,6 +12,10 @@
  *     from the CA, gets no response; the CA's certificate gets 200
  *   - client certificates optional: without one, 200
  *   - defaults (hc_server_enable_tls): TLS 1.2 and 1.3, not 1.1
+ *   - a resumed session (s_client -sess_out, then -sess_in)
+ *   - the TLS statistics (Envoy's ssl.*) for all of the above: handshakes
+ *     by version, resumptions, connections without a client certificate,
+ *     missing and unverifiable client certificates, other failures
  *   - errors, each with its reason, leaving the server able to try again:
  *     a missing certificate file, a key that does not match, an invalid
  *     cipher list, invalid TLS 1.3 suites, a missing CA file, client
@@ -27,6 +31,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 #include <sys/wait.h>
 
 #include <event2/event.h>
@@ -100,6 +106,34 @@ s_client(int port, const char *opts, char *out, size_t cap)
     n      = fread(out, 1, cap - 1, p);
     out[n] = '\0';
     pclose(p);
+}
+
+static void
+sleep_ms(int ms)
+{
+    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+
+    nanosleep(&ts, NULL);
+}
+
+#define CHECK_EQ(a, b) do {                                                \
+        unsigned long long a_ = (unsigned long long)(a), b_ = (unsigned long long)(b); \
+        if (a_ == b_) { passed++; }                                        \
+        else { failed++; fprintf(stderr, "  FAIL %s:%d: %s == %llu, want %llu\n", \
+                                 __FILE__, __LINE__, #a, a_, b_); }        \
+    } while (0)
+
+static void
+print_tls_stats(const char *what, const hc_server_stats *st)
+{
+    printf("  %-22s handshake %llu (1.2: %llu, 1.3: %llu), reused %llu, no_certificate %llu, "
+           "fail_verify_no_cert %llu, fail_verify_error %llu, connection_error %llu\n", what,
+           (unsigned long long)st->ssl_handshake, (unsigned long long)st->ssl_versions_tlsv1_2,
+           (unsigned long long)st->ssl_versions_tlsv1_3, (unsigned long long)st->ssl_session_reused,
+           (unsigned long long)st->ssl_no_certificate,
+           (unsigned long long)st->ssl_fail_verify_no_cert,
+           (unsigned long long)st->ssl_fail_verify_error,
+           (unsigned long long)st->ssl_connection_error);
 }
 
 static int
@@ -342,6 +376,71 @@ main(int argc, char **argv)
     s_client(PORT_DEF, "-tls1_1", out, sizeof(out));
     CHECK(!served(out));
     printf("  TLS 1.3 and 1.2 served, TLS 1.1 refused\n");
+
+    puts("session resumption:");
+    {
+        char sess[64];
+
+        snprintf(sess, sizeof(sess), "/tmp/hc_tls_sess_%d", (int)getpid());
+        snprintf(opts, sizeof(opts), "-tls1_3 -sess_out %s", sess);
+        s_client(PORT_DEF, opts, out, sizeof(out));
+        CHECK(served(out));
+        snprintf(opts, sizeof(opts), "-tls1_3 -sess_in %s", sess);
+        s_client(PORT_DEF, opts, out, sizeof(out));
+        CHECK(served(out) && has(out, "Reused, TLSv1.3"));
+        printf("  second connection: %s\n", has(out, "Reused") ? "resumed" : "full handshake");
+        unlink(sess);
+    }
+
+    puts("TLS statistics:");
+    sleep_ms(200);      /* the last closes reach the server */
+    {
+        hc_server_stats st;
+
+        /* TLS 1.3 only: the TLS 1.2 client and the one offering another
+         * suite failed; one TLS 1.3 handshake, no client certificate */
+        st = hc_server_get_stats(s13);
+        print_tls_stats("TLS 1.3 only:", &st);
+        CHECK_EQ(st.ssl_handshake, 1);
+        CHECK_EQ(st.ssl_versions_tlsv1_3, 1);
+        CHECK_EQ(st.ssl_versions_tlsv1_2, 0);
+        CHECK_EQ(st.ssl_no_certificate, 1);
+        CHECK_EQ(st.ssl_connection_error, 2);
+        CHECK_EQ(st.ssl_fail_verify_no_cert + st.ssl_fail_verify_error, 0);
+
+        st = hc_server_get_stats(s12);
+        print_tls_stats("TLS 1.2 only:", &st);
+        CHECK_EQ(st.ssl_handshake, 1);
+        CHECK_EQ(st.ssl_versions_tlsv1_2, 1);
+        CHECK_EQ(st.ssl_connection_error, 2);
+
+        /* required: no certificate, another CA's, the CA's */
+        st = hc_server_get_stats(sreq);
+        print_tls_stats("client cert required:", &st);
+        CHECK_EQ(st.ssl_fail_verify_no_cert, 1);
+        CHECK_EQ(st.ssl_fail_verify_error, 1);
+        CHECK_EQ(st.ssl_handshake, 1);
+        CHECK_EQ(st.ssl_no_certificate, 0);
+        CHECK_EQ(st.ssl_connection_error, 0);
+
+        st = hc_server_get_stats(sopt);
+        print_tls_stats("client cert optional:", &st);
+        CHECK_EQ(st.ssl_handshake, 1);
+        CHECK_EQ(st.ssl_no_certificate, 1);
+
+        /* defaults: 1.3, 1.2, refused 1.1 (whether the client sent
+         * anything or gave up locally, the connection failed), then the
+         * two resumption connections, the second resumed */
+        st = hc_server_get_stats(sdef);
+        print_tls_stats("defaults:", &st);
+        CHECK_EQ(st.ssl_handshake, 4);
+        CHECK_EQ(st.ssl_versions_tlsv1_3, 3);
+        CHECK_EQ(st.ssl_versions_tlsv1_2, 1);
+        CHECK_EQ(st.ssl_versions_tlsv1_1, 0);
+        CHECK_EQ(st.ssl_session_reused, 1);
+        CHECK_EQ(st.ssl_connection_error, 1);
+        CHECK_EQ(st.cx_ssl_active, 0);
+    }
 
     event_base_once(base, -1, EV_TIMEOUT, stop_cb, base, NULL);
     pthread_join(th, NULL);
