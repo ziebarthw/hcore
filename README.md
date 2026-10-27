@@ -30,6 +30,7 @@ tests/shutdown_test.c   freeing a requester (and server) while the application's
 tests/tls_name_test.c   https to an address, presenting and verifying a host name (hc_host.tls_name)
 tests/h2_test.c         the server over HTTP/2 (libevhtp with HTTP/2 only), checked with curl
 tests/processor_test.c  interceptors and processors on both sides of real exchanges
+tests/timeout_test.c    client and origin timeouts, the request body limit (HTTP/1.1 and HTTP/2)
 tests/run.sh            end-to-end tests (curl / client -> proxy -> tests/origin.py, echo_server)
 tests/tls/              self-signed test certificates (localhost, other.example)
 third_party/htstring/   copy of htstring: htstring_t string views, used by the engine's routing
@@ -445,6 +446,46 @@ A connection whose request head is still arriving counts as idle. Like any
 server closing an idle keep-alive connection, it is closed, and the client
 retries.
 
+## Timeouts and the request body limit
+
+For anything facing the internet, set both sides' timeouts and a body limit:
+
+```c
+hc_server_set_timeouts(s, 30000, 30000);        /* client read / write, ms */
+hc_server_set_max_body(s, 50 * 1024 * 1024);    /* bytes */
+
+hc_requester_config cfg = { .read_timeout_ms = 60000, .write_timeout_ms = 60000 };
+/* per exchange, e.g. per upstream, from ->produce_request(): */
+hc_client_set_timeouts(hc_request_channel_exchange(rc), 120000, -1);
+```
+
+All of them are inactivity timeouts: they fire when nothing moves for that
+long, not when a whole exchange takes long.
+
+- **Server read timeout:** a client that leaves the server waiting (a silent
+  new connection, a stalled request head or body, an idle keep-alive
+  connection, a stalled TLS handshake). It is not running while the server
+  is the one working: HTTP/1.x stops reading while a response is made, and on
+  HTTP/2 it is off while any stream has its request and awaits its response.
+  A slow handler or a slow origin is never cut off by it.
+- **Server write timeout:** a client that stops taking the response.
+- **Body limit:** `Content-Length` over the limit gets `413` before the
+  handler runs (and no `100 Continue`). A body that grows past it while
+  arriving (chunked, or HTTP/2 without `Content-Length`) fails the exchange,
+  `->failed("request body too large")`, and gets a `413` if no response has
+  started. HTTP/1.x connections are closed after the `413` (the rest of the
+  body is not read); on HTTP/2 only the stream is affected.
+- **Client read timeout:** the origin sends nothing while a response is
+  awaited or arriving. It counts from the end of the request, so a long
+  upload doesn't trip it, and it is off while input is suspended (a slow
+  downstream). **Client write timeout:** the origin stops taking the request.
+  The exchange fails with `"upstream read timeout"` or `"upstream write
+  timeout"`; idle pooled connections have no timeout (keep-alive expiry
+  handles them).
+
+Server exchanges cut off by a timeout fail with `"client read timeout"` or
+`"client write timeout"`.
+
 ## How the engine maps onto libevhtp
 
 | hc.h event                    | libevhtp mechanism                                                   |
@@ -636,7 +677,10 @@ Differences the engine accounts for:
   pending output to flush before freeing the bufferevent, without an event
   callback that would notice the flush failing. The engine therefore drops
   unsent output when libevhtp frees a server connection because of an error,
-  and when `hc_server_free()` closes connections. That needs
+  when `hc_server_free()` closes connections, and whenever a client (origin)
+  connection is freed: an origin that stopped reading (write timeout) would
+  otherwise keep the socket forever. To close after a `413` the engine waits
+  for the output to flush itself, then frees the connection. That needs
   `evbuffer_unfreeze()` first: libevent freezes the start of a socket
   bufferevent's output buffer. Normal closes still flush.
 - **The fork's `msgparser`.** It handles 1xx, pipelined responses and split
@@ -734,6 +778,24 @@ whose context reaches the response side; a refused request sends nothing; a
 refused response fails the exchange. The client and server keep working
 afterwards; the defaults and a shared, multiply referenced processor are
 checked directly; valgrind: no errors, no leaks.
+
+**Timeouts and body limit** (`tests/timeout_test`, 41 checks; 33 without
+HTTP/2) use raw sockets and curl against servers with 300 ms timeouts and a
+1000-byte limit, and a requester with 300 ms timeouts. Server: a silent
+client, a half-sent request head and an idle keep-alive connection are
+closed after 300 ms; an 800 ms handler is not cut off; a client that stops
+reading a 256 MiB response is closed and the handler gets `"client write
+timeout"`; `Content-Length` over the limit gets `413` with no `100 Continue`
+and without the handler; a chunked body growing past it gets `413` and fails
+the handler. HTTP/2: an 800 ms stream completes; `413` for an oversized
+`Content-Length` leaves the connection usable; a body without
+`Content-Length` growing past the limit gets `413`. Client: an origin that
+never answers fails after 300 ms with `"upstream read timeout"`; a 100 ms
+origin is fine; a per-exchange 2 s timeout lets an 800 ms origin through; a
+slow upload is not cut off; an idle pooled connection outlives the read
+timeout and is reused; an origin that never reads a 64 MiB upload gives
+`"upstream write timeout"`. Run under valgrind with `HC_TEST_SCALE=5`
+(stretches every duration): no errors, no leaks.
 
 **TLS server name** (`tests/tls_name_test`, 19 checks) connects over https
 to 127.0.0.1, where a plain OpenSSL server answers with the SNI it received.
