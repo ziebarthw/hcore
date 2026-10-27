@@ -1719,6 +1719,21 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
 
     entity         = entity_from_headers(h, &e, 1, 0, &close_delimited);
 
+#ifdef HC_HAVE_H2
+    /* HTTP/2: DATA frames delimit the body and Content-Length is optional,
+     * so a body follows exactly when the HEADERS frame did not end the
+     * stream (an upload of unknown length has neither Content-Length nor
+     * chunked encoding, and would otherwise look bodiless). */
+    if (ex->h2) {
+        if (req->flags & EVHTP_REQ_FLAG_END_STREAM) {
+            entity = NULL;
+        } else if (entity == NULL) {
+            e.content_length = -1;
+            entity           = &e;
+        }
+    }
+#endif
+
     /* Declared body over the limit: answered 413 below, never read. */
     if (srv->max_body > 0 && entity && entity->content_length > srv->max_body) {
         ex->too_large = 1;
