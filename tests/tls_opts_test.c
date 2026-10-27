@@ -324,7 +324,9 @@ main(int argc, char **argv)
     snprintf(opts, sizeof(opts), "-cert %s -key %s", other, other_key);
     s_client(PORT_REQ, opts, out, sizeof(out));
     CHECK(served(out));
-    CHECK(has(out, "Acceptable client certificate CA names") && has(out, "CN = other"));
+    /* "CN = other" (OpenSSL 3.0, 3.1) or "CN=other" (3.2 and later) */
+    CHECK(has(out, "Acceptable client certificate CA names") &&
+          (has(out, "CN = other") || has(out, "CN=other")));
     printf("  certificate from the CA: %s\n", served(out) ? "served" : "refused");
 
     puts("client certificate optional:");
