@@ -33,6 +33,7 @@ tests/processor_test.c  interceptors and processors on both sides of real exchan
 tests/timeout_test.c    client and origin timeouts, the request body limit (HTTP/1.1 and HTTP/2)
 tests/stats_test.c      server statistics against what happened on the wire; endpoint attachments
 tests/tls_opts_test.c   server TLS options (protocols, ciphers, client certificates) via openssl s_client
+tests/basic_server_test.c  hc_basic_server_factory(): whole requests, later and streamed replies, limits, IPv6
 tests/run.sh            end-to-end tests (curl / client -> proxy -> tests/origin.py, echo_server)
 tests/tls/              self-signed test certificates (localhost, other.example)
 third_party/htstring/   copy of htstring: htstring_t string views, used by the engine's routing
@@ -230,6 +231,7 @@ only on `hc.h`:
 | `AsyncEntityConsumer<T>`                           | `hc_entity_consumer` (+ `_vtbl`)         |
 | `BasicAsyncEntityConsumer` / `StringAsyncEntityConsumer` | `hc_buffer_entity_consumer_new(max)` |
 | `BasicResponseConsumer<T>` + `BasicClientExchangeHandler` | `hc_basic_client_handler_new()`   |
+| `BasicRequestConsumer` + `BasicServerExchangeHandler` + `AsyncServerRequestHandler` | `hc_basic_server_factory` + `hc_basic_server_config` |
 | `Message<HttpResponse, T>`                         | `hc_message` (head + body consumer)      |
 | `FutureCallback<T>`                                | `hc_result_callback` (completed / failed, plus optional information and released) |
 
@@ -251,6 +253,41 @@ does past its limit. The exchange is then cancelled, the connection is not
 reused, and the callback fails with the reason. The full-duplex client's
 duplex mode uses exactly this: a pattern-generating producer and a verifying
 consumer, plugged into the same basic handler.
+
+### Whole requests on the server
+
+`hc_basic_server_factory` is the server-side counterpart. It is httpcore5's
+`BasicServerExchangeHandler` with a `BasicRequestConsumer`, for servers
+that want each request complete, head and body in memory, before handling
+it (an API taking JSON, a file upload):
+
+```c
+static void on_request(void *arg, hc_basic_request *r)
+{
+    size_t      len;
+    const char *body = hc_basic_request_body(r, &len);   /* NUL-terminated */
+
+    /* hc_basic_request_method/_target/_headers/_authority/_version */
+    hc_response_send_simple(hc_basic_request_channel(r), 200, "application/json", "{}", 0);
+}
+
+static hc_basic_server_config api = { .request = on_request, .max_body = 1 << 20 };
+hc_server_register(server, pattern, hc_basic_server_factory, &api);
+```
+
+- **Replying later** works from any callback on the server's reactor thread
+  (a timer, a result handed back from another thread) until `->release()`.
+  Keep your state with `hc_basic_request_set_data()` and cancel anything
+  still meant to answer in `->release()`.
+- **Streaming replies** (server-sent events, large downloads):
+  `hc_response_send()` with an entity, then write in `->produce()` or from
+  a timer, as with any `hc_data_channel`.
+- **Bodies over `max_body`** (1 MiB by default) get `413` with
+  `Connection: close` and never reach the application.
+- **A client that leaves** is reported through `->failed()` at once on
+  HTTP/2. On HTTP/1.1 the connection is not read while a reply is pending,
+  so it is noticed only when the server next writes: a stream's next write
+  fails, and a single delayed reply simply ends the exchange.
 
 ## Interceptors and the HTTP processor (`hc_processor.h`)
 
@@ -442,6 +479,10 @@ hc_server_listen_opts(s, "0.0.0.0", 8080, &o);               /* in each thread *
 - **Who runs the loop:** the application does. Don't call `hc_reactor_run()`.
   `hc_reactor_free()` leaves the base alone. Everything hcore does for that
   reactor happens in the thread running that loop.
+- **Addresses:** `0.0.0.0` (all IPv4), an IPv4 address, `::` (all IPv6),
+  `::1` or `[::1]`, or `unix:/path`. An IPv6 socket is IPv6-only, so take
+  both families on all interfaces with two servers, one on `0.0.0.0` and
+  one on `::`.
 - **`reuse_port`:** sets `SO_REUSEPORT`. Every thread's server binds the same
   address, and the kernel spreads new connections between them.
 - **Accepting:** `hc_server_pause_accept()` and `hc_server_resume_accept()`
@@ -881,6 +922,17 @@ TLS statistics for all of it: handshakes by version, resumptions,
 connections without a client certificate, missing and unverifiable client
 certificates, and other failures, counted per server exactly as the
 scenarios dictate (58 checks in all). Valgrind: clean.
+
+**Whole requests** (`tests/basic_server_test`, 36 checks, 18 without
+HTTP/2, 8 more where the system has IPv6) drives `hc_basic_server_factory` with curl over HTTP/1.1
+and HTTP/2: a GET with a query (method, target, Host), POSTs of 10,000
+bytes with `Content-Length` and of unknown length (checksummed), a reply
+from a timer 150 ms later, a streamed reply of three server-sent events,
+bodies over the limit (`413`, the application never called), a client
+leaving before a pending reply, a stream to a client that has left
+(`->failed()` and `->release()`), and every request released exactly once.
+With IPv6: servers on `::1` and `[::1]`, and an IPv4 and an IPv6 server on
+the same port. Valgrind: clean.
 
 **TLS server name** (`tests/tls_name_test`, 19 checks) connects over https
 to 127.0.0.1, where a plain OpenSSL server answers with the SNI it received.

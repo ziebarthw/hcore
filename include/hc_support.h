@@ -19,6 +19,10 @@
  *   BasicClientExchangeHandler<T>             hc_basic_client_handler_new()
  *   HttpAsyncRequester.execute(producer,
  *       consumer, timeout, callback)          hc_requester_execute_request()
+ *   BasicServerExchangeHandler +
+ *     BasicRequestConsumer +
+ *     AsyncServerRequestHandler               hc_basic_server_factory() and
+ *                                             hc_basic_server_config
  *
  * Ownership: producers and consumers handed to a handler (or to
  * hc_requester_execute_request()) belong to it from then on and are
@@ -144,6 +148,67 @@ hc_client_handler *hc_basic_client_handler_new(hc_request_producer *request,
 int hc_requester_execute_request(hc_requester *rq, hc_request_producer *request,
                                  hc_entity_consumer *body, int64_t timeout_ms,
                                  const hc_result_callback *cb);
+
+/* ------------------------------------------------------------------------ */
+/* Basic server exchange handler: the whole request at once                  */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * For servers that want each request complete - head and body in memory -
+ * before handling it (an API taking JSON, a file upload), instead of
+ * streaming it through hc_server_handler. Java: BasicServerExchangeHandler
+ * with a BasicRequestConsumer and an AsyncServerRequestHandler.
+ *
+ * The request is answered as usual, through hc_basic_request_channel():
+ * hc_response_send_simple(), or hc_response_send() for a body of any size,
+ * streamed through ->produce() (e.g. server-sent events). The answer may
+ * come from ->request() itself or from any later callback on the server's
+ * reactor thread (a timer, work handed back from another thread) - until
+ * ->release().
+ *
+ * Bodies larger than max_body get "413 Content Too Large" (with
+ * "Connection: close") without reaching the application: at once when
+ * Content-Length says so, else as soon as the body grows past it.
+ */
+typedef struct hc_basic_request hc_basic_request;   /* opaque */
+
+typedef struct hc_basic_server_config {
+    /* The complete request. */
+    void (*request)(void *arg, hc_basic_request *r);
+    /* Optional: the response body channel can take data (after
+     * hc_response_send() with an entity; see hc_data_channel). */
+    void (*produce)(void *arg, hc_basic_request *r, hc_data_channel *ch);
+    /* Optional: the exchange failed after ->request() (the client went
+     * away, a write failed, ...); ->release() follows. */
+    void (*failed)(void *arg, hc_basic_request *r, const char *reason);
+    /* Optional: last call for r, after ->request() (r is invalid after it:
+     * cancel anything still meant to answer it). */
+    void (*release)(void *arg, hc_basic_request *r);
+    void  *arg;
+    size_t max_body;    /* 0: 1 MiB */
+} hc_basic_server_config;
+
+/* An hc_server_handler_factory: pass the config (which must outlive the
+ * server) as the factory's arg, e.g.
+ *   hc_server_register(s, pattern, hc_basic_server_factory, &config);
+ * or as the server's factory: hc_server_new(r, hc_basic_server_factory, &config). */
+hc_server_handler *hc_basic_server_factory(void *config);
+
+/* The request, valid until ->release(). */
+const char         *hc_basic_request_method(const hc_basic_request *r);
+/* request-target: "/path?query" */
+const char         *hc_basic_request_target(const hc_basic_request *r);
+/* Host (HTTP/1.x) or :authority (HTTP/2); may be NULL. */
+const char         *hc_basic_request_authority(const hc_basic_request *r);
+int                 hc_basic_request_version(const hc_basic_request *r);
+const hc_headers   *hc_basic_request_headers(const hc_basic_request *r);
+/* The body (NUL-terminated, not counted in *len); "" and 0 when none. */
+const char         *hc_basic_request_body(const hc_basic_request *r, size_t *len);
+hc_server_exchange *hc_basic_request_exchange(hc_basic_request *r);
+hc_response_channel *hc_basic_request_channel(hc_basic_request *r);
+/* The application's own pointer for this request. */
+void                hc_basic_request_set_data(hc_basic_request *r, void *data);
+void               *hc_basic_request_data(const hc_basic_request *r);
 
 #ifdef __cplusplus
 }

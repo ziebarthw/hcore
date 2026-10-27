@@ -408,6 +408,10 @@ typedef struct hc_listen_options {
     int defer_accept;   /* TCP_DEFER_ACCEPT: wake up only once data arrives   */
 } hc_listen_options;
 
+/* addr: an IPv4 address ("0.0.0.0": all), an IPv6 one ("::" all, "::1",
+ * also "[::1]" or libevhtp's "ipv6:::1"), or "unix:/path". An IPv6 socket
+ * is IPv6-only, and a server listens on one socket: to take both families
+ * on all interfaces, run two servers (one on "0.0.0.0", one on "::"). */
 int    hc_server_listen_opts(hc_server *s, const char *addr, uint16_t port,
                              const hc_listen_options *opts);
 /* Close the listening socket. Open connections carry on. */

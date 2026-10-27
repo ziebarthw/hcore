@@ -477,3 +477,247 @@ hc_requester_execute_request(hc_requester *rq, hc_request_producer *request,
 
     return 0;
 }
+
+/* ======================================================================== */
+/* Basic server exchange handler                                            */
+/* ======================================================================== */
+
+#define BASIC_SERVER_MAX_BODY (1024u * 1024u)
+
+struct hc_basic_request {
+    hc_server_handler             base;     /* must be first */
+    const hc_basic_server_config *cfg;
+    hc_server_exchange           *ex;
+    hc_response_channel          *rc;
+    char                         *method;
+    char                         *target;
+    char                         *authority;
+    int                           version;
+    hc_headers                   *headers;
+    char                         *body;     /* NUL-terminated */
+    size_t                        len;
+    size_t                        cap;
+    size_t                        max;
+    int                           rejected; /* over the limit: 413 sent  */
+    int                           delivered;/* ->request() was called    */
+    void                         *data;
+};
+
+#define BREQ(self) ((hc_basic_request *)(void *)(self))
+
+static void
+breq_reject(hc_basic_request *r)
+{
+    if (!r->rejected) {
+        r->rejected = 1;
+        /* -1 when a response has started already: nothing to add then */
+        hc_response_send_simple(r->rc, 413, "text/plain", "Request body too large\n", 1);
+    }
+}
+
+static void
+breq_handle_request(hc_server_handler *self, hc_server_exchange *ex,
+                    const hc_request_head *head, const hc_entity *entity,
+                    hc_response_channel *rc)
+{
+    hc_basic_request *r = BREQ(self);
+
+    r->ex        = ex;
+    r->rc        = rc;
+    r->version   = head->version;
+    r->method    = dup_str(head->method);
+    r->target    = dup_str(head->target);
+    r->authority = dup_str(head->authority);
+    r->headers   = hc_headers_copy(head->headers);
+    r->body      = malloc(1);
+
+    if (!r->method || !r->target || (head->authority && !r->authority) ||
+        !r->headers || !r->body) {
+        r->rejected = 1;
+        hc_response_send_simple(rc, 500, "text/plain", "out of memory\n", 1);
+        return;
+    }
+
+    r->body[0] = '\0';
+
+    if (entity && entity->content_length > 0 && (uint64_t)entity->content_length > r->max) {
+        breq_reject(r);     /* never read into memory */
+    }
+}
+
+static void
+breq_consume(hc_server_handler *self, const void *data, size_t len)
+{
+    hc_basic_request *r = BREQ(self);
+
+    if (r->rejected || len == 0) {
+        return;
+    }
+
+    if (len > r->max - r->len) {
+        breq_reject(r);
+        return;
+    }
+
+    if (r->len + len + 1 > r->cap) {
+        size_t cap = r->cap ? r->cap : 4096;
+        char  *p;
+
+        while (cap < r->len + len + 1) {
+            cap *= 2;
+        }
+
+        if ((p = realloc(r->body, cap)) == NULL) {
+            r->rejected = 1;
+            hc_response_send_simple(r->rc, 500, "text/plain", "out of memory\n", 1);
+            return;
+        }
+
+        r->body = p;
+        r->cap  = cap;
+    }
+
+    memcpy(r->body + r->len, data, len);
+    r->len            += len;
+    r->body[r->len]    = '\0';
+}
+
+static void
+breq_stream_end(hc_server_handler *self, const hc_headers *trailers)
+{
+    hc_basic_request *r = BREQ(self);
+
+    (void)trailers;
+
+    if (!r->rejected && !r->delivered) {
+        r->delivered = 1;
+        r->cfg->request(r->cfg->arg, r);
+    }
+}
+
+static void
+breq_produce(hc_server_handler *self, hc_data_channel *ch)
+{
+    hc_basic_request *r = BREQ(self);
+
+    if (r->delivered && r->cfg->produce) {
+        r->cfg->produce(r->cfg->arg, r, ch);
+    }
+}
+
+static void
+breq_failed(hc_server_handler *self, const char *reason)
+{
+    hc_basic_request *r = BREQ(self);
+
+    if (r->delivered && r->cfg->failed) {
+        r->cfg->failed(r->cfg->arg, r, reason);
+    }
+}
+
+static void
+breq_release(hc_server_handler *self)
+{
+    hc_basic_request *r = BREQ(self);
+
+    if (r->delivered && r->cfg->release) {
+        r->cfg->release(r->cfg->arg, r);
+    }
+
+    free(r->method);
+    free(r->target);
+    free(r->authority);
+    hc_headers_free(r->headers);
+    free(r->body);
+    free(r);
+}
+
+static const hc_server_handler_vtbl breq_vtbl = {
+    .handle_request = breq_handle_request,
+    .consume        = breq_consume,
+    .stream_end     = breq_stream_end,
+    .produce        = breq_produce,
+    .failed         = breq_failed,
+    .release        = breq_release,
+};
+
+hc_server_handler *
+hc_basic_server_factory(void *config)
+{
+    const hc_basic_server_config *cfg = config;
+    hc_basic_request             *r;
+
+    if (cfg == NULL || cfg->request == NULL || (r = calloc(1, sizeof(*r))) == NULL) {
+        return NULL;
+    }
+
+    r->base.vtbl = &breq_vtbl;
+    r->cfg       = cfg;
+    r->max       = cfg->max_body ? cfg->max_body : BASIC_SERVER_MAX_BODY;
+
+    return &r->base;
+}
+
+const char *
+hc_basic_request_method(const hc_basic_request *r)
+{
+    return r->method;
+}
+
+const char *
+hc_basic_request_target(const hc_basic_request *r)
+{
+    return r->target;
+}
+
+const char *
+hc_basic_request_authority(const hc_basic_request *r)
+{
+    return r->authority;
+}
+
+int
+hc_basic_request_version(const hc_basic_request *r)
+{
+    return r->version;
+}
+
+const hc_headers *
+hc_basic_request_headers(const hc_basic_request *r)
+{
+    return r->headers;
+}
+
+const char *
+hc_basic_request_body(const hc_basic_request *r, size_t *len)
+{
+    if (len) {
+        *len = r->len;
+    }
+
+    return r->body ? r->body : "";
+}
+
+hc_server_exchange *
+hc_basic_request_exchange(hc_basic_request *r)
+{
+    return r->ex;
+}
+
+hc_response_channel *
+hc_basic_request_channel(hc_basic_request *r)
+{
+    return r->rc;
+}
+
+void
+hc_basic_request_set_data(hc_basic_request *r, void *data)
+{
+    r->data = data;
+}
+
+void *
+hc_basic_request_data(const hc_basic_request *r)
+{
+    return r->data;
+}
