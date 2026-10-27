@@ -720,6 +720,10 @@ typedef struct srv_conn {
     hc_server          *srv;
     evhtp_connection_t *c;
     unsigned            h2_active; /* HTTP/2 streams under way (read timeout off) */
+    int                 tls;       /* counted in cx_ssl_active          */
+    int                 h2;        /* counted as HTTP/2 (else HTTP/1)   */
+    struct evbuffer          *rx, *tx;          /* the bufferevent's buffers */
+    struct evbuffer_cb_entry *rx_cbe, *tx_cbe;  /* byte counters             */
 } srv_conn;
 
 /* A registered pattern, classified once at registration so a lookup is only
@@ -756,6 +760,7 @@ struct hc_server {
     struct timeval            read_tv;  /* client timeouts (0: none) */
     struct timeval            write_tv;
     int64_t                   max_body; /* request body limit (0: none) */
+    hc_server_stats           stats;
 #ifdef HC_HAVE_TLS
     evhtp_ssl_cfg_t           tls;     /* libevhtp keeps a pointer to it */
 #endif
@@ -1225,6 +1230,7 @@ static void
 srv_body_too_large(hc_server_exchange *ex)
 {
     ex->too_large = 1;
+    ex->srv->stats.rq_too_large++;
 
     if (ex->failed || ex->req == NULL) {
         return;                 /* already failing: its body is discarded */
@@ -1689,6 +1695,14 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
     hc_context_set_protocol(ex->ctx, ex->h2 ? 20 : req->proto == EVHTP_PROTO_10 ? 10 : 11,
                             ex->conn && ex->conn->ssl != NULL);
 
+    srv->stats.rq_total++;
+    srv->stats.rq_active++;
+    if (ex->h2) {
+        srv->stats.rq_http2_total++;
+    } else {
+        srv->stats.rq_http1_total++;
+    }
+
     ex->next = srv->exchanges;              /* unlinked in srv_task_cb */
     if (srv->exchanges) {
         srv->exchanges->prev = ex;
@@ -1737,6 +1751,7 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
     /* Declared body over the limit: answered 413 below, never read. */
     if (srv->max_body > 0 && entity && entity->content_length > srv->max_body) {
         ex->too_large = 1;
+        srv->stats.rq_too_large++;
     }
 
     /* "Expect: 100-continue" is answered here, before the handler runs, so
@@ -1851,6 +1866,10 @@ srv_task_cb(evutil_socket_t fd, short what, void *arg)
                 ex->h->vtbl->failed(ex->h, ex->reason);
             }
 
+            if (ex->finished && !ex->failed) {
+                ex->srv->stats.rq_completed++;
+            }
+
             if (ex->finished && !ex->failed && ex->srv->listener.on_exchange_complete) {
                 ex->srv->listener.on_exchange_complete(ex->srv->listener.arg, ex->remote,
                                                        ex->keep_alive);
@@ -1858,6 +1877,8 @@ srv_task_cb(evutil_socket_t fd, short what, void *arg)
 
             ex->h->vtbl->release(ex->h);
         }
+
+        ex->srv->stats.rq_active--;
 
         if (ex->prev) {
             ex->prev->next = ex->next;
@@ -1914,6 +1935,26 @@ srv_conn_fini(evhtp_connection_t *c, void *arg)
         c->hooks->on_connection_fini_arg = NULL;
     }
 
+    /* The bufferevent may outlive this (libevhtp flushing): stop counting
+     * into a record that is about to go. */
+    if (n->rx_cbe) {
+        evbuffer_remove_cb_entry(n->rx, n->rx_cbe);
+    }
+    if (n->tx_cbe) {
+        evbuffer_remove_cb_entry(n->tx, n->tx_cbe);
+    }
+
+    n->srv->stats.cx_active--;
+    n->srv->stats.cx_destroy++;
+    if (n->h2) {
+        n->srv->stats.cx_http2_active--;
+    } else {
+        n->srv->stats.cx_http1_active--;
+    }
+    if (n->tls) {
+        n->srv->stats.cx_ssl_active--;
+    }
+
     if (n->prev) {
         n->prev->next = n->next;
     } else {
@@ -1928,6 +1969,47 @@ srv_conn_fini(evhtp_connection_t *c, void *arg)
     free(n);
 
     return EVHTP_RES_OK;
+}
+
+static void
+srv_count_rx(struct evbuffer *buf, const struct evbuffer_cb_info *info, void *arg)
+{
+    (void)buf;
+    ((srv_conn *)arg)->srv->stats.cx_rx_bytes_total += info->n_added;
+}
+
+static void
+srv_count_tx(struct evbuffer *buf, const struct evbuffer_cb_info *info, void *arg)
+{
+    (void)buf;
+    ((srv_conn *)arg)->srv->stats.cx_tx_bytes_total += info->n_added;
+}
+
+/* The TLS handshake is done: ALPN has decided HTTP/2 or HTTP/1.1. */
+static evhtp_res
+srv_conn_event(evhtp_connection_t *c, short events, void *arg)
+{
+    srv_conn *n = arg;
+
+    (void)c;    /* unused without HTTP/2 */
+
+    if ((events & BEV_EVENT_CONNECTED) && conn_is_h2(c) && !n->h2) {
+        n->h2 = 1;
+        n->srv->stats.cx_http1_total--;
+        n->srv->stats.cx_http1_active--;
+        n->srv->stats.cx_http2_total++;
+        n->srv->stats.cx_http2_active++;
+    }
+
+    return EVHTP_RES_OK;
+}
+
+hc_server_stats
+hc_server_get_stats(const hc_server *s)
+{
+    hc_server_stats none = { 0 };
+
+    return s ? s->stats : none;
 }
 
 static evhtp_res
@@ -1951,6 +2033,25 @@ srv_post_accept(evhtp_connection_t *c, void *arg)
     s->conns = n;
     s->n_conns++;
     evhtp_connection_set_hook(c, evhtp_hook_on_connection_fini, (evhtp_hook)srv_conn_fini, n);
+    evhtp_connection_set_hook(c, evhtp_hook_on_event, (evhtp_hook)srv_conn_event, n);
+
+    /* Counted as HTTP/1 until a TLS handshake says h2 (srv_conn_event). */
+    n->tls = c->ssl != NULL;
+    s->stats.cx_total++;
+    s->stats.cx_active++;
+    s->stats.cx_http1_total++;
+    s->stats.cx_http1_active++;
+    if (n->tls) {
+        s->stats.cx_ssl_total++;
+        s->stats.cx_ssl_active++;
+    }
+
+    if (c->bev) {
+        n->rx     = bufferevent_get_input(c->bev);
+        n->tx     = bufferevent_get_output(c->bev);
+        n->rx_cbe = evbuffer_add_cb(n->rx, srv_count_rx, n);
+        n->tx_cbe = evbuffer_add_cb(n->tx, srv_count_tx, n);
+    }
 
     return EVHTP_RES_OK;
 }
@@ -2384,6 +2485,8 @@ struct hc_pconn {
     void                *saved_arg;
     struct event        *task;
     unsigned             pending;
+    void                *attachment;   /* hc_endpoint_set_attachment()  */
+    void               (*attachment_free)(void *);
 };
 
 struct hc_request_channel {
@@ -2804,6 +2907,10 @@ pc_destroy(hc_pconn *pc)
     if (pc->conn) {
         pc->closing = 1;
         evhtp_connection_free(pc->conn);
+    }
+
+    if (pc->attachment_free) {
+        pc->attachment_free(pc->attachment);
     }
 
     event_free(pc->task);
@@ -3898,6 +4005,32 @@ hc_endpoint_execute(hc_endpoint *ep, hc_client_handler *h)
     }
 
     return cx;
+}
+
+void
+hc_endpoint_set_attachment(hc_endpoint *ep, void *data, void (*free_fn)(void *))
+{
+    hc_pconn *pc = ep ? ep->pc : NULL;
+
+    if (pc == NULL) {
+        if (free_fn) {
+            free_fn(data);
+        }
+        return;
+    }
+
+    if (pc->attachment_free && pc->attachment != data) {
+        pc->attachment_free(pc->attachment);
+    }
+
+    pc->attachment      = data;
+    pc->attachment_free = free_fn;
+}
+
+void *
+hc_endpoint_get_attachment(const hc_endpoint *ep)
+{
+    return (ep && ep->pc) ? ep->pc->attachment : NULL;
 }
 
 static void

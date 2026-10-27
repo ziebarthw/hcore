@@ -31,6 +31,7 @@ tests/tls_name_test.c   https to an address, presenting and verifying a host nam
 tests/h2_test.c         the server over HTTP/2 (libevhtp with HTTP/2 only), checked with curl
 tests/processor_test.c  interceptors and processors on both sides of real exchanges
 tests/timeout_test.c    client and origin timeouts, the request body limit (HTTP/1.1 and HTTP/2)
+tests/stats_test.c      server statistics against what happened on the wire; endpoint attachments
 tests/run.sh            end-to-end tests (curl / client -> proxy -> tests/origin.py, echo_server)
 tests/tls/              self-signed test certificates (localhost, other.example)
 third_party/htstring/   copy of htstring: htstring_t string views, used by the engine's routing
@@ -446,6 +447,32 @@ A connection whose request head is still arriving counts as idle. Like any
 server closing an idle keep-alive connection, it is closed, and the client
 retries.
 
+## Statistics
+
+`hc_server_get_stats(s)` returns Envoy-style counters for the server's
+client ("downstream") side, with Envoy's names minus the `downstream_`
+prefix:
+
+| Counter | What it counts |
+| ------- | -------------- |
+| `cx_total`, `cx_active`, `cx_destroy` | connections accepted, open now, closed |
+| `cx_ssl_total`, `cx_ssl_active` | TLS connections |
+| `cx_http1_total/_active`, `cx_http2_total/_active` | by protocol; a TLS connection counts as HTTP/1 until ALPN picks h2 |
+| `cx_rx_bytes_total`, `cx_tx_bytes_total` | bytes in and out, above TLS |
+| `rq_total`, `rq_active`, `rq_http1_total`, `rq_http2_total` | requests |
+| `rq_completed` | responses sent in full (not aborted, not cut off) |
+| `rq_too_large` | `413`s from the body limit |
+
+They are plain counters, read and updated on the server's reactor thread.
+
+For the client side, `hc_endpoint_set_attachment(ep, data, free_fn)` ties
+application data to a pooled connection: it stays with the connection
+across leases, and `free_fn` runs when the connection closes. A lease whose
+endpoint has no attachment yet is a connection the application has not
+seen, which is how a proxy counts origin connections per upstream (and
+decrements them in `free_fn`). `hc_pool_get_total_stats()` /
+`_route_stats()` give the pool's own leased/idle/pending counts.
+
 ## Timeouts and the request body limit
 
 For anything facing the internet, set both sides' timeouts and a body limit:
@@ -809,6 +836,17 @@ slow upload is not cut off; an idle pooled connection outlives the read
 timeout and is reused; an origin that never reads a 64 MiB upload gives
 `"upstream write timeout"`. Run under valgrind with `HC_TEST_SCALE=5`
 (stretches every duration): no errors, no leaks.
+
+**Statistics** (`tests/stats_test`, 59 checks; 50 without HTTP/2) checks
+every server counter against what happened on the wire: a plain HTTP/1.1
+connection with two keep-alive requests (received and sent bytes equal
+exactly what the client sent and read), then closed; a response the client
+walks away from (counted, not completed); a body over the limit
+(`rq_too_large`); over TLS, an HTTP/2 connection with two streams moves
+from HTTP/1 to HTTP/2, and an HTTP/1.1-over-TLS connection stays HTTP/1;
+all gauges return to 0. Attachments: a fresh connection has none, a reused
+one has the one set on it, a second connection (the first held) has none,
+and both are freed once when the requester closes them. Valgrind: clean.
 
 **TLS server name** (`tests/tls_name_test`, 19 checks) connects over https
 to 127.0.0.1, where a plain OpenSSL server answers with the SNI it received.
