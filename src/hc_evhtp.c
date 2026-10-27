@@ -2506,7 +2506,23 @@ int
 hc_server_listen_opts(hc_server *s, const char *addr, uint16_t port,
                       const hc_listen_options *opts)
 {
-    int backlog = opts && opts->backlog > 0 ? opts->backlog : 1024;
+    int  backlog = opts && opts->backlog > 0 ? opts->backlog : 1024;
+    char v6[INET6_ADDRSTRLEN + 8];
+
+    /* An IPv6 address, plain ("::", "::1") or bracketed ("[::1]"): libevhtp
+     * wants it as "ipv6:<address>". */
+    if (addr && strchr(addr, ':') && strncmp(addr, "ipv6:", 5) != 0 &&
+        strncmp(addr, "unix:", 5) != 0) {
+        size_t n = strlen(addr);
+
+        if (addr[0] == '[' && n > 2 && addr[n - 1] == ']') {
+            snprintf(v6, sizeof(v6), "ipv6:%.*s", (int)(n - 2), addr + 1);
+        } else {
+            snprintf(v6, sizeof(v6), "ipv6:%s", addr);
+        }
+
+        addr = v6;
+    }
 
     if (opts && opts->reuse_port) {
         evhtp_enable_flag(s->htp, EVHTP_FLAG_ENABLE_REUSEPORT);

@@ -107,6 +107,10 @@ tests/processor_test: tests/processor_test.c $(HC_OBJS)
 tests/timeout_test: tests/timeout_test.c $(HC_OBJS)
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE -o $@ $^ $(EVHTP_LIBS) -lpthread
 
+# hc_basic_server_factory(): whole requests, checked with curl.
+tests/basic_server_test: tests/basic_server_test.c $(HC_OBJS)
+	$(CC) $(HC_CFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE -o $@ $^ $(EVHTP_LIBS) -lpthread
+
 # Server TLS options, checked with openssl s_client.
 tests/tls_opts_test: tests/tls_opts_test.c $(HC_OBJS)
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE -o $@ $^ $(EVHTP_LIBS) -lpthread
@@ -126,7 +130,7 @@ HAVE_RESET := $(shell grep -qs EVHTP_HAVE_REQUEST_RESET_STREAM $(EVHTP_PREFIX)/i
 tests/h2_test: tests/h2_test.c $(HC_OBJS)
 	$(CC) $(HC_CFLAGS) $(CFLAGS) $(if $(HAVE_RESET),-DHC_TEST_STREAM_RESET) -o $@ $^ $(EVHTP_LIBS)
 
-check: all tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/processor_test tests/timeout_test tests/stats_test tests/tls_opts_test $(H2_TEST)
+check: all tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/processor_test tests/timeout_test tests/stats_test tests/tls_opts_test tests/basic_server_test $(H2_TEST)
 	tests/pool_test
 	tests/support_test tests/tls
 	tests/embed_test
@@ -136,6 +140,7 @@ check: all tests/pool_test tests/support_test tests/embed_test tests/shutdown_te
 	tests/timeout_test tests/tls
 	tests/stats_test tests/tls
 	tests/tls_opts_test tests/tls
+	tests/basic_server_test tests/tls
 	$(if $(HAVE_H2),tests/h2_test tests/tls,@echo "h2_test: skipped (libevhtp without HTTP/2)")
 	tests/run.sh
 
@@ -191,6 +196,6 @@ libhcore.pc:
 	@echo "wrote $@"
 
 clean:
-	rm -f libhcore.a libhcore.pc src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/h2_test tests/processor_test tests/timeout_test tests/stats_test tests/tls_opts_test
+	rm -f libhcore.a libhcore.pc src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/h2_test tests/processor_test tests/timeout_test tests/stats_test tests/tls_opts_test tests/basic_server_test
 
 .PHONY: all clean check install libhcore.pc
