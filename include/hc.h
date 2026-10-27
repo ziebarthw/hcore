@@ -416,6 +416,15 @@ typedef struct hc_server_stats {
     uint64_t rq_active;
     uint64_t rq_completed;      /* response sent in full, not aborted      */
     uint64_t rq_too_large;      /* 413s from hc_server_set_max_body()      */
+    /* Final responses by status class, counted as the head is sent (after
+     * the response interceptors), whoever made them: the handler, the
+     * engine (404, 413, a refused request). Interim 1xx responses from
+     * hc_response_send_information() are not counted. */
+    uint64_t rq_1xx;
+    uint64_t rq_2xx;
+    uint64_t rq_3xx;
+    uint64_t rq_4xx;
+    uint64_t rq_5xx;
 } hc_server_stats;
 
 /* A copy of the counters (zeroes for NULL). */

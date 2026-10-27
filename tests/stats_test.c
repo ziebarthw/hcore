@@ -8,6 +8,7 @@
  *   - TLS: an HTTP/2 connection with two streams moves from HTTP/1 to
  *     HTTP/2 when ALPN picks h2; an HTTP/1.1-over-TLS connection stays
  *     HTTP/1 (curl with HTTP/2 and a libevhtp with HTTP/2 only)
+ *   - responses by status class (2xx, 3xx, 4xx incl. the 413, 5xx)
  *   - all gauges back to 0 at the end
  * Endpoint attachments: a fresh pooled connection has none; one set on it
  * is found on the next lease of the same connection, a new connection has
@@ -95,6 +96,10 @@ h_request(hc_server_handler *self, hc_server_exchange *ex, const hc_request_head
         t->total = (size_t)atol(t->path + 5);
         hc_response_send(rc, &rh, &e);
         hc_headers_free(h);
+    } else if (strcmp(t->path, "/fail") == 0) {
+        hc_response_send_simple(rc, 503, "text/plain", "no upstream", 0);
+    } else if (strcmp(t->path, "/moved") == 0) {
+        hc_response_send_simple(rc, 302, "text/plain", "elsewhere", 0);
     } else if (strcmp(t->path, "/upload") != 0) {
         hc_response_send_simple(rc, 200, "text/plain", "hello", 0);
     }
@@ -331,6 +336,29 @@ server_cases(hc_server *s)
     CHECK_EQ(st.cx_http2_total, 0);
     printf("  Content-Length over the limit: rq_too_large %llu\n",
            (unsigned long long)st.rq_too_large);
+
+    /* status classes: 200 x2 and the cut-off 200 (its head went out), the
+     * 413; then a 302, a 503 and one more 200 */
+    CHECK_EQ(st.rq_2xx, 3);
+    CHECK_EQ(st.rq_4xx, 1);
+    fd = connect_to(PORT_H1);
+    send_str(fd, "GET /moved HTTP/1.1\r\nHost: x\r\n\r\n");
+    read_upto(fd, out, sizeof(out), "elsewhere");
+    send_str(fd, "GET /fail HTTP/1.1\r\nHost: x\r\n\r\n");
+    read_upto(fd, out, sizeof(out), "no upstream");
+    send_str(fd, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n");
+    read_upto(fd, out, sizeof(out), "hello");
+    close(fd);
+    sleep_ms(100);
+    st = hc_server_get_stats(s);
+    CHECK_EQ(st.rq_1xx, 0);
+    CHECK_EQ(st.rq_2xx, 4);
+    CHECK_EQ(st.rq_3xx, 1);
+    CHECK_EQ(st.rq_4xx, 1);
+    CHECK_EQ(st.rq_5xx, 1);
+    printf("  by status class: 2xx %llu, 3xx %llu, 4xx %llu, 5xx %llu\n",
+           (unsigned long long)st.rq_2xx, (unsigned long long)st.rq_3xx,
+           (unsigned long long)st.rq_4xx, (unsigned long long)st.rq_5xx);
 }
 
 static void
