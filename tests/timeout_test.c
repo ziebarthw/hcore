@@ -80,6 +80,7 @@ static hc_reactor        *R;
 
 /* What the server handlers saw (written on the loop thread). */
 static volatile int handled_upload;     /* /upload handle_request calls */
+static volatile int upload_length;      /* its Content-Length (-1: none) */
 static char         last_failure[128];
 static volatile int failures;
 
@@ -155,6 +156,7 @@ h_request(hc_server_handler *self, hc_server_exchange *ex, const hc_request_head
         hc_headers_free(h);
     } else if (strcmp(t->path, "/upload") == 0) {
         handled_upload++;           /* answered at stream_end */
+        upload_length = entity ? (int)entity->content_length : 0;
     } else {
         reply(t, 404, "?");
     }
@@ -529,13 +531,19 @@ h2_cases(const char *tmpdir)
     CHECK(handled_upload == 0);
     printf("  Content-Length 2000: %s\n", strstr(out, " 413 1\n") ? "413, connection reused" : out);
 
-    /* no Content-Length (curl sends a chunked upload as plain DATA) */
-    failures = 0;
-    snprintf(args, sizeof(args), "--http2 -w ' %%{http_code}' -H 'Transfer-Encoding: chunked' "
-             "--data-binary @%s https://127.0.0.1:%d/upload", file, PORT_TLS);
+    /* no Content-Length: an upload from stdin, whose length curl cannot
+     * know (curl 8.15 adds Content-Length to a chunked --data-binary on
+     * HTTP/2, which would test the case above again) */
+    failures       = 0;
+    handled_upload = 0;
+    upload_length  = 0;
+    last_failure[0] = '\0';
+    snprintf(args, sizeof(args), "--http2 -w ' %%{http_code}' -X POST -T - "
+             "https://127.0.0.1:%d/upload < %s", PORT_TLS, file);
     CHECK(curl(args, out, sizeof(out)) == 0);
     CHECK(strstr(out, " 413") != NULL);
     sleep_ms(100 * K);
+    CHECK(handled_upload == 1 && upload_length == -1);   /* really no length */
     CHECK(failures == 1 && strcmp(last_failure, "request body too large") == 0);
     printf("  2000 bytes, no Content-Length: %s; handler: %s\n",
            strstr(out, " 413") ? "413" : out, last_failure);

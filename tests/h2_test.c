@@ -5,7 +5,8 @@
  *
  *   - a small reply, an error reply that asks to close the connection (no
  *     connection-specific header may reach an HTTP/2 client), HEAD
- *   - an upload (3 MB, past the stream and connection windows), counted
+ *   - an upload (3 MB, past the stream and connection windows), counted;
+ *     again with its length unknown (HTTP/2: no Content-Length)
  *   - a streamed download of unknown length (8 MB) produced with
  *     backpressure: every byte checked
  *   - six streams at once on one connection
@@ -49,6 +50,7 @@ static struct event_base *base;
 static hc_reactor        *R;
 static hc_server         *S, *S_H1;
 static volatile int       last_version;     /* request version seen */
+static volatile int       last_had_body;    /* entity != NULL       */
 
 static unsigned char
 pattern(size_t i)
@@ -104,6 +106,7 @@ h_request(hc_server_handler *self, hc_server_exchange *ex, const hc_request_head
     t->ex = ex;
     t->rc = rc;
     last_version = head->version;
+    last_had_body = entity != NULL;
     snprintf(t->path, sizeof(t->path), "%s", head->target);
 
     if (strcmp(t->path, "/hello") == 0) {
@@ -358,6 +361,16 @@ run_cases(const char *proto, const char *want_version, int port, int want_hc_ver
         snprintf(want, sizeof(want), "n=%u sum=%lu", 3u * 1024 * 1024, sum);
         CHECK(strcmp(out, want) == 0);
         printf("  upload 3 MB: %s\n", strcmp(out, want) == 0 ? "ok" : out);
+
+        /* the same, from stdin: length unknown (HTTP/2: no Content-Length,
+         * HTTP/1.1: chunked) - the handler must still be told a body
+         * follows, and get all of it */
+        snprintf(args, sizeof(args), "%s -X POST -T - -H 'Content-Type: application/octet-stream' "
+                 "https://127.0.0.1:%d/upload < %s", proto, port, file);
+        CHECK(curl(args, out, sizeof(out)) == 0);
+        CHECK(strcmp(out, want) == 0);
+        CHECK(last_had_body == 1);
+        printf("  upload 3 MB, length unknown: %s\n", strcmp(out, want) == 0 ? "ok" : out);
     }
 
     /* streamed download: 8 MB, unknown length */

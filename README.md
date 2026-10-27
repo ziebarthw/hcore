@@ -759,19 +759,21 @@ goes over the wire. It covers:
 Breaking any of the three drain rules fails the matching check, against
 both libevhtps.
 
-**HTTP/2 server** (`tests/h2_test`, 41 checks; 46 with stream reset) runs only when libevhtp has
+**HTTP/2 server** (`tests/h2_test`, 47 checks; 52 with stream reset) runs only when libevhtp has
 HTTP/2 (the ziebarthw fork built with nghttp2; `make check` says "skipped"
 otherwise) and curl does. An HTTPS hcore server answers curl over HTTP/2 and,
 for comparison, the same requests over HTTP/1.1:
 - a small reply; an error reply asking to close the connection (no
   `Connection` header may reach an HTTP/2 client); HEAD;
-- a 3 MB upload, counted (past the 64 KB HTTP/2 flow-control windows);
+- a 3 MB upload, counted (past the 64 KB HTTP/2 flow-control windows), and
+  again with its length unknown (HTTP/2: no `Content-Length`; HTTP/1.1:
+  chunked), which the handler must still see as a request with a body;
 - an 8 MB download of unknown length produced with backpressure, every byte
   checked;
 - six streams at once on one connection;
 - a drain with a stream under way: it completes, then the connection closes;
 - `hc_server_set_http2(s, 0)`: a client asking for h2 gets HTTP/1.1;
-- with a libevhtp that has `evhtp_request_reset_stream()` (46 checks):
+- with a libevhtp that has `evhtp_request_reset_stream()`:
   `hc_server_abort()` on a stream with a reply under way resets just that
   stream while another stream on the same connection completes (one
   connection opened), and a stream reset 100 KB into a 3 MB upload leaves
@@ -790,7 +792,7 @@ refused response fails the exchange. The client and server keep working
 afterwards; the defaults and a shared, multiply referenced processor are
 checked directly; valgrind: no errors, no leaks.
 
-**Timeouts and body limit** (`tests/timeout_test`, 41 checks; 33 without
+**Timeouts and body limit** (`tests/timeout_test`, 42 checks; 33 without
 HTTP/2) use raw sockets and curl against servers with 300 ms timeouts and a
 1000-byte limit, and a requester with 300 ms timeouts. Server: a silent
 client, a half-sent request head and an idle keep-alive connection are
