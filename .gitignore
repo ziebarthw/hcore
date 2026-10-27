@@ -14,6 +14,7 @@
 /tests/processor_test
 /tests/timeout_test
 /tests/stats_test
+/tests/tls_opts_test
 
 # local build settings (see config.mk.example)
 /config.mk

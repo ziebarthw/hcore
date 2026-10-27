@@ -308,10 +308,46 @@ typedef struct hc_server_listener {
 } hc_server_listener;
 
 void       hc_server_set_listener(hc_server *s, const hc_server_listener *l);
-/* Serve HTTPS: PEM certificate (chain) and private key files. Call before
- * hc_server_listen(). Returns -1 if they cannot be loaded or TLS support
- * was not compiled in. */
+/* Serve HTTPS: PEM certificate (chain) and private key files, TLS 1.2 and
+ * 1.3, OpenSSL's default ciphers. Call before hc_server_listen(). Returns
+ * -1 if they cannot be loaded or TLS support was not compiled in. */
 int        hc_server_enable_tls(hc_server *s, const char *cert_file, const char *key_file);
+
+/* TLS protocol versions, for hc_server_tls_options.protocols. */
+#define HC_TLS_1_0 (1u << 0)
+#define HC_TLS_1_1 (1u << 1)
+#define HC_TLS_1_2 (1u << 2)
+#define HC_TLS_1_3 (1u << 3)
+
+/* Client certificates (mutual TLS), for hc_server_tls_options.verify_client. */
+#define HC_TLS_VERIFY_NONE     0    /* not asked for (the default)          */
+#define HC_TLS_VERIFY_OPTIONAL 1    /* asked for; checked if one is sent    */
+#define HC_TLS_VERIFY_REQUIRED 2    /* the handshake fails without a valid one */
+
+typedef struct hc_server_tls_options {
+    const char *cert_file;     /* PEM certificate, with its chain (required) */
+    const char *key_file;      /* PEM private key; NULL: in cert_file       */
+    unsigned    protocols;     /* HC_TLS_1_x bits; 0: TLS 1.2 and 1.3. (With
+                                * OpenSSL 3, TLS 1.0/1.1 also need a cipher
+                                * list ending in ":@SECLEVEL=0".)            */
+    const char *ciphers;       /* OpenSSL cipher list for TLS 1.2 and below,
+                                * e.g. "ECDHE+AESGCM:ECDHE+CHACHA20"; NULL:
+                                * OpenSSL's default                          */
+    const char *ciphersuites;  /* TLS 1.3 suites, e.g.
+                                * "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256";
+                                * NULL: OpenSSL's default                    */
+    int         verify_client; /* HC_TLS_VERIFY_*                            */
+    const char *ca_file;       /* PEM CAs that client certificates must chain
+                                * to (needed with verify_client)            */
+    int         verify_depth;  /* client chain depth; 0: OpenSSL's default   */
+} hc_server_tls_options;
+
+/* hc_server_enable_tls() with options. On failure returns -1 and, when err
+ * is not NULL, says why in err (e.g. "certificate /x.pem: no such file",
+ * "private key does not match the certificate", "invalid cipher list:
+ * FOO"); the server is then as before (TLS can be enabled again). */
+int        hc_server_enable_tls_opts(hc_server *s, const hc_server_tls_options *o,
+                                     char *err, size_t errlen);
 /* HTTP/2 over TLS (ALPN "h2"), on by default when libevhtp has it (the
  * ziebarthw fork built with nghttp2); 0 offers HTTP/1.1 only. Call before
  * hc_server_enable_tls(). Returns -1 when asking for HTTP/2 from a

@@ -2127,33 +2127,184 @@ srv_alpn_http11(SSL *ssl, const unsigned char **out, unsigned char *outlen,
 }
 #endif
 
+#ifdef HC_HAVE_TLS
+/* "what: OpenSSL's reason" into err, from the newest queued OpenSSL error. */
+static void
+tls_err(char *err, size_t errlen, const char *what, const char *detail)
+{
+    unsigned long e      = ERR_peek_last_error();
+    const char   *reason = e ? ERR_reason_error_string(e) : NULL;
+
+    if (err && errlen) {
+        snprintf(err, errlen, "%s%s%s%s%s", what, detail ? " " : "", detail ? detail : "",
+                 reason ? ": " : "", reason ? reason : "");
+    }
+
+    ERR_clear_error();
+}
+
+/* A file that cannot be read: "what path: No such file or directory". */
+static int
+tls_unreadable(char *err, size_t errlen, const char *what, const char *path)
+{
+    FILE *f = fopen(path, "r");
+
+    if (f) {
+        fclose(f);
+        return 0;
+    }
+
+    if (err && errlen) {
+        snprintf(err, errlen, "%s %s: %s", what, path, strerror(errno));
+    }
+
+    return 1;
+}
+
+/* Undo a failed enable: the server is as before. */
+static void
+tls_reset(hc_server *s)
+{
+    if (s->htp->ssl_ctx) {
+        SSL_CTX_free(s->htp->ssl_ctx);
+        s->htp->ssl_ctx = NULL;
+    }
+
+    s->htp->ssl_cfg = NULL;
+    free(s->tls.pemfile);
+    free(s->tls.privfile);
+    free(s->tls.ciphers);
+    free(s->tls.cafile);
+    memset(&s->tls, 0, sizeof(s->tls));
+}
+#endif
+
 int
-hc_server_enable_tls(hc_server *s, const char *cert_file, const char *key_file)
+hc_server_enable_tls_opts(hc_server *s, const hc_server_tls_options *o, char *err, size_t errlen)
 {
 #ifdef HC_HAVE_TLS
     SSL_CTX *ctx;
+    unsigned protocols;
+    long     no = 0;
+
+    if (err && errlen) {
+        err[0] = '\0';
+    }
+
+    if (s == NULL || o == NULL || o->cert_file == NULL) {
+        tls_err(err, errlen, "no certificate file", NULL);
+        return -1;
+    }
 
     if (s->tls.pemfile) {
-        return -1;              /* already enabled */
+        tls_err(err, errlen, "TLS is already enabled", NULL);
+        return -1;
     }
 
-    s->tls.pemfile         = dup_cstr(cert_file);
-    s->tls.privfile        = dup_cstr(key_file);
-    s->tls.ssl_opts        = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1;
+    protocols = o->protocols ? o->protocols : (HC_TLS_1_2 | HC_TLS_1_3);
+
+    if ((protocols & (HC_TLS_1_0 | HC_TLS_1_1 | HC_TLS_1_2 | HC_TLS_1_3)) == 0) {
+        tls_err(err, errlen, "no TLS protocol version enabled", NULL);
+        return -1;
+    }
+
+    if (o->verify_client != HC_TLS_VERIFY_NONE && (o->ca_file == NULL || !o->ca_file[0])) {
+        tls_err(err, errlen, "verifying client certificates needs a CA file", NULL);
+        return -1;
+    }
+
+    if (tls_unreadable(err, errlen, "certificate", o->cert_file) ||
+        (o->key_file && tls_unreadable(err, errlen, "private key", o->key_file)) ||
+        (o->ca_file && o->ca_file[0] && tls_unreadable(err, errlen, "CA file", o->ca_file))) {
+        return -1;
+    }
+
+    no |= SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3;
+    no |= (protocols & HC_TLS_1_0) ? 0 : SSL_OP_NO_TLSv1;
+    no |= (protocols & HC_TLS_1_1) ? 0 : SSL_OP_NO_TLSv1_1;
+    no |= (protocols & HC_TLS_1_2) ? 0 : SSL_OP_NO_TLSv1_2;
+    no |= (protocols & HC_TLS_1_3) ? 0 : SSL_OP_NO_TLSv1_3;
+
+    ERR_clear_error();
+
+    s->tls.pemfile         = dup_cstr(o->cert_file);
+    s->tls.privfile        = dup_cstr(o->key_file ? o->key_file : o->cert_file);
+    s->tls.ciphers         = o->ciphers && o->ciphers[0] ? dup_cstr(o->ciphers) : NULL;
+    s->tls.cafile          = o->ca_file && o->ca_file[0] ? dup_cstr(o->ca_file) : NULL;
+    s->tls.ssl_opts        = no;
     s->tls.ssl_ctx_timeout = 60 * 60;
-    s->tls.verify_peer     = SSL_VERIFY_NONE;
+    s->tls.verify_peer     = o->verify_client == HC_TLS_VERIFY_REQUIRED ?
+                                 SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT :
+                             o->verify_client == HC_TLS_VERIFY_OPTIONAL ? SSL_VERIFY_PEER :
+                                 SSL_VERIFY_NONE;
+    s->tls.verify_depth    = o->verify_depth > 0 ? o->verify_depth : 0;
     s->tls.scache_type     = evhtp_ssl_scache_type_internal;
 
-    if (!s->tls.pemfile || !s->tls.privfile || evhtp_ssl_init(s->htp, &s->tls) != 0) {
+    if (!s->tls.pemfile || !s->tls.privfile ||
+        (o->ciphers && o->ciphers[0] && !s->tls.ciphers) ||
+        (o->ca_file && o->ca_file[0] && !s->tls.cafile)) {
+        tls_reset(s);
+        tls_err(err, errlen, "out of memory", NULL);
         return -1;
     }
 
-    /* evhtp_ssl_init() ignores certificate/key loading errors: check. */
+    if (evhtp_ssl_init(s->htp, &s->tls) != 0) {
+        /* its only checked failure, besides allocation */
+        tls_err(err, errlen, "invalid cipher list:", o->ciphers);
+        tls_reset(s);
+        return -1;
+    }
+
+    /* evhtp_ssl_init() ignores certificate, key and CA loading errors: load
+     * again where something is missing, for OpenSSL's reason. */
     ctx = s->htp->ssl_ctx;
+    ERR_clear_error();
 
-    if (SSL_CTX_get0_certificate(ctx) == NULL || SSL_CTX_check_private_key(ctx) != 1) {
+    if (SSL_CTX_get0_certificate(ctx) == NULL) {
+        SSL_CTX_use_certificate_chain_file(ctx, o->cert_file);
+        tls_err(err, errlen, "certificate", o->cert_file);
+        tls_reset(s);
         return -1;
     }
+
+    if (SSL_CTX_check_private_key(ctx) != 1) {
+        const char *key = o->key_file ? o->key_file : o->cert_file;
+
+        ERR_clear_error();
+        if (SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) != 1 &&
+            ERR_GET_REASON(ERR_peek_last_error()) != X509_R_KEY_VALUES_MISMATCH) {
+            tls_err(err, errlen, "private key", key);
+        } else {
+            ERR_clear_error();
+            tls_err(err, errlen, "private key does not match the certificate", NULL);
+        }
+        tls_reset(s);
+        return -1;
+    }
+
+    if (s->tls.cafile && SSL_CTX_load_verify_locations(ctx, s->tls.cafile, NULL) != 1) {
+        tls_err(err, errlen, "CA file", s->tls.cafile);
+        tls_reset(s);
+        return -1;
+    }
+
+    if (o->ciphersuites && o->ciphersuites[0] &&
+        SSL_CTX_set_ciphersuites(ctx, o->ciphersuites) != 1) {
+        tls_err(err, errlen, "invalid TLS 1.3 cipher suites:", o->ciphersuites);
+        tls_reset(s);
+        return -1;
+    }
+
+    if (s->tls.cafile && o->verify_client != HC_TLS_VERIFY_NONE) {
+        /* the CAs to name in the CertificateRequest */
+        STACK_OF(X509_NAME) *names = SSL_load_client_CA_file(s->tls.cafile);
+
+        if (names) {
+            SSL_CTX_set_client_CA_list(ctx, names);
+        }
+    }
+
+    ERR_clear_error();
 
 #ifdef HC_HAVE_H2
     /* Built with HTTP/2: libevhtp's ALPN callback (installed by
@@ -2165,11 +2316,25 @@ hc_server_enable_tls(hc_server *s, const char *cert_file, const char *key_file)
     return 0;
 #else
     (void)s;
-    (void)cert_file;
-    (void)key_file;
+    (void)o;
+
+    if (err && errlen) {
+        snprintf(err, errlen, "TLS support not compiled in");
+    }
 
     return -1;
 #endif
+}
+
+int
+hc_server_enable_tls(hc_server *s, const char *cert_file, const char *key_file)
+{
+    hc_server_tls_options o = { 0 };
+
+    o.cert_file = cert_file;
+    o.key_file  = key_file;
+
+    return hc_server_enable_tls_opts(s, &o, NULL, 0);
 }
 
 int
@@ -2383,6 +2548,8 @@ hc_server_free(hc_server *s)
 #ifdef HC_HAVE_TLS
         free(s->tls.pemfile);
         free(s->tls.privfile);
+        free(s->tls.ciphers);
+        free(s->tls.cafile);
 #endif
         for (size_t i = 0; i < s->n_routes; i++) {
             free(s->routes[i].pattern);
