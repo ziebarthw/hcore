@@ -464,7 +464,7 @@ retries.
 
 `hc_server_get_stats(s)` returns Envoy-style counters for the server's
 client ("downstream") side, with Envoy's names minus the `downstream_`
-prefix:
+prefix (its listener `ssl.*` statistics keep an `ssl_` prefix):
 
 | Counter | What it counts |
 | ------- | -------------- |
@@ -476,6 +476,11 @@ prefix:
 | `rq_completed` | responses sent in full (not aborted, not cut off) |
 | `rq_too_large` | `413`s from the body limit |
 | `rq_1xx` … `rq_5xx` | final responses by status class, as sent (after the interceptors) |
+| `ssl_handshake`, `ssl_versions_tlsv1` … `_tlsv1_3` | completed TLS handshakes, in total and by version |
+| `ssl_session_reused` | resumed TLS sessions |
+| `ssl_no_certificate` | handshakes where the client sent no certificate |
+| `ssl_fail_verify_no_cert`, `ssl_fail_verify_error` | handshakes failed for a missing or unverifiable client certificate |
+| `ssl_connection_error` | other failed TLS connections: protocol or cipher mismatch, a client leaving or timing out mid-handshake |
 
 They are plain counters, read and updated on the server's reactor thread.
 
@@ -862,7 +867,7 @@ all gauges return to 0. Attachments: a fresh connection has none, a reused
 one has the one set on it, a second connection (the first held) has none,
 and both are freed once when the requester closes them. Valgrind: clean.
 
-**Server TLS options** (`tests/tls_opts_test`, 33 checks) drives servers
+**Server TLS options** (`tests/tls_opts_test`, 58 checks) drives servers
 with `openssl s_client`: TLS 1.3 only with one suite refuses TLS 1.2 and a
 client offering another suite, and serves that suite; TLS 1.2 only with one
 cipher likewise; with client certificates required, no certificate or one
@@ -871,7 +876,11 @@ named in the request); optional serves a client without one; the defaults
 serve TLS 1.2 and 1.3, not 1.1. Errors: a missing certificate or CA file, a
 mismatched key, invalid ciphers or TLS 1.3 suites, client verification
 without a CA, no protocol version - each with its reason, after which valid
-options still work. Valgrind: clean.
+options still work. A resumed session (`-sess_out` / `-sess_in`). And the
+TLS statistics for all of it: handshakes by version, resumptions,
+connections without a client certificate, missing and unverifiable client
+certificates, and other failures, counted per server exactly as the
+scenarios dictate (58 checks in all). Valgrind: clean.
 
 **TLS server name** (`tests/tls_name_test`, 19 checks) connects over https
 to 127.0.0.1, where a plain OpenSSL server answers with the SNI it received.

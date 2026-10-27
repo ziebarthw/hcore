@@ -721,6 +721,7 @@ typedef struct srv_conn {
     evhtp_connection_t *c;
     unsigned            h2_active; /* HTTP/2 streams under way (read timeout off) */
     int                 tls;       /* counted in cx_ssl_active          */
+    int                 tls_state; /* 0 handshaking, 1 done, 2 failed (counted) */
     int                 h2;        /* counted as HTTP/2 (else HTTP/1)   */
     struct evbuffer          *rx, *tx;          /* the bufferevent's buffers */
     struct evbuffer_cb_entry *rx_cbe, *tx_cbe;  /* byte counters             */
@@ -1961,6 +1962,13 @@ srv_conn_fini(evhtp_connection_t *c, void *arg)
     }
     if (n->tls) {
         n->srv->stats.cx_ssl_active--;
+
+        /* Closed during the handshake without an event saying why (e.g. by
+         * the server): a failed connection all the same, unless the server
+         * itself is shutting down. */
+        if (n->tls_state == 0 && !n->srv->closing) {
+            n->srv->stats.ssl_connection_error++;
+        }
     }
 
     if (n->prev) {
@@ -1993,13 +2001,100 @@ srv_count_tx(struct evbuffer *buf, const struct evbuffer_cb_info *info, void *ar
     ((srv_conn *)arg)->srv->stats.cx_tx_bytes_total += info->n_added;
 }
 
-/* The TLS handshake is done: ALPN has decided HTTP/2 or HTTP/1.1. */
+#ifdef HC_HAVE_TLS
+static int
+tls_has_peer_cert(SSL *ssl)
+{
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    return SSL_get0_peer_certificate(ssl) != NULL;
+#else
+    X509 *x = SSL_get_peer_certificate(ssl);
+
+    X509_free(x);
+    return x != NULL;
+#endif
+}
+
+/* Handshake complete: Envoy's ssl.handshake, session_reused,
+ * no_certificate, versions.<version>. */
+static void
+srv_tls_done(srv_conn *n, evhtp_connection_t *c)
+{
+    hc_server_stats *st = &n->srv->stats;
+
+    n->tls_state = 1;
+    st->ssl_handshake++;
+
+    if (SSL_session_reused(c->ssl)) {
+        st->ssl_session_reused++;
+    }
+
+    if (!tls_has_peer_cert(c->ssl)) {
+        st->ssl_no_certificate++;
+    }
+
+    switch (SSL_version(c->ssl)) {
+    case TLS1_VERSION:   st->ssl_versions_tlsv1++;   break;
+    case TLS1_1_VERSION: st->ssl_versions_tlsv1_1++; break;
+    case TLS1_2_VERSION: st->ssl_versions_tlsv1_2++; break;
+#ifdef TLS1_3_VERSION
+    case TLS1_3_VERSION: st->ssl_versions_tlsv1_3++; break;
+#endif
+    }
+}
+
+/* Handshake failed (error, EOF or timeout before it completed): Envoy's
+ * fail_verify_no_cert, fail_verify_error or connection_error. Called from
+ * the event hook, while the SSL object and the bufferevent's OpenSSL errors
+ * are still there. */
+static void
+srv_tls_failed(srv_conn *n, evhtp_connection_t *c)
+{
+    hc_server_stats *st          = &n->srv->stats;
+    int              no_cert     = 0;
+    int              verify_fail = 0;
+    unsigned long    e;
+
+    n->tls_state = 2;
+
+    while (c->bev && (e = bufferevent_get_openssl_error(c->bev)) != 0) {
+        if (ERR_GET_REASON(e) == SSL_R_PEER_DID_NOT_RETURN_A_CERTIFICATE) {
+            no_cert = 1;
+        } else if (ERR_GET_REASON(e) == SSL_R_CERTIFICATE_VERIFY_FAILED) {
+            verify_fail = 1;
+        }
+    }
+
+    /* (A client certificate that fails verification is not kept on the
+     * connection: the verify result and the error say what happened.) */
+    if (no_cert) {
+        st->ssl_fail_verify_no_cert++;
+    } else if (verify_fail || (c->ssl && SSL_get_verify_result(c->ssl) != X509_V_OK)) {
+        st->ssl_fail_verify_error++;
+    } else {
+        st->ssl_connection_error++;
+    }
+}
+#endif
+
+/* The TLS handshake is done (ALPN has decided HTTP/2 or HTTP/1.1), or the
+ * connection failed. */
 static evhtp_res
 srv_conn_event(evhtp_connection_t *c, short events, void *arg)
 {
     srv_conn *n = arg;
 
     (void)c;    /* unused without HTTP/2 */
+
+#ifdef HC_HAVE_TLS
+    if (n->tls && n->tls_state == 0 && c->ssl) {
+        if (events & BEV_EVENT_CONNECTED) {
+            srv_tls_done(n, c);
+        } else if (events & (BEV_EVENT_ERROR | BEV_EVENT_EOF | BEV_EVENT_TIMEOUT)) {
+            srv_tls_failed(n, c);
+        }
+    }
+#endif
 
     if ((events & BEV_EVENT_CONNECTED) && conn_is_h2(c) && !n->h2) {
         n->h2 = 1;
