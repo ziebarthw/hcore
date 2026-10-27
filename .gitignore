@@ -13,6 +13,7 @@
 /tests/h2_test
 /tests/processor_test
 /tests/timeout_test
+/tests/stats_test
 
 # local build settings (see config.mk.example)
 /config.mk

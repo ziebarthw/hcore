@@ -390,6 +390,37 @@ int    hc_server_resume_accept(hc_server *s);
 void   hc_server_drain(hc_server *s);
 size_t hc_server_connection_count(const hc_server *s);
 
+/*
+ * Counters for the server's client ("downstream") connections and requests,
+ * named and counted as Envoy's downstream_* statistics. *_total and
+ * cx_destroy only grow; *_active are gauges. A TLS connection counts as
+ * HTTP/1 until its handshake picks h2 (ALPN), then moves to HTTP/2.
+ * Bytes are counted above TLS (plain HTTP bytes). Not thread safe: read
+ * them on the server's reactor thread.
+ */
+typedef struct hc_server_stats {
+    uint64_t cx_total;          /* connections accepted                    */
+    uint64_t cx_active;
+    uint64_t cx_destroy;        /* connections closed                      */
+    uint64_t cx_ssl_total;
+    uint64_t cx_ssl_active;
+    uint64_t cx_http1_total;
+    uint64_t cx_http1_active;
+    uint64_t cx_http2_total;
+    uint64_t cx_http2_active;
+    uint64_t cx_rx_bytes_total; /* received                                */
+    uint64_t cx_tx_bytes_total; /* queued for sending                      */
+    uint64_t rq_total;          /* requests that reached the engine        */
+    uint64_t rq_http1_total;
+    uint64_t rq_http2_total;
+    uint64_t rq_active;
+    uint64_t rq_completed;      /* response sent in full, not aborted      */
+    uint64_t rq_too_large;      /* 413s from hc_server_set_max_body()      */
+} hc_server_stats;
+
+/* A copy of the counters (zeroes for NULL). */
+hc_server_stats hc_server_get_stats(const hc_server *s);
+
 /* ------------------------------------------------------------------------ */
 /* Client side: AsyncClientExchangeHandler                                  */
 /* ------------------------------------------------------------------------ */
@@ -529,6 +560,16 @@ hc_client_exchange *hc_endpoint_execute(hc_endpoint *ep, hc_client_handler *h);
  * your pointer once you have called one of them. */
 void hc_endpoint_release_and_reuse(hc_endpoint *ep);
 void hc_endpoint_release_and_discard(hc_endpoint *ep);
+
+/* Application data tied to the endpoint's connection (not to one lease):
+ * it stays with the connection while the connection is pooled and leased
+ * again, and free_fn (if not NULL) frees it when the connection is closed
+ * and leaves the pool, or when another attachment replaces it. NULL until
+ * set, so a lease that finds no attachment has a connection the
+ * application has not seen before - e.g. to count connections per
+ * upstream. (Java: IOSession attributes.) */
+void  hc_endpoint_set_attachment(hc_endpoint *ep, void *data, void (*free_fn)(void *));
+void *hc_endpoint_get_attachment(const hc_endpoint *ep);
 
 /* Java: HttpAsyncRequester.execute(handler, timeout, context).
  * Leases a pooled connection to target, runs the handler on it, and
