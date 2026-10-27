@@ -32,6 +32,7 @@ tests/h2_test.c         the server over HTTP/2 (libevhtp with HTTP/2 only), chec
 tests/processor_test.c  interceptors and processors on both sides of real exchanges
 tests/timeout_test.c    client and origin timeouts, the request body limit (HTTP/1.1 and HTTP/2)
 tests/stats_test.c      server statistics against what happened on the wire; endpoint attachments
+tests/tls_opts_test.c   server TLS options (protocols, ciphers, client certificates) via openssl s_client
 tests/run.sh            end-to-end tests (curl / client -> proxy -> tests/origin.py, echo_server)
 tests/tls/              self-signed test certificates (localhost, other.example)
 third_party/htstring/   copy of htstring: htstring_t string views, used by the engine's routing
@@ -313,9 +314,21 @@ host, user agent, request date, default headers, response date, server;
   `TLS certificate verification failed: hostname mismatch`, `... self-signed
   certificate`, `TLS handshake failed: ...`, `cannot resolve <name>: ...`,
   `cannot connect to origin: Connection refused`.
-- **Server:** `hc_server_enable_tls(server, cert.pem, key.pem)`. It returns
-  -1 if the pair doesn't load; libevhtp itself ignores that error, so the
-  engine checks.
+- **Server:** `hc_server_enable_tls(server, cert.pem, key.pem)` serves TLS
+  1.2 and 1.3 with OpenSSL's default ciphers. `hc_server_enable_tls_opts()`
+  takes `hc_server_tls_options` instead:
+  - `protocols`: `HC_TLS_1_0` … `HC_TLS_1_3` (0: TLS 1.2 and 1.3);
+  - `ciphers` (TLS 1.2 and below) and `ciphersuites` (TLS 1.3), in
+    OpenSSL's syntax;
+  - `verify_client` (`HC_TLS_VERIFY_OPTIONAL` / `_REQUIRED`), `ca_file`
+    and `verify_depth`, for client certificates (mutual TLS); the CA's
+    name is sent in the certificate request.
+
+  Failures come back as reasons, e.g. `certificate /x.pem: No such file or
+  directory`, `private key does not match the certificate`, `invalid cipher
+  list: FOO: no cipher match`, and leave the server able to try again.
+  (libevhtp itself ignores certificate and key loading errors, so the
+  engine checks.)
 - **Examples:** `echo_server --tls CERT KEY`;
   `reverse_proxy [--cafile PEM] https://origin`;
   `full_duplex_client [--cafile PEM | --insecure] https://...`.
@@ -848,6 +861,17 @@ from HTTP/1 to HTTP/2, and an HTTP/1.1-over-TLS connection stays HTTP/1;
 all gauges return to 0. Attachments: a fresh connection has none, a reused
 one has the one set on it, a second connection (the first held) has none,
 and both are freed once when the requester closes them. Valgrind: clean.
+
+**Server TLS options** (`tests/tls_opts_test`, 33 checks) drives servers
+with `openssl s_client`: TLS 1.3 only with one suite refuses TLS 1.2 and a
+client offering another suite, and serves that suite; TLS 1.2 only with one
+cipher likewise; with client certificates required, no certificate or one
+from another CA gets nothing and the CA's certificate is served (the CA is
+named in the request); optional serves a client without one; the defaults
+serve TLS 1.2 and 1.3, not 1.1. Errors: a missing certificate or CA file, a
+mismatched key, invalid ciphers or TLS 1.3 suites, client verification
+without a CA, no protocol version - each with its reason, after which valid
+options still work. Valgrind: clean.
 
 **TLS server name** (`tests/tls_name_test`, 19 checks) connects over https
 to 127.0.0.1, where a plain OpenSSL server answers with the SNI it received.
