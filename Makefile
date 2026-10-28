@@ -32,7 +32,7 @@ HC_CFLAGS = -std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude -Ithird_p
 EVHTP_CFLAGS = -I$(EVHTP_PREFIX)/include
 EVHTP_LIBS   = $(EVHTP_PREFIX)/lib/libevhtp.a $(EXTRA_LIBS) -levent -levent_openssl -levent_pthreads -lssl -lcrypto -lpthread
 
-all: libhcore.a reverse_proxy echo_server full_duplex_client full_duplex_server
+all: libhcore.a reverse_proxy echo_server full_duplex_client full_duplex_server file_server
 
 src/hc_evhtp.o: src/hc_evhtp.c include/hc.h include/hc_pool.h include/hc_processor.h third_party/htstring/include/htstring/htstring.h
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE $(EVHTP_CFLAGS) -c -o $@ $<
@@ -73,6 +73,9 @@ full_duplex_client: examples/full_duplex_client.o $(HC_OBJS)
 	$(CC) -o $@ $^ $(EVHTP_LIBS)
 
 full_duplex_server: examples/full_duplex_server.o $(HC_OBJS)
+	$(CC) -o $@ $^ $(EVHTP_LIBS)
+
+file_server: examples/file_server.o $(HC_OBJS)
 	$(CC) -o $@ $^ $(EVHTP_LIBS)
 
 hcurl: examples/hcurl.o $(HC_OBJS)
@@ -196,6 +199,6 @@ libhcore.pc:
 	@echo "wrote $@"
 
 clean:
-	rm -f libhcore.a libhcore.pc src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/h2_test tests/processor_test tests/timeout_test tests/stats_test tests/tls_opts_test tests/basic_server_test
+	rm -f libhcore.a libhcore.pc src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server file_server tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/h2_test tests/processor_test tests/timeout_test tests/stats_test tests/tls_opts_test tests/basic_server_test
 
 .PHONY: all clean check install libhcore.pc
