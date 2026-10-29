@@ -179,6 +179,65 @@ test_join_cstr(void)
     }
 }
 
+static void
+test_pct_decode(void)
+{
+    char      out[64];
+    ptrdiff_t n;
+
+#define DECODE(lit) htstring_pct_decode(HTSTRING_LIT(lit), out, sizeof(out))
+
+    /* plain text is copied; escapes in either case are decoded */
+    n = DECODE("/a/b.txt");
+    CHECK(n == 8 && memcmp(out, "/a/b.txt", 8) == 0);
+    n = DECODE("/a%20b%2Fc%2fd");
+    CHECK(n == 8 && memcmp(out, "/a b/c/d", 8) == 0);
+    n = DECODE("%41%7a%7A%e2%82%ac");       /* "Azz" and the euro sign's UTF-8 */
+    CHECK(n == 6 && memcmp(out, "Azz\xe2\x82\xac", 6) == 0);
+    n = DECODE("%25%2525");                 /* "%%25": decoded once only */
+    CHECK(n == 4 && memcmp(out, "%%25", 4) == 0);
+    n = DECODE("a+b");                      /* '+' is not a space in a path */
+    CHECK(n == 3 && memcmp(out, "a+b", 3) == 0);
+    n = DECODE("");
+    CHECK(n == 0);
+
+    /* "%00" decodes; refusing it is the caller's call */
+    n = DECODE("a%00b");
+    CHECK(n == 3 && memcmp(out, "a\0b", 3) == 0 && memchr(out, '\0', (size_t)n) != NULL);
+
+    /* bad escapes: refused */
+    CHECK(DECODE("%") == -1);
+    CHECK(DECODE("abc%") == -1);
+    CHECK(DECODE("abc%4") == -1);
+    CHECK(DECODE("%zz") == -1);
+    CHECK(DECODE("%4g") == -1);
+    CHECK(DECODE("%g4") == -1);
+    CHECK(DECODE("% 41") == -1);
+
+    /* a dst too small: refused; exactly big enough: fine */
+    CHECK(htstring_pct_decode(HTSTRING_LIT("abc"), out, 2) == -1);
+    CHECK(htstring_pct_decode(HTSTRING_LIT("%41%42"), out, 1) == -1);
+    CHECK(htstring_pct_decode(HTSTRING_LIT("%41%42"), out, 2) == 2 && memcmp(out, "AB", 2) == 0);
+    CHECK(htstring_pct_decode(HTSTRING_LIT(""), NULL, 0) == 0);
+
+    /* in place */
+    {
+        char buf[] = "/x%2Fy%20z";
+
+        n = htstring_pct_decode(htstring_ctor(buf, strlen(buf)), buf, sizeof(buf));
+        CHECK(n == 6 && memcmp(buf, "/x/y z", 6) == 0);
+    }
+
+    /* only the view is decoded, not what follows it */
+    {
+        const char *p = "/a%20b?q=%zz";
+
+        n = htstring_pct_decode(htstring_ctor(p, 7), out, sizeof(out));
+        CHECK(n == 5 && memcmp(out, "/a b?", 5) == 0);
+    }
+#undef DECODE
+}
+
 int
 main(void)
 {
@@ -187,5 +246,6 @@ main(void)
     test_compare();
     test_to_cstr();
     test_join_cstr();
+    test_pct_decode();
     return check_done("htstring_test");
 }
