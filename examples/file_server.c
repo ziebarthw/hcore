@@ -30,6 +30,7 @@
  *   curl --limit-rate 100k --max-time 1 localhost:8080/big.bin -o /dev/null
  *                                         client gives up: ->failed, ->release
  */
+#define _GNU_SOURCE
 #include "hc.h"
 #include "hc_support.h"
 #include "htstring/htstring.h"
@@ -136,6 +137,177 @@ content_type_for(const char *name)
 /* TODO 2: an error page                                                    */
 /* ------------------------------------------------------------------------ */
 
+#define TOO_CUTE_BY_HALF
+#ifdef TOO_CUTE_BY_HALF
+#define DYNAMIC_ESCAPED
+#ifdef DYNAMIC_ESCAPED
+static htstring_t escaped[256];
+static void
+init_escaped(void)
+{
+    for (size_t c = 0; c < sizeof(escaped)/sizeof(escaped[0]); ++c) {
+        switch (c) {
+            case '<':
+                escaped[c].startp = "&lt;";
+                escaped[c].len    = 4;
+                break;
+            case '>':
+                escaped[c].startp = "&gt;";
+                escaped[c].len    = 4;
+                break;
+            case '&':
+                escaped[c].startp = "&amp;";
+                escaped[c].len    = 5;
+                break;
+            case '"':
+                escaped[c].startp = "&quot;";
+                escaped[c].len    = 6;
+                break;
+            default:
+                escaped[c].startp = "";
+                escaped[c].len    = 0; // Could be 1 to avoid if (n > 0)...
+                break;
+        }
+    }
+}
+#else
+static htstring_t escaped[256] = {
+    {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0},
+    {"&quot;", 6},
+    {"", 0},
+    {"", 0},
+    {"", 0},
+    {"&amp;", 5},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0},
+    {"&lt;", 4},
+    {"", 0},
+    {"&gt;", 4},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0},
+    {"", 0}
+};
+static void
+init_escaped(void)
+{
+}
+#endif///DYNAMIC_ESCAPED
+
+static inline size_t
+calc_escaped_len(const char *msg)
+{
+    size_t len = 0;
+    for (const char *curp = msg; curp[0]; ++curp) {
+        size_t n = escaped[(unsigned char)curp[0]].len;
+        if (n > 0) {
+            len += n;
+        } else {
+            ++len;
+        }
+    }
+    return len;
+}
+
+static inline char*
+escape_message(const char *msg)
+{
+    size_t len = calc_escaped_len(msg);
+    char  *out = (char*)malloc(len + 1); // Could be htstring_t rather than c string.
+    char  *dst = out;
+
+    for (const char *curp = msg; curp[0]; ++curp) {
+        htstring_t e = escaped[(unsigned char)curp[0]];
+        if (e.len > 0) {
+            memcpy(dst, e.startp, e.len);
+            dst += e.len;
+        } else {
+            *dst++ = curp[0];
+        }
+    }
+    *dst = '\0';
+    return out;
+}
+#else
+static inline size_t
+calc_escaped_len(const char *msg)
+{
+    size_t len = 0;
+    for (const char *curp = msg; curp[0]; ++curp) {
+        switch ((unsigned char)curp[0]) {
+            case '<':
+            case '>':
+                len += 4;
+                break;
+            case '&':
+                len += 5;
+                break;
+            case '"':
+                len += 6;
+                break;
+            default:
+                ++len;
+                break;
+        }
+    }
+    return len;
+}
+
+static inline char*
+escape_message(const char *msg)
+{
+    size_t len = calc_escaped_len(msg);
+    char  *out = (char*)malloc(len + 1); // Could be htstring_t rather than c string.
+    char  *dst = out;
+
+    for (const char *curp = msg; curp[0]; ++curp) {
+        switch ((unsigned char)curp[0]) {
+            case '<':
+                memcpy(dst, "&lt;", 4);
+                dst += 4;
+                break;
+            case '>':
+                memcpy(dst, "&gt;", 4);
+                dst += 4;
+                break;
+            case '&':
+                memcpy(dst, "&amp;", 5);
+                dst += 5;
+                break;
+            case '"':
+                memcpy(dst, "&quot;", 6);
+                dst += 6;
+                break;
+            default:
+                *dst++ = curp[0];
+                break;
+        }
+    }
+    *dst = '\0';
+    return out;
+}
+#endif//TOO_CUTE_BY_HALF
+
 /* Java: println(msg) and
  *   responseTrigger.submitResponse(AsyncResponseBuilder.create(status)
  *       .setEntity("<html><body><h1>" + msg + "</h1></body></html>",
@@ -150,14 +322,15 @@ static void
 send_error_page(hc_basic_request *r, int status, const char *msg)
 {
     ht_scratch_auto(tbuf);
+    char       *escaped_msg = escape_message(msg);
     const char *body = htstring_join_cstr_v(&tbuf,
                         HTSTRING_LIT("<html><body><h1>"),
-                        htstring_ctor(msg,
-                        strlen(msg)),
+                        htstring_ctor(escaped_msg, strlen(escaped_msg)),
                         HTSTRING_LIT("</h1></body></html>"));
-    println(msg);
+    println("%s", msg);
     hc_response_send_simple(hc_basic_request_channel(r), status, "text/html",
                             body, 0);
+    free(escaped_msg);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -181,12 +354,43 @@ static int
 resolve_path(const char *target, char *out, size_t size)
 {
     struct parsed_uri u = parse_uri_view(htstring_ctor(target, strlen(target)), false);
-    htstring_t path = parsed_uri_get_path(target, &u);
-    println("%s - target \"%s\", path \"%.*s\"", __func__, target, (int)path.len, path.startp);
-    (void)out;
-    (void)size;
-    /* TODO */
-    return -1;
+    htstring_t        path = parsed_uri_get_path(target, &u);
+
+    char              dec[2048];
+    ptrdiff_t         n = htstring_pct_decode(path, dec, sizeof(dec));
+
+    if (n < 0) {
+        return -1;
+    }
+    if (memchr(dec, 0, n)) {
+        return -1;
+    }
+    const char *curp = (const char*)memrchr(dec, '/', n);
+    if (curp) {
+        for (const char *p = dec; curp - p > 1; ++p) {
+            if (memcmp(p, "..", 2)) {
+                return -1;
+            }
+        }
+    }
+    if (dec[0] != '/') {
+        return -1;
+    }
+    size_t doc_root_len = strlen(doc_root);
+    if (n + doc_root_len >= size) {
+        return -1;
+    }
+
+    ht_scratch_auto(tbuf);
+    const char *file_path = htstring_join_cstr_v(&tbuf,
+                            htstring_ctor(doc_root, doc_root_len),
+                            htstring_ctor(dec, n));
+
+    println("file path \"%.*s\"", (int)(n + doc_root_len), file_path);
+
+    memcpy(out, file_path, n + doc_root_len);
+    out[n + doc_root_len] = '\0';
+    return 0;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -336,6 +540,8 @@ main(int argc, char **argv)
      * hc_reactor_run(). */
     hc_reactor_stop_on_signals(r);
     println("Listening on 0.0.0.0:%d", port);
+
+    init_escaped();
 
     hc_reactor_run(r);      /* Java: server.awaitShutdown() */
 
