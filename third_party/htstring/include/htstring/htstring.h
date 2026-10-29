@@ -297,6 +297,43 @@ htstring_to_cstr(ht_scratch_t * buf, const htstring_t s)
     return htstring_join_cstr(buf, &s, 1);
 }
 
+
+/* Splits s at every delim into parts[0], parts[1], ... (views into s; no
+ * copying). Every part is kept, empty ones too: "/a//b" split at '/' is
+ * "", "a", "", "b", and "" is one empty part.
+ *
+ * Returns the number of parts, or -1 when there are more than max (parts
+ * then holds the first max). With parts NULL (and any max) it only
+ * counts, so an array can be sized first:
+ *
+ *   htstring_t seg[32];                                   on the stack
+ *   ptrdiff_t  n = htstring_split(path, '/', seg, 32);
+ *
+ *   ptrdiff_t   n   = htstring_split(path, '/', NULL, 0); or allocated
+ *   htstring_t *seg = malloc(n * sizeof(*seg));
+ *   htstring_split(path, '/', seg, (size_t)n);
+ */
+static inline ptrdiff_t
+htstring_split(const htstring_t s, char delim, htstring_t *parts, size_t max)
+{
+    size_t      n     = 0;
+    const char *start = s.startp;
+    const char *end   = s.startp + s.len;
+
+    for (const char *p = start; ; p++) {
+        if (p == end || *p == delim) {
+            if (parts) {
+                if (n == max) return -1;
+                parts[n] = htstring_ctor(start, (size_t)(p - start));
+            }
+            n++;
+            if (p == end) break;
+            start = p + 1;
+        }
+    }
+    return (ptrdiff_t)n;
+}
+
 /* RFC 3986 percent-decoding: each "%XX" (hex digits, either case) becomes
  * that byte; everything else is copied. "+" is left alone: it means a
  * space only in form data, not in a path.

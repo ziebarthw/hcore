@@ -180,6 +180,65 @@ test_join_cstr(void)
 }
 
 static void
+test_split(void)
+{
+    htstring_t seg[8];
+    ptrdiff_t  n;
+
+    n = htstring_split(HTSTRING_LIT("/a/b.txt"), '/', seg, 8);
+    CHECK(n == 3);
+    CHECK_STR(seg[0], "");
+    CHECK_STR(seg[1], "a");
+    CHECK_STR(seg[2], "b.txt");
+
+    /* empty parts are kept, at either end and in the middle */
+    n = htstring_split(HTSTRING_LIT("/a//b/"), '/', seg, 8);
+    CHECK(n == 5);
+    CHECK_STR(seg[2], "");
+    CHECK_STR(seg[3], "b");
+    CHECK_STR(seg[4], "");
+
+    /* no delimiter: one part, the whole string; "" is one empty part */
+    n = htstring_split(HTSTRING_LIT("abc"), '/', seg, 8);
+    CHECK(n == 1);
+    CHECK_STR(seg[0], "abc");
+    n = htstring_split(HTSTRING_LIT(""), '/', seg, 8);
+    CHECK(n == 1 && seg[0].len == 0);
+    n = htstring_split(HTSTRING_LIT("/"), '/', seg, 8);
+    CHECK(n == 2 && seg[0].len == 0 && seg[1].len == 0);
+
+    /* the parts point into the input */
+    {
+        const char *p = "x,yy,z";
+
+        n = htstring_split(htstring_ctor(p, strlen(p)), ',', seg, 8);
+        CHECK(n == 3 && seg[1].startp == p + 2 && seg[1].len == 2);
+    }
+
+    /* too many: -1, the first max filled in; exactly max: fine */
+    n = htstring_split(HTSTRING_LIT("a/b/c"), '/', seg, 2);
+    CHECK(n == -1);
+    CHECK_STR(seg[0], "a");
+    CHECK_STR(seg[1], "b");
+    CHECK(htstring_split(HTSTRING_LIT("a/b/c"), '/', seg, 3) == 3);
+    CHECK(htstring_split(HTSTRING_LIT("a"), '/', seg, 0) == -1);
+
+    /* counting only */
+    CHECK(htstring_split(HTSTRING_LIT("/a//b/"), '/', NULL, 0) == 5);
+    CHECK(htstring_split(HTSTRING_LIT(""), '/', NULL, 0) == 1);
+
+    /* a path's segments: ".." found as a whole segment only */
+    {
+        int dotdot = 0;
+
+        n = htstring_split(HTSTRING_LIT("/a/..x/../b"), '/', seg, 8);
+        for (ptrdiff_t i = 0; i < n; i++)
+            dotdot += htstring_equals(seg[i], HTSTRING_LIT(".."));
+        CHECK(n == 5 && dotdot == 1);
+    }
+}
+
+static void
 test_pct_decode(void)
 {
     char      out[64];
@@ -246,6 +305,7 @@ main(void)
     test_compare();
     test_to_cstr();
     test_join_cstr();
+    test_split();
     test_pct_decode();
     return check_done("htstring_test");
 }
