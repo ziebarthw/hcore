@@ -64,6 +64,7 @@ if (!parsed_uri_has_error(&u)) {
 - **IPv6:** the host is returned without its brackets, and `URI_IS_IPV6` is set. `parsed_uri_get_host_port` and `parsed_uri_get_authority` add the brackets back.
 - **Building a URI:** `parsed_uri_join` and `parsed_uri_to_cstr` return a newly `malloc`ed string.
 - **Limits:** components are stored as 16-bit offsets, so input longer than 65535 bytes is rejected.
+- **Splitting:** `htstring_split(path, '/', seg, nseg)` fills an array you provide (on the stack or allocated) with views of each part and returns how many, or -1 if there were more than `nseg`. Empty parts are kept. With a NULL array it just counts.
 - **Percent-decoding:** `htstring_pct_decode(path, buf, sizeof(buf))` turns `%XX` back into bytes and returns the length, or -1 for a bad escape or a full buffer. `+` stays `+`, and `%00` is decoded, so check for a NUL before using the result as a file name.
 
 ### Header values
