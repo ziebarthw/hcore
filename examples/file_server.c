@@ -32,6 +32,8 @@
  */
 #include "hc.h"
 #include "hc_support.h"
+#include "htstring/htstring.h"
+#include "htstring/parsed_uri.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -114,9 +116,20 @@ remote_address(hc_basic_request *r, char *buf, size_t size)
 static const char *
 content_type_for(const char *name)
 {
-    (void)name;
-    /* TODO */
-    return "application/octet-stream";
+    htstring_t s = htstring_ctor(name, strlen(name));
+    if (htstring_has_suffixi(s, HTSTRING_LIT(".txt"))) {
+        return "text/plain";
+    }
+    else if (htstring_has_suffixi(s, HTSTRING_LIT(".html")) ||
+                htstring_has_suffixi(s, HTSTRING_LIT(".htm"))) {
+        return "text/html";
+    }
+    else if (htstring_has_suffixi(s, HTSTRING_LIT(".xml"))) {
+        return "text/xml";
+    }
+    else {
+        return "application/octet-stream";
+    }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -136,11 +149,15 @@ content_type_for(const char *name)
 static void
 send_error_page(hc_basic_request *r, int status, const char *msg)
 {
-    (void)status;
-    (void)msg;
-    /* TODO: replace this line */
-    hc_response_send_simple(hc_basic_request_channel(r), 501, "text/plain",
-                            "send_error_page: not written yet\n", 0);
+    ht_scratch_auto(tbuf);
+    const char *body = htstring_join_cstr_v(&tbuf,
+                        HTSTRING_LIT("<html><body><h1>"),
+                        htstring_ctor(msg,
+                        strlen(msg)),
+                        HTSTRING_LIT("</h1></body></html>"));
+    println(msg);
+    hc_response_send_simple(hc_basic_request_channel(r), status, "text/html",
+                            body, 0);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -163,7 +180,9 @@ send_error_page(hc_basic_request *r, int status, const char *msg)
 static int
 resolve_path(const char *target, char *out, size_t size)
 {
-    (void)target;
+    struct parsed_uri u = parse_uri_view(htstring_ctor(target, strlen(target)), false);
+    htstring_t path = parsed_uri_get_path(target, &u);
+    println("%s - target \"%s\", path \"%.*s\"", __func__, target, (int)path.len, path.startp);
     (void)out;
     (void)size;
     /* TODO */
@@ -211,14 +230,19 @@ static void
 file_request(void *arg, hc_basic_request *r)
 {
     (void)arg;
-    /* Not used yet (keeps the compiler quiet): delete once they are. */
-    (void)resolve_path;
-    (void)send_error_page;
-    (void)content_type_for;
-    (void)remote_address;
-    /* TODO: replace this line */
-    hc_response_send_simple(hc_basic_request_channel(r), 501, "text/plain",
-                            "file_request: not written yet\n", 0);
+    char out[2048];
+    if (resolve_path(hc_basic_request_target(r), out, sizeof(out)) != 0) {
+        hc_response_send_simple(hc_basic_request_channel(r), 400, "text/plain", "resolve path failed", 1);
+    }
+    else {
+        /* Not used yet (keeps the compiler quiet): delete once they are. */
+        (void)send_error_page;
+        (void)content_type_for;
+        (void)remote_address;
+        /* TODO: replace this line */
+        hc_response_send_simple(hc_basic_request_channel(r), 501, "text/plain",
+                                "file_request: not written yet\n", 0);
+    }
 }
 
 /* ------------------------------------------------------------------------ */
