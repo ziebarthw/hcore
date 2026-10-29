@@ -3,6 +3,7 @@
 #define HTSTRING_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -294,6 +295,51 @@ static inline const char *
 htstring_to_cstr(ht_scratch_t * buf, const htstring_t s)
 {
     return htstring_join_cstr(buf, &s, 1);
+}
+
+/* RFC 3986 percent-decoding: each "%XX" (hex digits, either case) becomes
+ * that byte; everything else is copied. "+" is left alone: it means a
+ * space only in form data, not in a path.
+ *
+ * Writes at most dst_size bytes to dst, without a terminating NUL, and
+ * returns the decoded length; -1 for a bad escape ("%", "%4", "%zz") or a
+ * dst too small. dst may be src.startp itself (decoding in place: the
+ * output is never longer than the input).
+ *
+ * "%00" decodes to a NUL byte like any other: a caller that will use the
+ * result as a C string (a file name, say) should refuse it, e.g.
+ * memchr(dst, '\0', n) != NULL. */
+static inline int
+htstring_hexval_(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static inline ptrdiff_t
+htstring_pct_decode(const htstring_t src, char *dst, size_t dst_size)
+{
+    size_t n = 0;
+
+    for (size_t i = 0; i < src.len; i++) {
+        char c = src.startp[i];
+
+        if (c == '%') {
+            int hi, lo;
+
+            if (src.len - i < 3) return -1;
+            hi = htstring_hexval_(src.startp[i + 1]);
+            lo = htstring_hexval_(src.startp[i + 2]);
+            if (hi < 0 || lo < 0) return -1;
+            c  = (char)(hi << 4 | lo);
+            i += 2;
+        }
+        if (n == dst_size) return -1;
+        dst[n++] = c;
+    }
+    return (ptrdiff_t)n;
 }
 
 #endif
