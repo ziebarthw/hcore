@@ -3,11 +3,12 @@
 A C99 port of the *shape* of Apache HttpCore 5's async API: exchange
 handlers, a route-based connection pool, a requester, request producers and
 response consumers, URI-pattern routing, interim (1xx) responses and TLS.
-It comes with ports of three HttpCore examples:
+It comes with ports of four HttpCore examples:
 [`AsyncReverseProxyExample`](https://github.com/apache/httpcomponents-core/blob/rel/v5.1/httpcore5/src/test/java/org/apache/hc/core5/http/examples/AsyncReverseProxyExample.java),
-[`AsyncFullDuplexClientExample`](https://github.com/apache/httpcomponents-core/blob/rel/v5.1/httpcore5/src/test/java/org/apache/hc/core5/http/examples/AsyncFullDuplexClientExample.java)
+[`AsyncFullDuplexClientExample`](https://github.com/apache/httpcomponents-core/blob/rel/v5.1/httpcore5/src/test/java/org/apache/hc/core5/http/examples/AsyncFullDuplexClientExample.java),
+[`AsyncFullDuplexServerExample`](https://github.com/apache/httpcomponents-core/blob/rel/v5.1/httpcore5/src/test/java/org/apache/hc/core5/http/examples/AsyncFullDuplexServerExample.java)
 and
-[`AsyncFullDuplexServerExample`](https://github.com/apache/httpcomponents-core/blob/rel/v5.1/httpcore5/src/test/java/org/apache/hc/core5/http/examples/AsyncFullDuplexServerExample.java).
+[`AsyncFileServerExample`](https://github.com/apache/httpcomponents-core/blob/rel/v5.1/httpcore5/src/test/java/org/apache/hc/core5/http/examples/AsyncFileServerExample.java).
 
 ```
 include/hc.h            the "interfaces" an app implements, channels it calls, hc_host (no libevhtp types)
@@ -23,7 +24,7 @@ examples/reverse_proxy.c       port of AsyncReverseProxyExample (pooled, http/ht
 examples/full_duplex_client.c  port of AsyncFullDuplexClientExample (producers/consumers, http/https)
 examples/full_duplex_server.c  port of AsyncFullDuplexServerExample (routing, stream listener, http/https)
 examples/echo_server.c         minimal server handler: streams the request body back (http/https)
-examples/file_server.c         AsyncFileServerExample as a scaffold to finish (TODOs; builds and runs as is)
+examples/file_server.c         port of AsyncFileServerExample (whole requests, a file streamed with Content-Length)
 tests/pool_test.c       pool + hc_host unit tests with fake connections
 tests/support_test.c    in-process integration tests: support API, TLS, 1xx, routing (HTTP + HTTPS servers)
 tests/embed_test.c      hcore in the application's event loop: reuse_port, pause/resume accept, graceful drain
