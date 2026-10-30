@@ -1,23 +1,17 @@
 /*
- * file_server.c - a port of HttpCore 5's AsyncFileServerExample, as a
- * scaffold to finish.
+ * file_server.c - port of HttpCore 5's AsyncFileServerExample: serves the
+ * files under a document root over HTTP/1.1.
  *
  *   Java: httpcore5/src/test/java/org/apache/hc/core5/http/examples/
  *         AsyncFileServerExample.java (rel/v5.1)
  *
- * The plumbing is done: arguments, the server and its timeouts, listening,
- * Ctrl-C, the logging. It builds and runs as it is; every request gets
- * "501 Not Implemented" until the TODOs are filled in. Each TODO says which
- * part of the Java example it is and which hcore calls do the job.
- *
- * Suggested order (each step can be tried with curl before the next):
- *   1. content_type_for()          warm-up, plain C
- *   2. send_error_page()           the first response
- *   3. resolve_path()              target -> file name, safely
- *   4. file_request()              404 / 403 / start a 200
- *   5. struct file_xfer,
- *      file_produce(),
- *      file_release()              stream the file without loading it
+ * Shows hc_basic_server_factory (whole requests, as BasicRequestConsumer),
+ * a response with a known Content-Length streamed from a file through
+ * ->produce() as the client takes it (Java's AsyncEntityProducers.create(
+ * file)), per-request state cleaned up in ->release() whatever happens, and
+ * the error pages. Unlike the Java example, the path is checked: "%XX" is
+ * decoded and any ".." segment refused, so nothing outside the document
+ * root is served.
  *
  * Usage: file_server DOC_ROOT [port]           (port 8080 by default)
  *
@@ -53,7 +47,7 @@
 static const char *doc_root;    /* Java: docRoot */
 
 /* ------------------------------------------------------------------------ */
-/* Done: helpers                                                            */
+/* Helpers                                                                  */
 /* ------------------------------------------------------------------------ */
 
 /* Java: println(): the date (HttpDateGenerator's format), then the message. */
@@ -105,7 +99,7 @@ remote_address(hc_basic_request *r, char *buf, size_t size)
 }
 
 /* ------------------------------------------------------------------------ */
-/* TODO 1: the content type                                                 */
+/* The content type                                                         */
 /* ------------------------------------------------------------------------ */
 
 /* Java: the if/else on filename.endsWith(...):
@@ -129,7 +123,7 @@ content_type_for(const char *name)
 }
 
 /* ------------------------------------------------------------------------ */
-/* TODO 2: an error page                                                    */
+/* Error pages                                                              */
 /* ------------------------------------------------------------------------ */
 
 static const htstring_t escaped[256] = {
@@ -217,7 +211,7 @@ send_error_page(hc_basic_request *r, int status, const char *msg)
 }
 
 /* ------------------------------------------------------------------------ */
-/* TODO 3: from request-target to file name                                 */
+/* From request-target to file name                                         */
 /* ------------------------------------------------------------------------ */
 
 /* Java: requestUri.getPath(), then new File(docRoot, path).
@@ -266,7 +260,7 @@ resolve_path(const char *target, char *out, size_t size)
 }
 
 /* ------------------------------------------------------------------------ */
-/* TODO 5 (state): one file being sent                                      */
+/* One file being sent                                                      */
 /* ------------------------------------------------------------------------ */
 
 /* Java hides this in AsyncEntityProducers.create(file, contentType). In C
@@ -276,11 +270,10 @@ resolve_path(const char *target, char *out, size_t size)
  * called once per request whatever happened: sent, client gone, timeout. */
 typedef struct file_xfer {
     int fd;
-    /* TODO: anything else you need */
 } file_xfer;
 
 /* ------------------------------------------------------------------------ */
-/* TODO 4: the request                                                      */
+/* The request                                                              */
 /* ------------------------------------------------------------------------ */
 
 /* Java: handle(): the whole request has arrived (the server's basic factory
@@ -354,7 +347,7 @@ file_request(void *arg, hc_basic_request *r)
 }
 
 /* ------------------------------------------------------------------------ */
-/* TODO 5: sending the file                                                 */
+/* Sending the file                                                         */
 /* ------------------------------------------------------------------------ */
 
 /* Java: what the FileEntityProducer does: called whenever the connection
@@ -422,7 +415,7 @@ file_release(void *arg, hc_basic_request *r)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Done: main                                                               */
+/* main                                                                     */
 /* ------------------------------------------------------------------------ */
 
 int
