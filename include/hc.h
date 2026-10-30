@@ -184,9 +184,10 @@ size_t hc_host_to_string(const hc_host *h, char *buf, size_t len);
 
 /* Outgoing body stream (response body on the server side, request body on
  * the client side). Writes are always accepted and queued; use
- * hc_data_capacity() to avoid queueing without bound. When the channel has
- * room again after being full, or after hc_data_request_output(), the owning
- * handler's ->produce() is called. */
+ * hc_data_capacity() to avoid queueing without bound. The owning handler's
+ * ->produce() is called once the channel is opened (hc_response_send() /
+ * hc_request_send() with an entity), when it has room again after being
+ * full, and after hc_data_request_output(). */
 typedef struct hc_data_channel hc_data_channel;
 
 long   hc_data_write(hc_data_channel *ch, const void *data, size_t len);
