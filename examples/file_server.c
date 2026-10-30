@@ -30,7 +30,6 @@
  *   curl --limit-rate 100k --max-time 1 localhost:8080/big.bin -o /dev/null
  *                                         client gives up: ->failed, ->release
  */
-#define _GNU_SOURCE
 #include "hc.h"
 #include "hc_support.h"
 #include "htstring/htstring.h"
@@ -152,12 +151,16 @@ calc_escaped_len(const char *msg)
     return len;
 }
 
+/* NULL when out of memory. */
 static inline char*
 escape_message(const char *msg)
 {
     size_t len = calc_escaped_len(msg);
     char  *out = (char*)malloc(len + 1); // Could be htstring_t rather than c string.
     char  *dst = out;
+
+    if (out == NULL)
+        return NULL;
 
     for (const char *curp = msg; curp[0]; ++curp) {
         htstring_t e = escaped[(unsigned char)curp[0]];
@@ -182,18 +185,34 @@ escape_message(const char *msg)
  *                           "text/html", body, 0);
  * (the last argument: 1 to close the connection afterwards). Build the body
  * with snprintf() into a local buffer; hcore copies it. */
+/* Out of memory, or anything else that leaves no proper answer: a fixed
+ * text, so sending it allocates nothing of ours. */
+static void
+send_internal_error(hc_basic_request *r, const char *what)
+{
+    println("internal error: %s", what);
+    hc_response_send_simple(hc_basic_request_channel(r), 500, "text/plain",
+                            "Internal Server Error\n", 0);
+}
+
 static void
 send_error_page(hc_basic_request *r, int status, const char *msg)
 {
     ht_scratch_auto(tbuf);
     char       *escaped_msg = escape_message(msg);
-    const char *body = htstring_join_cstr_v(&tbuf,
+    const char *body = NULL;
+
+    if (escaped_msg)
+        body = htstring_join_cstr_v(&tbuf,
                         HTSTRING_LIT("<html><body><h1>"),
                         htstring_ctor(escaped_msg, strlen(escaped_msg)),
                         HTSTRING_LIT("</h1></body></html>"));
     println("%s", msg);
-    hc_response_send_simple(hc_basic_request_channel(r), status, "text/html",
-                            body, 0);
+    if (body)
+        hc_response_send_simple(hc_basic_request_channel(r), status, "text/html",
+                                body, 0);
+    else
+        send_internal_error(r, "out of memory (error page)");
     free(escaped_msg);
 }
 
@@ -279,8 +298,8 @@ typedef struct file_xfer {
  *          hc_headers_free after sending - hcore copies them);
  *        - the entity: hc_entity { st.st_size, content type } - a known
  *          length, so the reply has Content-Length rather than chunks;
- *        - ch = hc_response_send(hc_basic_request_channel(r), &head, &entity);
- *        - hc_data_request_output(ch): ->produce() then sends the bytes.
+ *        - hc_response_send(hc_basic_request_channel(r), &head, &entity):
+ *          hcore then calls ->produce(), which sends the bytes.
  *      Don't read the file here: file_produce() does, as the client takes it.
  */
 static void
@@ -296,15 +315,27 @@ file_request(void *arg, hc_basic_request *r)
     } else if (stat(path, &sbuf) != 0) {
         snprintf(msg, sizeof(msg), "File %s not found", path);
         send_error_page(r, 404, msg);
-    } else if (!(sbuf.st_mode & S_IFREG) || (fd = open(path, O_RDONLY)) == -1) {
+    } else if (!S_ISREG(sbuf.st_mode) || (fd = open(path, O_RDONLY)) == -1) {
         snprintf(msg, sizeof(msg), "Cannot read file %s", path);
         send_error_page(r, 403, msg);
     } else {
         const char *content_type = content_type_for(path);
         file_xfer  *xfer = calloc(1, sizeof(*xfer));
-
         hc_headers *headers = hc_headers_new();
-        hc_headers_add(headers, "Content-type", content_type);
+
+        if (xfer == NULL || headers == NULL ||
+            hc_headers_add(headers, "Content-type", content_type) != 0) {
+            hc_headers_free(headers);
+            free(xfer);
+            close(fd);
+            send_internal_error(r, "out of memory (200 response)");
+            return;
+        }
+
+        /* Attached before sending: from here on file_release() owns the
+         * fd and xfer, whatever happens next. */
+        xfer->fd = fd;
+        hc_basic_request_set_data(r, xfer);
 
         hc_response_head head = {
             .headers = headers,
@@ -315,11 +346,9 @@ file_request(void *arg, hc_basic_request *r)
             .content_length = sbuf.st_size,
             .content_type = content_type
         };
-        hc_response_send(hc_basic_request_channel(r), &head, &entity);
-
         println("%s | serving file %s", remote_address(r, msg, sizeof(msg)), path);
-        xfer->fd = fd;
-        hc_basic_request_set_data(r, xfer);
+        if (hc_response_send(hc_basic_request_channel(r), &head, &entity) == NULL)
+            println("cannot send the response for %s", path);  /* ->failed and ->release follow */
         hc_headers_free(headers);
     }
 }
@@ -344,9 +373,21 @@ file_produce(void *arg, hc_basic_request *r, hc_data_channel *ch)
 {
     (void)arg;
     file_xfer *xfer = hc_basic_request_data(r);
+    if (xfer == NULL)
+        return;
     while (hc_data_capacity(ch) > 0) {
         char buf[16 * 1024];
         ssize_t n = read(xfer->fd, buf, sizeof(buf));
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0) {
+            /* Content-Length is already promised: there is no way to
+             * answer differently now. Abort the exchange; the client sees
+             * the connection (or HTTP/2 stream) close short of the length. */
+            println("read failed: %s", strerror(errno));
+            hc_server_abort(hc_basic_request_exchange(r));
+            return;
+        }
         if (n == 0) {
             hc_data_end(ch, NULL);
             return;
