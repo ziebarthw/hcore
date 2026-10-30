@@ -118,101 +118,25 @@ static const char *
 content_type_for(const char *name)
 {
     htstring_t s = htstring_ctor(name, strlen(name));
-    if (htstring_has_suffixi(s, HTSTRING_LIT(".txt"))) {
+    if (htstring_has_suffixi(s, HTSTRING_LIT(".txt")))
         return "text/plain";
-    }
     else if (htstring_has_suffixi(s, HTSTRING_LIT(".html")) ||
                 htstring_has_suffixi(s, HTSTRING_LIT(".htm"))) {
         return "text/html";
-    }
-    else if (htstring_has_suffixi(s, HTSTRING_LIT(".xml"))) {
+    } else if (htstring_has_suffixi(s, HTSTRING_LIT(".xml")))
         return "text/xml";
-    }
-    else {
+    else
         return "application/octet-stream";
-    }
 }
 
 /* ------------------------------------------------------------------------ */
 /* TODO 2: an error page                                                    */
 /* ------------------------------------------------------------------------ */
 
-#define TOO_CUTE_BY_HALF
-#ifdef TOO_CUTE_BY_HALF
-#define DYNAMIC_ESCAPED
-#ifdef DYNAMIC_ESCAPED
-static htstring_t escaped[256];
-static void
-init_escaped(void)
-{
-    for (size_t c = 0; c < sizeof(escaped)/sizeof(escaped[0]); ++c) {
-        switch (c) {
-            case '<':
-                escaped[c].startp = "&lt;";
-                escaped[c].len    = 4;
-                break;
-            case '>':
-                escaped[c].startp = "&gt;";
-                escaped[c].len    = 4;
-                break;
-            case '&':
-                escaped[c].startp = "&amp;";
-                escaped[c].len    = 5;
-                break;
-            case '"':
-                escaped[c].startp = "&quot;";
-                escaped[c].len    = 6;
-                break;
-            default:
-                escaped[c].startp = "";
-                escaped[c].len    = 0; // Could be 1 to avoid if (n > 0)...
-                break;
-        }
-    }
-}
-#else
-static htstring_t escaped[256] = {
-    {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0},
-    {"&quot;", 6},
-    {"", 0},
-    {"", 0},
-    {"", 0},
-    {"&amp;", 5},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0},
-    {"&lt;", 4},
-    {"", 0},
-    {"&gt;", 4},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0}, {"", 0},
-    {"", 0}
-};
-static void
-init_escaped(void)
-{
-}
-#endif///DYNAMIC_ESCAPED
+static const htstring_t escaped[256] = {
+    ['<'] = { "&lt;", 4 },  ['>'] = { "&gt;", 4 },
+    ['&'] = { "&amp;", 5 }, ['"'] = { "&quot;", 6 },
+};                          /* every other entry is zero: { NULL, 0 } */
 
 static inline size_t
 calc_escaped_len(const char *msg)
@@ -220,11 +144,10 @@ calc_escaped_len(const char *msg)
     size_t len = 0;
     for (const char *curp = msg; curp[0]; ++curp) {
         size_t n = escaped[(unsigned char)curp[0]].len;
-        if (n > 0) {
+        if (n > 0)
             len += n;
-        } else {
+        else
             ++len;
-        }
     }
     return len;
 }
@@ -248,65 +171,6 @@ escape_message(const char *msg)
     *dst = '\0';
     return out;
 }
-#else
-static inline size_t
-calc_escaped_len(const char *msg)
-{
-    size_t len = 0;
-    for (const char *curp = msg; curp[0]; ++curp) {
-        switch ((unsigned char)curp[0]) {
-            case '<':
-            case '>':
-                len += 4;
-                break;
-            case '&':
-                len += 5;
-                break;
-            case '"':
-                len += 6;
-                break;
-            default:
-                ++len;
-                break;
-        }
-    }
-    return len;
-}
-
-static inline char*
-escape_message(const char *msg)
-{
-    size_t len = calc_escaped_len(msg);
-    char  *out = (char*)malloc(len + 1); // Could be htstring_t rather than c string.
-    char  *dst = out;
-
-    for (const char *curp = msg; curp[0]; ++curp) {
-        switch ((unsigned char)curp[0]) {
-            case '<':
-                memcpy(dst, "&lt;", 4);
-                dst += 4;
-                break;
-            case '>':
-                memcpy(dst, "&gt;", 4);
-                dst += 4;
-                break;
-            case '&':
-                memcpy(dst, "&amp;", 5);
-                dst += 5;
-                break;
-            case '"':
-                memcpy(dst, "&quot;", 6);
-                dst += 6;
-                break;
-            default:
-                *dst++ = curp[0];
-                break;
-        }
-    }
-    *dst = '\0';
-    return out;
-}
-#endif//TOO_CUTE_BY_HALF
 
 /* Java: println(msg) and
  *   responseTrigger.submitResponse(AsyncResponseBuilder.create(status)
@@ -358,35 +222,24 @@ resolve_path(const char *target, char *out, size_t size)
 
     char              dec[2048];
     ptrdiff_t         n = htstring_pct_decode(path, dec, sizeof(dec));
+    if (n < 0) return -1;
+    if (n == 0) return -1;
+    if (dec[0] != '/') return -1;
+    if (memchr(dec, 0, n)) return -1;
 
-    if (n < 0) {
-        return -1;
-    }
-    if (memchr(dec, 0, n)) {
-        return -1;
-    }
-    const char *curp = (const char*)memrchr(dec, '/', n);
-    if (curp) {
-        for (const char *p = dec; curp - p > 1; ++p) {
-            if (memcmp(p, "..", 2)) {
-                return -1;
-            }
-        }
-    }
-    if (dec[0] != '/') {
-        return -1;
+    htstring_t        seg[64];
+    ptrdiff_t         ns = htstring_split(htstring_ctor(dec, (size_t)n), '/', seg, 64);
+    if (ns < 0) return -1;
+    for (ptrdiff_t i = 0; i < ns; i++) {
+        if (htstring_equals(seg[i], HTSTRING_LIT(".."))) return -1;
     }
     size_t doc_root_len = strlen(doc_root);
-    if (n + doc_root_len >= size) {
-        return -1;
-    }
+    if (n + doc_root_len >= size) return -1;
 
     ht_scratch_auto(tbuf);
     const char *file_path = htstring_join_cstr_v(&tbuf,
                             htstring_ctor(doc_root, doc_root_len),
                             htstring_ctor(dec, n));
-
-    println("file path \"%.*s\"", (int)(n + doc_root_len), file_path);
 
     memcpy(out, file_path, n + doc_root_len);
     out[n + doc_root_len] = '\0';
@@ -434,18 +287,40 @@ static void
 file_request(void *arg, hc_basic_request *r)
 {
     (void)arg;
-    char out[2048];
-    if (resolve_path(hc_basic_request_target(r), out, sizeof(out)) != 0) {
+    struct stat sbuf;
+    char msg[4096];
+    char path[2048];
+    int fd;
+    if (resolve_path(hc_basic_request_target(r), path, sizeof(path)) != 0) {
         hc_response_send_simple(hc_basic_request_channel(r), 400, "text/plain", "resolve path failed", 1);
-    }
-    else {
-        /* Not used yet (keeps the compiler quiet): delete once they are. */
-        (void)send_error_page;
-        (void)content_type_for;
-        (void)remote_address;
-        /* TODO: replace this line */
-        hc_response_send_simple(hc_basic_request_channel(r), 501, "text/plain",
-                                "file_request: not written yet\n", 0);
+    } else if (stat(path, &sbuf) != 0) {
+        snprintf(msg, sizeof(msg), "File %s not found", path);
+        send_error_page(r, 404, msg);
+    } else if (!(sbuf.st_mode & S_IFREG) || (fd = open(path, O_RDONLY)) == -1) {
+        snprintf(msg, sizeof(msg), "Cannot read file %s", path);
+        send_error_page(r, 403, msg);
+    } else {
+        const char *content_type = content_type_for(path);
+        file_xfer  *xfer = calloc(1, sizeof(*xfer));
+
+        hc_headers *headers = hc_headers_new();
+        hc_headers_add(headers, "Content-type", content_type);
+
+        hc_response_head head = {
+            .headers = headers,
+            .status = 200,
+            .version = 11
+        };
+        hc_entity entity = {
+            .content_length = sbuf.st_size,
+            .content_type = content_type
+        };
+        hc_response_send(hc_basic_request_channel(r), &head, &entity);
+
+        println("%s | serving file %s", remote_address(r, msg, sizeof(msg)), path);
+        xfer->fd = fd;
+        hc_basic_request_set_data(r, xfer);
+        hc_headers_free(headers);
     }
 }
 
@@ -468,9 +343,18 @@ static void
 file_produce(void *arg, hc_basic_request *r, hc_data_channel *ch)
 {
     (void)arg;
-    (void)r;
-    (void)ch;
-    /* TODO */
+    file_xfer *xfer = hc_basic_request_data(r);
+    while (hc_data_capacity(ch) > 0) {
+        char buf[16 * 1024];
+        ssize_t n = read(xfer->fd, buf, sizeof(buf));
+        if (n == 0) {
+            hc_data_end(ch, NULL);
+            return;
+        }
+        if (hc_data_write(ch, buf, n) < 0) {
+            return;
+        }
+    }
 }
 
 /* Java: the exchange's failed(): the client went away mid-file, a
@@ -489,8 +373,11 @@ static void
 file_release(void *arg, hc_basic_request *r)
 {
     (void)arg;
-    (void)r;
-    /* TODO */
+    file_xfer *xfer = hc_basic_request_data(r);
+    if (xfer) {
+        close(xfer->fd);
+        free(xfer);
+    }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -540,8 +427,6 @@ main(int argc, char **argv)
      * hc_reactor_run(). */
     hc_reactor_stop_on_signals(r);
     println("Listening on 0.0.0.0:%d", port);
-
-    init_escaped();
 
     hc_reactor_run(r);      /* Java: server.awaitShutdown() */
 
