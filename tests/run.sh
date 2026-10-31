@@ -9,7 +9,10 @@ pass=0; fail=0
 check() { if [ "$2" == "$3" ]; then echo "PASS $1"; pass=$((pass+1)); else echo "FAIL $1: got [$2] want [$3]"; fail=$((fail+1)); fi; }
 
 pkill -x reverse_proxy; pkill -x echo_server; pkill -f "[f]ull_duplex_server 92"; sleep 0.3
-pgrep -f "^python3 .*origin.py 9000" >/dev/null || { python3 $HERE/origin.py 9000 </dev/null >/dev/null 2>&1 & sleep 0.5; }
+# Always a fresh origin: one left running from an earlier run may be an older
+# origin.py that lacks routes the checks below rely on.
+pkill -f "^python3 .*origin.py 9000"; sleep 0.3
+python3 $HERE/origin.py 9000 </dev/null >/dev/null 2>&1 &
 $B/echo_server 9001 </dev/null >/dev/null 2>$S/echo.err &
 $B/echo_server --tls $HERE/tls/localhost.pem $HERE/tls/localhost.key 9443 </dev/null >/dev/null 2>$S/echo_tls.err &
 $B/echo_server --tls $HERE/tls/other.pem $HERE/tls/other.key 9444 </dev/null >/dev/null 2>>$S/echo_tls.err &
