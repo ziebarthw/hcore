@@ -106,6 +106,13 @@ check "tls: ... over a single TLS connection to the origin" "$(conns_to 8086 944
 FD="$WRAP $B/full_duplex_client"
 out=$($FD http://127.0.0.1:9000/post 2>&1); rc=$?
 check "client: Java mode POSTs \"stuff\"" "$rc $(echo "$out" | grep -c '^5 35bafb1ce99aef3ab068afbaabae8f21fd9b9f02d3a9442e364fa92c0b3eeef0')" "0 1"
+check "client: stream listener logs request, response, keep-alive completion" "$(echo "$out" | grep -c '^127.0.0.1:9000 POST /post HTTP/1.1$') $(echo "$out" | grep -c '^127.0.0.1:9000 HTTP/1.1 200$') $(echo "$out" | grep -c '^127.0.0.1:9000 exchange completed (connection kept alive)$')" "1 1 1"
+out=$($FD --expect http://127.0.0.1:9000/early 2>&1)
+check "client: stream listener sees interim heads before the final one" "$(echo "$out" | grep -E '^127.0.0.1:9000 HTTP/1.1 [0-9]+$' | awk '{print $3}' | tr '\n' ' ')" "100 103 200 "
+out=$($FD http://127.0.0.1:9000/close 2>&1)
+check "client: read-until-close response -> exchange completed (connection closed)" "$(echo "$out" | grep -c 'exchange completed (connection closed)')" "1"
+out=$($FD http://127.0.0.1:9000/die 2>&1)
+check "client: response cut off -> no exchange completed line" "$(echo "$out" | grep -c 'HTTP/1.1 200$') $(echo "$out" | grep -c 'exchange completed')" "1 0"
 out=$($FD --duplex 8 http://127.0.0.1:9001/echo 2>&1); rc=$?
 check "client: 8MB full duplex direct to echo_server" "$rc $(echo "$out" | grep -c 'echo verified') $(echo "$out" | grep -c 'full duplex: both')" "0 1 1"
 out=$($FD -n 3 --duplex 32 http://127.0.0.1:8082/echo 2>&1); rc=$?

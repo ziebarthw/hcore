@@ -101,6 +101,7 @@ Java's `Supplier<AsyncServerExchangeHandler>`: one handler per exchange.
 | `ResponseChannel.sendInformation`             | `hc_response_send_information()`           |
 | `AsyncServerBootstrap.register(uriPattern, supplier)` | `hc_server_register()`             |
 | `Http1StreamListener` (server)                | `hc_server_listener` / `hc_server_set_listener()` |
+| `Http1StreamListener` (requester)             | `hc_requester_listener` / `hc_requester_set_listener()` |
 | `EndpointDetails.getRemoteAddress/getLocalAddress` | `hc_server_exchange_remote_address()` / `_local_address()` |
 | `HttpHost`                                    | `hc_host` (scheme, name, port)             |
 | `consume` / `streamEnd` / `produce`           | `consume` / `stream_end` / `produce`       |
@@ -122,7 +123,9 @@ Java's `Supplier<AsyncServerExchangeHandler>`: one handler per exchange.
 
 - Every callback is dispatched from the event loop, never from inside an `hc_*`
   call. So any `hc_*` function may be called from any callback, including ones
-  that tear things down: `hc_client_cancel`, `hc_server_abort`.
+  that tear things down: `hc_client_cancel`, `hc_server_abort`. The stream
+  listeners are the exception: they only observe, and report a head as it is
+  sent, from inside `hc_response_send()` / `hc_request_send()`.
 - `release()` is the last call a handler receives, exactly once. Channels and
   the exchange pointer are invalid after it, so null your copies there.
 - Head structs and entity strings passed to callbacks are valid only during
@@ -428,6 +431,17 @@ without `produce_request()`. A handler that needs its exchange, for
 `hc_client_suspend_input` or `hc_client_cancel`, gets it from
 `hc_request_channel_exchange(rc)` in `produce_request()`.
 
+`hc_requester_set_listener()` is the requester's `Http1StreamListener`
+(`AsyncRequesterBootstrap.setStreamListener()`), the client side of
+`hc_server_set_listener()`, with the same three callbacks. Each gets the
+origin's `address:port`. It sees messages as they cross the wire: the
+request head as sent, after the request interceptors, and every response
+head as received, before the response interceptors, interim `1xx` ones
+included. `on_exchange_complete` fires for exchanges that finished normally,
+with whether the connection goes back to the pool (`1`) or was closed (`0`).
+It covers every exchange on the requester's connections; the unpooled
+`hc_client_execute()` has no requester and isn't reported.
+
 `examples/full_duplex_client.c` ports `AsyncFullDuplexClientExample`:
 
 ```
@@ -445,17 +459,24 @@ consumer into the same basic handler.
 The Java example sends only `"stuff"`, too little to show full duplex. With
 `--duplex`, the client streams generated data as a chunked body, verifies
 every echoed byte, and reports how much of the upload had been sent when the
-first response byte arrived:
+first response byte arrived. The stream listener prints what Java's prints
+(the request line, the status line, the completion); the pool listener's
+lease and release lines are an addition that shows connection reuse:
 
 ```
->> POST http://127.0.0.1:8081/echo
 http://127.0.0.1:8081 opening new connection [leased: 1][available: 0]
+127.0.0.1:8081 POST /echo HTTP/1.1
+127.0.0.1:8081 HTTP/1.1 200
 http://127.0.0.1:8081/echo->200
   sent 8388608 bytes, received 8388608 bytes, echo verified
   first response byte after 1 ms, with 130903 of 8388608 request bytes sent (1.6%)
   upload finished after 54 ms, response after 83 ms -> full duplex: both directions streamed at the same time
+127.0.0.1:8081 exchange completed (connection kept alive)
 http://127.0.0.1:8081 connection kept alive [leased: 0][available: 1]
 ```
+
+With `--expect`, the listener shows the `HTTP/1.1 100` (and any `103`) ahead
+of the final status line.
 
 Against a server that reads the whole request before answering, it reports
 half duplex instead.
@@ -809,7 +830,7 @@ They found one real bug: an expired slot that got a new connection kept its
 old expiry, so the new connection was dropped on its first release. Java's
 `assignConnection` resets the timestamps, and now so does this.
 
-**Integration tests** (`tests/support_test`, 68 checks) run HTTP, HTTPS and
+**Integration tests** (`tests/support_test`, 80 checks) run HTTP, HTTPS and
 routing servers and a requester in one process. They cover:
 - a string producer and a 3 MB bytes producer round trip;
 - a GET without a body;
@@ -827,6 +848,10 @@ routing servers and a requester in one process. They cover:
   unmatched paths get 404;
 - the server listener: one request head, response head and keep-alive
   completion per request, with the client's address.
+- the requester listener, case by case: request head before response heads,
+  interim `100`/`103` heads, a completion only for exchanges that finished
+  (none for the over-limit consumer or a failed connect), and the origin's
+  address.
 - the exchange's addresses: the client's matches what the listener reports,
   the local one is the server's, and a short buffer is handled like
   `getpeername()`.

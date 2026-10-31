@@ -22,6 +22,7 @@
  *   ResponseChannel.sendInformation()    hc_response_send_information()
  *   AsyncServerBootstrap.register()      hc_server_register()
  *   Http1StreamListener (server)         hc_server_listener
+ *   Http1StreamListener (requester)      hc_requester_listener
  *   HttpHost                             hc_host
  *   HttpAsyncRequester (pooled)          hc_requester_* (pool: hc_pool.h)
  *   RequestChannel.sendRequest()         hc_request_send()
@@ -599,6 +600,38 @@ hc_requester *hc_requester_new(hc_reactor *r, const hc_requester_config *cfg);
 void          hc_requester_free(hc_requester *rq);
 /* The underlying pool: limits, statistics, listener, close_idle. */
 hc_pool      *hc_requester_pool(hc_requester *rq);
+
+/*
+ * Java: Http1StreamListener on the requester (AsyncRequesterBootstrap
+ * .setStreamListener()), the client side of hc_server_listener. remote is
+ * the origin's "address:port" (IPv6 as "[address]:port"). Every callback is
+ * optional. It sees the messages as they go over the wire:
+ *   on_request_head       a request head as it is sent, after the request
+ *                         interceptors; its headers are the application's
+ *                         and the interceptors' (the engine adds Host,
+ *                         Content-Length or Transfer-Encoding after them).
+ *   on_response_head      every response head as it arrives, before the
+ *                         response interceptors: the final one, and before
+ *                         it any interim (1xx) ones, e.g. "100 Continue".
+ *   on_exchange_complete  an exchange that finished normally, and whether
+ *                         its connection can carry another (keep_alive 1:
+ *                         back to the pool; 0: closed). Not called for one
+ *                         that failed or was cancelled.
+ * Covers every exchange on the requester's connections: hc_endpoint_execute(),
+ * hc_requester_execute() and hc_support.h's hc_requester_execute_request(),
+ * not the unpooled hc_client_execute(). The listener only observes: it may
+ * be called from inside hc_request_send(), so it must not start, cancel or
+ * otherwise drive exchanges itself. The struct is copied; NULL removes it.
+ * Exchanges already under way use the new listener from their next event.
+ */
+typedef struct hc_requester_listener {
+    void (*on_request_head)(void *arg, const char *remote, const hc_request_head *head);
+    void (*on_response_head)(void *arg, const char *remote, const hc_response_head *head);
+    void (*on_exchange_complete)(void *arg, const char *remote, int keep_alive);
+    void  *arg;
+} hc_requester_listener;
+
+void          hc_requester_set_listener(hc_requester *rq, const hc_requester_listener *l);
 
 /* Lease a connection to target, reusing an idle one when possible.
  * timeout_ms bounds the wait for a pool slot plus name resolution, TCP

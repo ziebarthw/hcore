@@ -32,7 +32,10 @@
  *   anonymous AsyncClientExchangeHandler           hc_basic_client_handler (inside
  *     consumeInformation / consumeResponse ...       hc_requester_execute_request)
  *   requester.execute(handler, timeout, ctx)       hc_requester_execute_request()
- *   Http1StreamListener                            log lines + pool listener
+ *   .setStreamListener(Http1StreamListener)        hc_requester_set_listener()
+ *     onRequestHead / onResponseHead /               on_request_head / on_response_head /
+ *     onExchangeComplete                             on_exchange_complete
+ *   (no Java counterpart)                          pool listener: lease / release lines
  *   CountDownLatch / latch.await()                 hc_reactor_stop() when done
  */
 #include "hc.h"
@@ -316,9 +319,6 @@ start_exchange(void)
         hc_request_producer_add_header(req, "Expect", "100-continue");
     }
 
-    /* Java's Http1StreamListener.onRequestHead */
-    printf(">> POST %s\n", url);
-
     if (hc_requester_execute_request(requester, req, body, EXECUTE_TIMEOUT_MS, &cb) != 0) {
         hc_request_producer_free(req);
         body->vtbl->release(body);
@@ -333,8 +333,41 @@ fail:
     hc_reactor_stop(reactor);
 }
 
-/* Java: Http1StreamListener.onExchangeComplete reports "connection kept
- * alive" / "connection closed"; here the pool reports it on release. */
+/* ------------------------------------------------------------------------ */
+/* Java: .setStreamListener(new Http1StreamListener() { ... })              */
+/* ------------------------------------------------------------------------ */
+
+/* System.out.println(connection.getRemoteAddress() + " " + new RequestLine(request)) */
+static void
+on_request_head(void *arg, const char *remote, const hc_request_head *head)
+{
+    (void)arg;
+    printf("%s %s %s HTTP/%s\n", remote, head->method, head->target,
+           head->version == 10 ? "1.0" : "1.1");
+}
+
+/* System.out.println(connection.getRemoteAddress() + " " + new StatusLine(response));
+ * interim responses (100 Continue, 103 Early Hints) come through here too */
+static void
+on_response_head(void *arg, const char *remote, const hc_response_head *head)
+{
+    (void)arg;
+    printf("%s HTTP/%s %d\n", remote, head->version == 10 ? "1.0" : "1.1", head->status);
+}
+
+static void
+on_exchange_complete(void *arg, const char *remote, int keep_alive)
+{
+    (void)arg;
+    printf("%s exchange completed (connection %s)\n", remote,
+           keep_alive ? "kept alive" : "closed");
+}
+
+/* ------------------------------------------------------------------------ */
+/* Pool listener (an addition: shows the connection being leased again)     */
+/* ------------------------------------------------------------------------ */
+
+/* The lease is given back once the handler has released everything. */
 static void
 on_pool_release(void *arg, const hc_pool_entry *e, int reusable, hc_pool_stats t)
 {
@@ -364,10 +397,11 @@ on_pool_lease(void *arg, const hc_pool_entry *e, hc_pool_stats t)
 int
 main(int argc, char **argv)
 {
-    hc_requester_config cfg = { 0 };
-    hc_pool_listener    l   = { on_pool_lease, on_pool_release, NULL };
-    hc_host             probe;
-    char                target[2048];
+    hc_requester_config   cfg = { 0 };
+    hc_requester_listener sl  = { on_request_head, on_response_head, on_exchange_complete, NULL };
+    hc_pool_listener      l   = { on_pool_lease, on_pool_release, NULL };
+    hc_host               probe;
+    char                  target[2048];
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--duplex") == 0 && i + 1 < argc) {
@@ -403,6 +437,7 @@ main(int argc, char **argv)
         return 1;
     }
 
+    hc_requester_set_listener(requester, &sl);  /* Java: .setStreamListener() */
     hc_pool_set_listener(hc_requester_pool(requester), &l);
     hc_reactor_stop_on_signals(reactor);
 

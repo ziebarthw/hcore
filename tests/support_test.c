@@ -254,6 +254,84 @@ l_complete(void *arg, const char *remote, int keep_alive)
     L.kept_alive += keep_alive;
 }
 
+/* The requester's stream listener (Java: Http1StreamListener on the
+ * requester), reset at the start of every case. */
+static struct {
+    int  requests, responses, interim, completed, kept_alive;
+    int  last_status, interim_status;
+    char last_method[16];
+    char last_target[128];
+    char remote[64];
+    int  order_ok;              /* request head before every response head */
+} CL;
+
+static void
+cl_reset(void)
+{
+    memset(&CL, 0, sizeof(CL));
+    CL.order_ok = 1;
+}
+
+static void
+cl_request(void *arg, const char *remote, const hc_request_head *head)
+{
+    (void)arg;
+    CL.requests++;
+    snprintf(CL.last_method, sizeof(CL.last_method), "%s", head->method);
+    snprintf(CL.last_target, sizeof(CL.last_target), "%s", head->target);
+    snprintf(CL.remote, sizeof(CL.remote), "%s", remote);
+}
+
+static void
+cl_response(void *arg, const char *remote, const hc_response_head *head)
+{
+    (void)arg;
+    CL.order_ok = CL.order_ok && CL.requests > 0 && strcmp(remote, CL.remote) == 0;
+
+    if (head->status < 200) {
+        CL.interim++;
+        CL.interim_status = head->status;
+    } else {
+        CL.responses++;
+        CL.last_status = head->status;
+    }
+}
+
+static void
+cl_complete(void *arg, const char *remote, int keep_alive)
+{
+    (void)arg;
+    CL.order_ok = CL.order_ok && CL.responses > 0 && strcmp(remote, CL.remote) == 0;
+    CL.completed++;
+    CL.kept_alive += keep_alive;
+}
+
+/* requests, final responses, interim responses, completions, kept alive */
+static int
+cl_counts(int rq, int rs, int in, int co, int ka)
+{
+    int ok = CL.order_ok && CL.requests == rq && CL.responses == rs && CL.interim == in &&
+             CL.completed == co && CL.kept_alive == ka;
+
+    if (!ok) {
+        fprintf(stderr, "    requester listener: %d %d %d %d %d (order %d), expected %d %d %d %d %d\n",
+                CL.requests, CL.responses, CL.interim, CL.completed, CL.kept_alive,
+                CL.order_ok, rq, rs, in, co, ka);
+    }
+
+    return ok;
+}
+
+static int
+cl_remote_is(int port)
+{
+    char want[32];
+
+    snprintf(want, sizeof(want), "127.0.0.1:%d", port);
+
+    return strcmp(CL.remote, want) == 0;
+}
+
 /* ======================================================================== */
 /* Cases                                                                    */
 /* ======================================================================== */
@@ -339,6 +417,7 @@ run(const char *method, const char *uri, hc_entity_producer *entity, size_t max_
 
     free(O.body);
     memset(&O, 0, sizeof(O));
+    cl_reset();
 
     if (req == NULL) {
         CHECK(!"request producer");
@@ -389,6 +468,10 @@ next_case(void)
         case 1:
             CHECK(O.completed == 1 && O.failed == 0 && O.released == 1);
             CHECK(O.status == 200 && O.body_len == 5 && strcmp(O.body, "stuff") == 0);
+            /* requester listener: request head, response head, completion */
+            CHECK(cl_counts(1, 1, 0, 1, 1));
+            CHECK(strcmp(CL.last_method, "POST") == 0 && strcmp(CL.last_target, "/echo") == 0);
+            CHECK(CL.last_status == 200 && cl_remote_is(HTTP_PORT));
             puts("bytes producer 3MB round trip (chunked response)");
             snprintf(url, sizeof(url), "http://127.0.0.1:%d/echo", HTTP_PORT);
             run("PUT", url, hc_bytes_entity_producer_new(big, BIG_LEN, NULL), 0, NULL);
@@ -413,6 +496,7 @@ next_case(void)
             CHECK(O.completed == 0 && O.failed == 1 && O.released == 1);
             CHECK(strstr(O.reason, "rejected") != NULL);
             CHECK(route_stats("http", HTTP_PORT).available == 0);   /* not reused */
+            CHECK(cl_counts(1, 1, 0, 0, 0));    /* head seen, never completed */
             puts("server sendInformation(103) -> client information callback");
             snprintf(url, sizeof(url), "http://127.0.0.1:%d/hints", HTTP_PORT);
             run("GET", url, NULL, 0, NULL);
@@ -422,6 +506,7 @@ next_case(void)
             CHECK(O.information == 1 && O.info_status == 103);
             CHECK(strcmp(O.info_link, "</a.css>; rel=preload") == 0);
             CHECK(O.completed == 1 && strcmp(O.body, "hinted") == 0);
+            CHECK(cl_counts(1, 1, 1, 1, 1) && CL.interim_status == 103);
             puts("Expect: 100-continue -> 100 from the engine, before any response head");
             snprintf(url, sizeof(url), "http://127.0.0.1:%d/echo", HTTP_PORT);
             run("POST", url, hc_bytes_entity_producer_new(big, BIG_LEN, NULL), 0, "100-continue");
@@ -429,6 +514,7 @@ next_case(void)
 
         case 6:
             CHECK(O.information == 1 && O.info_status == 100);
+            CHECK(cl_counts(1, 1, 1, 1, 1) && CL.interim_status == 100);
             CHECK(O.completed == 1 && O.body_len == BIG_LEN && memcmp(O.body, big, BIG_LEN) == 0);
             puts("https: 3MB round trip with verification against the test CA");
             snprintf(url, sizeof(url), "https://localhost:%d/echo", HTTPS_PORT);
@@ -438,6 +524,7 @@ next_case(void)
         case 7:
             CHECK(O.completed == 1 && O.body_len == BIG_LEN && memcmp(O.body, big, BIG_LEN) == 0);
             CHECK(route_stats("https", HTTPS_PORT).available == 1);
+            CHECK(cl_counts(1, 1, 0, 1, 1) && cl_remote_is(HTTPS_PORT));
             puts("https again: reuses the pooled TLS connection");
             snprintf(url, sizeof(url), "https://localhost:%d/hints", HTTPS_PORT);
             run("GET", url, NULL, 0, NULL);
@@ -454,6 +541,7 @@ next_case(void)
         case 9:
             CHECK(O.completed == 0 && O.failed == 1 && O.released == 1);
             CHECK(strstr(O.reason, "IP address mismatch") != NULL);
+            CHECK(cl_counts(0, 0, 0, 0, 0));    /* nothing was sent */
             puts("http to a closed port -> failed, released once");
             run("GET", "http://127.0.0.1:9/x", NULL, 0, NULL);
             break;
@@ -461,6 +549,7 @@ next_case(void)
         case 10:
             CHECK(O.completed == 0 && O.failed == 1 && O.released == 1);
             CHECK(strstr(O.reason, "Connection refused") != NULL);
+            CHECK(cl_counts(0, 0, 0, 0, 0));
             puts("bad URI is rejected up front");
             CHECK(hc_request_producer_new("GET", "ftp://x/", hc_string_entity_producer_new("x", NULL)) == NULL);
             CHECK(hc_request_producer_new("GET", "no-scheme", NULL) == NULL);
@@ -535,6 +624,11 @@ next_route_case(void)
         CHECK(L.last_status == 404 && strcmp(L.last_target, "/nothing/here") == 0);
         CHECK(strncmp(L.remote, "127.0.0.1:", 10) == 0);
 
+        /* requester listener: the same exchanges from the client's side */
+        CHECK(cl_counts(n, n, 0, n, n) && cl_remote_is(ROUTER_PORT));
+        CHECK(strcmp(CL.last_method, "GET") == 0 && strcmp(CL.last_target, "/nothing/here") == 0);
+        CHECK(CL.last_status == 404);
+
         /* exchange addresses: every handler saw both; the remote one is the
          * client the listener reported, the local one this server */
         {
@@ -549,6 +643,10 @@ next_route_case(void)
         step = -1;                          /* done */
         hc_reactor_stop(R);
         return;
+    }
+
+    if (route_step == 0) {
+        cl_reset();
     }
 
     snprintf(url, sizeof(url), "http://127.0.0.1:%d%s", ROUTER_PORT, ROUTES[route_step++].path);
@@ -571,6 +669,7 @@ main(int argc, char **argv)
     hc_requester_config cfg = { 0 };
     hc_server          *http, *https, *router;
     hc_server_listener  lis = { l_request, l_response, l_complete, NULL };
+    hc_requester_listener clis = { cl_request, cl_response, cl_complete, NULL };
     hc_timer           *start;
 
     if (argc < 2) {
@@ -594,6 +693,7 @@ main(int argc, char **argv)
     https = hc_server_new(R, srv_factory, NULL);
     router = hc_server_new(R, NULL, NULL);          /* unmatched: 404 */
     hc_server_set_listener(router, &lis);
+    hc_requester_set_listener(RQ, &clis);
 
     if (!RQ || hc_server_listen(http, "127.0.0.1", HTTP_PORT) != 0 ||
         hc_server_enable_tls(https, cert, key) != 0 ||
