@@ -82,7 +82,7 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         data = self.body()
-        if self.path.startswith("/early"):
+        if self.path.startswith(("/early", "/close", "/die")):
             return self.do_GET()
         self.send(200, f"{len(data)} {hashlib.sha256(data).hexdigest()}\n".encode())
     do_PUT = do_POST

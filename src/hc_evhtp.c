@@ -1569,11 +1569,12 @@ static const hc_server_handler_vtbl refused_vtbl = {
     .release        = rf_release,
 };
 
+/* "address:port" ("[address]:port" for IPv6), "unknown" for anything else.
+ * The listeners' remote. */
 static void
-format_remote(const evhtp_connection_t *c, char *buf, size_t len)
+format_sockaddr(const struct sockaddr *sa, char *buf, size_t len)
 {
-    const struct sockaddr *sa = c ? c->saddr : NULL;
-    char                   ip[INET6_ADDRSTRLEN];
+    char ip[INET6_ADDRSTRLEN];
 
     if (sa && sa->sa_family == AF_INET) {
         const struct sockaddr_in *in = (const struct sockaddr_in *)(const void *)sa;
@@ -1588,6 +1589,12 @@ format_remote(const evhtp_connection_t *c, char *buf, size_t len)
     } else {
         snprintf(buf, len, "unknown");
     }
+}
+
+static void
+format_remote(const evhtp_connection_t *c, char *buf, size_t len)
+{
+    format_sockaddr(c ? c->saddr : NULL, buf, len);
 }
 
 /* Copies an IPv4/IPv6 address; returns its length, 0 for anything else. */
@@ -2724,6 +2731,7 @@ struct hc_requester {
     hc_processor         *processor; /* interceptors (own reference) */
     int64_t               read_timeout_ms;  /* exchange defaults (0: none) */
     int64_t               write_timeout_ms;
+    hc_requester_listener listener;  /* hc_requester_set_listener() */
 };
 
 struct hc_connect_op {
@@ -2780,6 +2788,7 @@ struct hc_pconn {
     unsigned             pending;
     void                *attachment;   /* hc_endpoint_set_attachment()  */
     void               (*attachment_free)(void *);
+    char                 remote[64];   /* the origin's "address:port", once known */
 };
 
 struct hc_request_channel {
@@ -2820,6 +2829,8 @@ struct hc_client_exchange {
     int                 timeouts_on;   /* set on the connection             */
     hc_context         *ctx;           /* interceptors' and handler's       */
     const hc_processor *proc;          /* the requester's (borrowed), or NULL */
+    const hc_requester_listener *lis;  /* the requester's, or NULL (unpooled) */
+    char                remote[64];    /* for the listener, from the request on */
 };
 
 static void cli_task_cb(evutil_socket_t fd, short what, void *arg);
@@ -2855,6 +2866,34 @@ cli_on_request_end(void *owner)
 
     cx->req_sent = 1;           /* the response may still flow */
     cx_apply_timeouts(cx);
+}
+
+/* The origin's "address:port" for the requester listener: the connected
+ * socket's peer, worked out once per connection (the target's name and
+ * port if the socket cannot tell). */
+static const char *
+pc_remote(hc_pconn *pc)
+{
+    struct sockaddr_storage ss;
+    socklen_t               len = sizeof(ss);
+    evutil_socket_t         fd;
+
+    if (pc->remote[0] != '\0') {
+        return pc->remote;
+    }
+
+    fd = pc->conn ? bufferevent_getfd(evhtp_connection_get_bev(pc->conn)) : -1;
+
+    if (fd >= 0 && getpeername(fd, (struct sockaddr *)(void *)&ss, &len) == 0 &&
+        (ss.ss_family == AF_INET || ss.ss_family == AF_INET6)) {
+        format_sockaddr((const struct sockaddr *)(const void *)&ss, pc->remote, sizeof(pc->remote));
+    } else {
+        snprintf(pc->remote, sizeof(pc->remote),
+                 strchr(pc->target.name, ':') ? "[%.40s]:%u" : "%.50s:%u",
+                 pc->target.name, (unsigned)pc->target.port);
+    }
+
+    return pc->remote;
 }
 
 static void
@@ -3385,6 +3424,10 @@ cli_deliver_interim(hc_client_exchange *cx, const char *msg, size_t len)
         line = eol;
     }
 
+    if (cx->lis && cx->lis->on_response_head && !cx->released) {
+        cx->lis->on_response_head(cx->lis->arg, cx->remote, &head);
+    }
+
     if (!cx->failed && !cx->released && cx->h->vtbl->consume_information) {
         cx->h->vtbl->consume_information(cx->h, &head);
     }
@@ -3523,6 +3566,21 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
     }
 
     headers_to_evhtp(own_headers ? own_headers : head->headers, cx->req->headers_out);
+
+    /* Requester listener: from here on this exchange reports to it. */
+    if (cx->pc && cx->pc->rq) {
+        cx->lis = &cx->pc->rq->listener;
+        snprintf(cx->remote, sizeof(cx->remote), "%s", pc_remote(cx->pc));
+
+        if (cx->lis->on_request_head) {
+            hc_request_head sent = *head;
+
+            sent.headers = own_headers ? own_headers : head->headers;
+            sent.version = head->version == 10 ? 10 : 11;  /* as sent */
+            cx->lis->on_request_head(cx->lis->arg, cx->remote, &sent);
+        }
+    }
+
     hc_headers_free(own_headers);
 
     if (entity && entity->content_length >= 0) {
@@ -3703,6 +3761,11 @@ cli_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
 
     if (cx->keep_alive_ms < 0 && cx->pc && cx->pc->rq) {
         cx->keep_alive_ms = cx->pc->rq->default_keep_alive_ms;
+    }
+
+    /* Requester listener: the head as received. */
+    if (cx->lis && cx->lis->on_response_head && !cx->released) {
+        cx->lis->on_response_head(cx->lis->arg, cx->remote, &head);
     }
 
     /* Interceptors: after the engine has read framing and persistence from
@@ -3987,6 +4050,11 @@ cli_task_cb(evutil_socket_t fd, short what, void *arg)
                 if (!cx->end_delivered) {
                     cx->end_delivered = 1;
                     cx->h->vtbl->stream_end(cx->h, NULL);
+                }
+
+                /* Java: onExchangeComplete(connection, keepAlive) */
+                if (cx->lis && cx->lis->on_exchange_complete) {
+                    cx->lis->on_exchange_complete(cx->lis->arg, cx->remote, reusable);
                 }
             } else if (cx->h->vtbl->failed) {
                 cx->h->vtbl->failed(cx->h, cx->reason ? cx->reason : "failed");
@@ -4474,6 +4542,20 @@ hc_pool *
 hc_requester_pool(hc_requester *rq)
 {
     return rq->pool;
+}
+
+void
+hc_requester_set_listener(hc_requester *rq, const hc_requester_listener *l)
+{
+    if (rq == NULL) {
+        return;
+    }
+
+    if (l) {
+        rq->listener = *l;
+    } else {
+        memset(&rq->listener, 0, sizeof(rq->listener));
+    }
 }
 
 /* Finish an exchange now, as its queued T_FINISH would later: the handler
