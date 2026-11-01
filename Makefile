@@ -32,7 +32,7 @@ HC_CFLAGS = -std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude -Ithird_p
 EVHTP_CFLAGS = -I$(EVHTP_PREFIX)/include
 EVHTP_LIBS   = $(EVHTP_PREFIX)/lib/libevhtp.a $(EXTRA_LIBS) -levent -levent_openssl -levent_pthreads -lssl -lcrypto -lpthread
 
-all: libhcore.a reverse_proxy echo_server full_duplex_client full_duplex_server file_server
+all: libhcore.a reverse_proxy echo_server full_duplex_client full_duplex_server file_server pipelined_client
 
 src/hc_evhtp.o: src/hc_evhtp.c include/hc.h include/hc_pool.h include/hc_processor.h third_party/htstring/include/htstring/htstring.h
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE $(EVHTP_CFLAGS) -c -o $@ $<
@@ -70,6 +70,9 @@ echo_server: examples/echo_server.o $(HC_OBJS)
 	$(CC) -o $@ $^ $(EVHTP_LIBS)
 
 full_duplex_client: examples/full_duplex_client.o $(HC_OBJS)
+	$(CC) -o $@ $^ $(EVHTP_LIBS)
+
+pipelined_client: examples/pipelined_client.o $(HC_OBJS)
 	$(CC) -o $@ $^ $(EVHTP_LIBS)
 
 full_duplex_server: examples/full_duplex_server.o $(HC_OBJS)
@@ -122,6 +125,10 @@ tests/tls_opts_test: tests/tls_opts_test.c $(HC_OBJS)
 tests/stats_test: tests/stats_test.c $(HC_OBJS)
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE -o $@ $^ $(EVHTP_LIBS) -lpthread
 
+# HTTP/1.1 pipelining on an endpoint, against a scripted origin.
+tests/pipeline_test: tests/pipeline_test.c $(HC_OBJS)
+	$(CC) $(HC_CFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE -o $@ $^ $(EVHTP_LIBS)
+
 # HTTP/2 server (only with a libevhtp that has HTTP/2: the ziebarthw fork
 # built with nghttp2; needs curl with HTTP/2 to run).
 HAVE_H2 := $(shell grep -qs EVHTP_CONN_FLAG_IS_HTTP2 $(EVHTP_PREFIX)/include/evhtp/evhtp.h && echo yes)
@@ -133,7 +140,7 @@ HAVE_RESET := $(shell grep -qs EVHTP_HAVE_REQUEST_RESET_STREAM $(EVHTP_PREFIX)/i
 tests/h2_test: tests/h2_test.c $(HC_OBJS)
 	$(CC) $(HC_CFLAGS) $(CFLAGS) $(if $(HAVE_RESET),-DHC_TEST_STREAM_RESET) -o $@ $^ $(EVHTP_LIBS)
 
-check: all tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/processor_test tests/timeout_test tests/stats_test tests/tls_opts_test tests/basic_server_test $(H2_TEST)
+check: all tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/processor_test tests/timeout_test tests/stats_test tests/tls_opts_test tests/basic_server_test tests/pipeline_test $(H2_TEST)
 	tests/pool_test
 	tests/support_test tests/tls
 	tests/embed_test
@@ -144,6 +151,7 @@ check: all tests/pool_test tests/support_test tests/embed_test tests/shutdown_te
 	tests/stats_test tests/tls
 	tests/tls_opts_test tests/tls
 	tests/basic_server_test tests/tls
+	tests/pipeline_test
 	$(if $(HAVE_H2),tests/h2_test tests/tls,@echo "h2_test: skipped (libevhtp without HTTP/2)")
 	tests/run.sh
 
@@ -199,6 +207,6 @@ libhcore.pc:
 	@echo "wrote $@"
 
 clean:
-	rm -f libhcore.a libhcore.pc src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server file_server tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/h2_test tests/processor_test tests/timeout_test tests/stats_test tests/tls_opts_test tests/basic_server_test
+	rm -f libhcore.a libhcore.pc src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server file_server pipelined_client tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/h2_test tests/processor_test tests/timeout_test tests/stats_test tests/tls_opts_test tests/basic_server_test tests/pipeline_test
 
 .PHONY: all clean check install libhcore.pc

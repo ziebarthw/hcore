@@ -5,6 +5,7 @@
 /reverse_proxy
 /echo_server
 /full_duplex_client
+/pipelined_client
 /tests/pool_test
 /tests/support_test
 /tests/embed_test
@@ -16,6 +17,7 @@
 /tests/stats_test
 /tests/tls_opts_test
 /tests/basic_server_test
+/tests/pipeline_test
 
 # local build settings (see config.mk.example)
 /config.mk

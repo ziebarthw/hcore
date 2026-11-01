@@ -22,6 +22,7 @@ src/hc_support.c        producers/consumers   }
 src/hc_processor.c      interceptors/context  }
 examples/reverse_proxy.c       port of AsyncReverseProxyExample (pooled, http/https origins, relays 1xx)
 examples/full_duplex_client.c  port of AsyncFullDuplexClientExample (producers/consumers, http/https)
+examples/pipelined_client.c    port of AsyncPipelinedRequestExecutionExample (HTTP/1.1 pipelining on one endpoint)
 examples/full_duplex_server.c  port of AsyncFullDuplexServerExample (routing, stream listener, http/https)
 examples/echo_server.c         minimal server handler: streams the request body back (http/https)
 examples/file_server.c         port of AsyncFileServerExample (whole requests, a file streamed with Content-Length)
@@ -29,6 +30,7 @@ tests/pool_test.c       pool + hc_host unit tests with fake connections
 tests/support_test.c    in-process integration tests: support API, TLS, 1xx, routing (HTTP + HTTPS servers)
 tests/embed_test.c      hcore in the application's event loop: reuse_port, pause/resume accept, graceful drain
 tests/shutdown_test.c   freeing a requester (and server) while the application's loop keeps running
+tests/pipeline_test.c   HTTP/1.1 pipelining on an endpoint, against a scripted origin
 tests/tls_name_test.c   https to an address, presenting and verifying a host name (hc_host.tls_name)
 tests/h2_test.c         the server over HTTP/2 (libevhtp with HTTP/2 only), checked with curl
 tests/processor_test.c  interceptors and processors on both sides of real exchanges
@@ -114,7 +116,7 @@ Java's `Supplier<AsyncServerExchangeHandler>`: one handler per exchange.
 | `EntityDetails` (null = no body)              | `const hc_entity *` (NULL = no body)       |
 | `HttpAsyncRequester.execute` (no pool)        | `hc_client_execute()`                      |
 | `HttpAsyncRequester.connect` -> `AsyncClientEndpoint` | `hc_requester_connect()` -> `hc_endpoint` |
-| `AsyncClientEndpoint.execute`                 | `hc_endpoint_execute()`                    |
+| `AsyncClientEndpoint.execute` (pipelined)     | `hc_endpoint_execute()`                    |
 | `HttpAsyncRequester.execute(handler, timeout, ctx)` (pooled) | `hc_requester_execute()`    |
 | `HttpAsyncRequester.execute(producer, consumer, timeout, callback)` | `hc_requester_execute_request()` |
 | `releaseAndReuse` / `releaseAndDiscard`       | `hc_endpoint_release_and_reuse/_discard()` |
@@ -485,6 +487,62 @@ For `-n`, each exchange starts the next from the callback's `released()`. The
 engine returns the finished connection to the pool synchronously, before
 that `release()` returns, so the next lease always finds it idle and reuse
 doesn't depend on event ordering.
+
+## Pipelined requests
+
+Several `hc_endpoint_execute()` calls on one endpoint, without waiting for
+the first to finish, pipeline their requests (HTTP/1.1): Java's
+`AsyncClientEndpoint.execute()` called in a loop. Each request goes out as
+soon as the one ahead of it has been sent completely, so several can be on
+the wire while their responses are outstanding. Responses come back in
+request order, each to its own handler.
+
+Some requests are not pipelined behind: one after a `HEAD` or `CONNECT`
+request, an HTTP/1.0 request or one carrying `Connection: close` waits until
+that exchange is finished. If the connection ends early - the origin closes
+it, or a response says `Connection: close` - the exchanges still queued
+fail with `upstream connection closed`.
+
+Cancelling a queued exchange whose request hasn't been sent yet just drops
+it. Cancelling one whose request is already on the wire closes the
+connection: its response would still arrive, and the connection could no
+longer pair responses with requests. The other exchanges on it fail.
+Releasing the endpoint with `hc_endpoint_release_and_discard()` cancels
+everything still queued.
+
+`examples/pipelined_client.c` ports `AsyncPipelinedRequestExecutionExample`.
+It leases one connection, executes four GETs on it at once, and prints what
+the Java example prints:
+
+```
+pipelined_client [--cafile PEM] [--insecure] [http[s]://host[:port]]   # default http://httpbin.org
+```
+
+```
+127.0.0.1:9000 GET / HTTP/1.1
+127.0.0.1:9000 GET /ip HTTP/1.1
+127.0.0.1:9000 GET /user-agent HTTP/1.1
+127.0.0.1:9000 GET /headers HTTP/1.1
+127.0.0.1:9000 HTTP/1.1 200
+/->200
+...
+127.0.0.1:9000 exchange completed (connection kept alive)
+127.0.0.1:9000 HTTP/1.1 200
+/ip->200
+...
+Shutting down I/O reactor
+```
+
+All four request lines come before the first status line. Java's
+`cancelled()` callback has no separate C counterpart: a cancelled exchange
+fails with `cancelled`.
+
+Inside the engine, libevhtp parses into one request at a time. A pipelined
+request is written to the connection without becoming that request, and
+takes its place when the response ahead of it completes - before the parser
+reaches the next response's bytes, whether the parser stops after each
+message (libevhtp's `parser.c`, the fork's current `msgparser.c`) or reads
+straight on (the fork's earlier `msgparser.c`).
 
 ## Embedding: your event loop, several threads, graceful drain
 
@@ -969,6 +1027,24 @@ SNI is sent (an IP is never sent as SNI) and verification checks the IP; a
 name the certificate does not cover fails verification, and with
 verification off reaches the origin as given. Different TLS names to one
 address are separate pool routes (`tests/pool_test`).
+
+**Pipelining** (`tests/pipeline_test`, 65 checks) runs an endpoint against
+a scripted origin that either answers only once it has received every
+request - which a client that doesn't pipeline could never satisfy - writing
+all responses in one go, or answers each request as it arrives. It covers:
+- four GETs on the wire before any response, with chunked and
+  Content-Length bodies, a 404, and a `103 Early Hints` ahead of a pipelined
+  response; the connection is kept alive and reused afterwards;
+- a request body (POST) in the middle of the pipeline;
+- `HEAD`: the request after it waits for its response;
+- `Connection: close` on the 2nd of 4 responses, and an origin that closes
+  after the first of 3: the rest fail;
+- cancelling an exchange not yet sent (only it fails) and one already sent
+  (the connection closes, the others fail);
+- discarding the endpoint with exchanges queued.
+
+It passes with libevhtp's own parser and with both of the fork's
+`msgparser.c` versions.
 
 **Shutdown while running** (`tests/shutdown_test`, 34 checks) frees a
 requester while the event loop it runs on carries on, the way an embedding

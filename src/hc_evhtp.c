@@ -685,6 +685,7 @@ enum {
     T_ABORT   = 1u << 2,
     T_FINISH  = 1u << 3,
     T_RAWREAD = 1u << 4,
+    T_KICK    = 1u << 5,    /* parse input already buffered for this exchange */
 };
 
 static void
@@ -2751,7 +2752,10 @@ struct hc_endpoint {
     hc_requester       *rq;
     hc_pool_entry      *entry;
     hc_pconn           *pc;
-    hc_client_exchange *cx;      /* exchange in flight, if any */
+    /* Exchanges on this connection, oldest first (HTTP/1.1 pipelining):
+     * responses arrive in this order. cx is the oldest, NULL when idle. */
+    hc_client_exchange *cx;
+    hc_client_exchange *tail;
     int                 release_pending;
     int                 reuse;
     hc_timer           *task;
@@ -2773,7 +2777,8 @@ struct hc_pconn {
     char                 err[512];    /* why connecting failed, if known   */
     hc_pool_entry       *entry;
     evhtp_connection_t  *conn;        /* NULL once libevhtp freed it       */
-    hc_client_exchange  *cx;
+    hc_client_exchange  *cx;          /* the exchange the incoming response
+                                       * belongs to (libevhtp's request)    */
     hc_connect_op       *op;          /* connecting for this op            */
     int                  dead;        /* closed, or idle and broken        */
     int                  closing;     /* pc_destroy() in progress          */
@@ -2831,6 +2836,16 @@ struct hc_client_exchange {
     const hc_processor *proc;          /* the requester's (borrowed), or NULL */
     const hc_requester_listener *lis;  /* the requester's, or NULL (unpooled) */
     char                remote[64];    /* for the listener, from the request on */
+    /* Pipelining (endpoint exchanges) */
+    hc_client_exchange *ep_next;       /* next exchange on the endpoint      */
+    int                 started;       /* T_START scheduled                  */
+    int                 pipeline_ok;   /* a request may follow this one before
+                                        * its response (not HEAD, CONNECT,
+                                        * HTTP/1.0 or "Connection: close")  */
+    int                 handed_over;   /* the connection's response stream
+                                        * moved on to ep_next               */
+    int                 parser_interim; /* libevhtp's parser delivered a 1xx:
+                                        * its "completion" is not the end   */
 };
 
 static void cli_task_cb(evutil_socket_t fd, short what, void *arg);
@@ -2858,6 +2873,7 @@ cli_schedule_produce(void *owner)
 }
 
 static void cx_apply_timeouts(hc_client_exchange *cx);
+static void ep_kick(hc_endpoint *ep);
 
 static void
 cli_on_request_end(void *owner)
@@ -2866,6 +2882,10 @@ cli_on_request_end(void *owner)
 
     cx->req_sent = 1;           /* the response may still flow */
     cx_apply_timeouts(cx);
+
+    if (cx->ep) {
+        ep_kick(cx->ep);        /* a pipelined request may follow now */
+    }
 }
 
 /* The origin's "address:port" for the requester listener: the connected
@@ -3053,8 +3073,14 @@ pc_on_conn_fini(evhtp_connection_t *c, void *arg)
         return EVHTP_RES_OK;
     }
 
+    /* Every exchange on the connection: the one reading its response and,
+     * pipelined, those queued with it on the endpoint. */
     if (pc->cx) {
-        cli_conn_gone(pc->cx);
+        hc_client_exchange *x = pc->cx->ep ? pc->cx->ep->cx : pc->cx;
+
+        for (; x; x = x->ep ? x->ep_next : NULL) {
+            cli_conn_gone(x);
+        }
     }
 
     if (pc->op) {
@@ -3226,9 +3252,15 @@ static void
 pc_destroy(hc_pconn *pc)
 {
     if (pc->cx) {               /* only at shutdown with exchanges in flight */
-        pc->cx->pc = NULL;
-        cli_fail(pc->cx, "connection pool shut down");
-        schedule(pc->cx->task, &pc->cx->pending, T_FINISH);
+        hc_client_exchange *x = pc->cx->ep ? pc->cx->ep->cx : pc->cx;
+
+        for (; x; x = x->ep ? x->ep_next : NULL) {
+            x->pc = NULL;
+            cli_fail(x, "connection pool shut down");
+            schedule(x->task, &x->pending, T_FINISH);
+        }
+
+        pc->cx = NULL;
     }
 
     if (pc->dns_req) {
@@ -3567,6 +3599,14 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
 
     headers_to_evhtp(own_headers ? own_headers : head->headers, cx->req->headers_out);
 
+    /* May the next exchange on the endpoint send before this response? */
+    {
+        const char *v = hc_headers_get(own_headers ? own_headers : head->headers, "connection");
+
+        cx->pipeline_ok = m != htp_method_HEAD && m != htp_method_CONNECT &&
+                          head->version != 10 && !(v && has_token(v, "close"));
+    }
+
     /* Requester listener: from here on this exchange reports to it. */
     if (cx->pc && cx->pc->rq) {
         cx->lis = &cx->pc->rq->listener;
@@ -3596,13 +3636,30 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
         cx->req->proto = EVHTP_PROTO_10;
     }
 
-    evhtp_make_request(conn, cx->req, (htp_method)m, head->target);
-    cx->req_attached = 1;
-    cli_interpose_begin(cx, evhtp_connection_get_bev(conn));
+    if (cx->pc->cx == cx) {
+        /* The connection's next response is ours: libevhtp parses into
+         * this request. */
+        evhtp_make_request(conn, cx->req, (htp_method)m, head->target);
+        cx->req_attached = 1;
+        cli_interpose_begin(cx, evhtp_connection_get_bev(conn));
+    } else {
+        /* Pipelined behind responses still to come: write the request,
+         * leave libevhtp parsing the current one. The request becomes
+         * libevhtp's at hand-over (cx_hand_over). */
+        evhtp_request_t *current = conn->request;
+
+        evhtp_make_request(conn, cx->req, (htp_method)m, head->target);
+        conn->request = current;
+    }
 
     if (entity == NULL) {
         cx->req_sent = 1;
         cx_apply_timeouts(cx);
+
+        if (cx->ep) {
+            ep_kick(cx->ep);
+        }
+
         return NULL;
     }
 
@@ -3613,6 +3670,10 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
     if (entity->content_length == 0) {
         cx->out.ended = 1;
         cx->req_sent  = 1;
+
+        if (cx->ep) {
+            ep_kick(cx->ep);
+        }
     }
 
     cx_apply_timeouts(cx);
@@ -3659,8 +3720,9 @@ cx_apply_timeouts(hc_client_exchange *cx)
     int64_t             r = cx->read_ms, w = cx->write_ms;
     struct timeval      rt, wt;
 
-    if (c == NULL || !cx->head_sent || cx->done || cx->failed || cx->released) {
-        return;
+    if (c == NULL || !cx->head_sent || cx->done || cx->failed || cx->released ||
+        cx->pc->cx != cx) {
+        return;                 /* a pipelined exchange: applied at hand-over */
     }
 
     if (r < 0) {
@@ -3730,6 +3792,27 @@ cli_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
 
     if ((h = headers_from_evhtp(hdrs)) == NULL) {
         return EVHTP_RES_FATAL;
+    }
+
+    /* An interim response normally never reaches the parser (see the
+     * interposer); one that does - a parser that read on into a pipelined
+     * response before the interposer was in place - is interim all the
+     * same. The parser then ends that "message", and parses the final
+     * response into this request next. */
+    if (status >= 100 && status < 200 && status != 101) {
+        hc_response_head interim = { status, htparser_get_minor(c->parser) == 0 ? 10 : 11, h };
+
+        if (cx->lis && cx->lis->on_response_head && !cx->released) {
+            cx->lis->on_response_head(cx->lis->arg, cx->remote, &interim);
+        }
+
+        if (!cx->failed && !cx->released && cx->h->vtbl->consume_information) {
+            cx->h->vtbl->consume_information(cx->h, &interim);
+        }
+
+        cx->parser_interim = 1;
+        hc_headers_free(h);
+        return EVHTP_RES_OK;
     }
 
     body_possible = !(status < 200 || status == 204 || status == 304);
@@ -3879,11 +3962,102 @@ cli_raw_event(struct bufferevent *bev, short events, void *arg)
     schedule(cx->task, &cx->pending, T_FINISH);
 }
 
+/* --- HTTP/1.1 pipelining ------------------------------------------------ *
+ * An endpoint's exchanges form a queue. Each one's request is written as
+ * soon as the one ahead of it has been sent completely, so several requests
+ * can be on the wire while responses are outstanding; the responses come
+ * back in the same order. libevhtp parses into one request at a time (the
+ * connection's c->request, our pc->cx): a pipelined request is written
+ * without becoming it, and becomes it when the response ahead completes -
+ * before the parser reaches the bytes of the next response.
+ */
+
+/* Start the endpoint's exchanges that may send their requests now: the
+ * oldest one, and each one whose predecessor has sent all of its request
+ * and allows another to follow it. */
+static void
+ep_kick(hc_endpoint *ep)
+{
+    hc_client_exchange *prev = NULL, *cx;
+
+    for (cx = ep->cx; cx; prev = cx, cx = cx->ep_next) {
+        if (cx->started) {
+            continue;
+        }
+
+        if (prev && (!prev->req_sent || !prev->pipeline_ok || prev->failed ||
+                     (prev->resp_head && !prev->resp_keepalive))) {
+            break;              /* it waits for the connection to be its own */
+        }
+
+        cx->started = 1;
+
+        if (ep->pc->conn == NULL || ep->pc->dead) {
+            cli_fail(cx, "upstream connection closed");
+            schedule(cx->task, &cx->pending, T_FINISH);
+        } else {
+            schedule(cx->task, &cx->pending, T_START);
+        }
+    }
+}
+
+/* cx's response is complete and the connection stays: if the next
+ * exchange's request is already on the wire, the next response is its.
+ * Returns 1 if it was handed over. in_readcb: called from libevhtp's read
+ * callback (via the response's completion). */
+static int
+cx_hand_over(hc_client_exchange *cx, int in_readcb)
+{
+    hc_client_exchange *next = cx->ep ? cx->ep_next : NULL;
+    evhtp_connection_t *conn = cx_conn(cx);
+
+    if (next == NULL || conn == NULL || cx->handed_over || !cx->done || cx->failed ||
+        cx->raw_mode || !cx->resp_keepalive || cx->pc->cx != cx ||
+        !next->head_sent || next->req_attached || next->req == NULL || next->failed) {
+        return 0;
+    }
+
+    conn->request      = next->req;
+    next->req_attached = 1;
+    cx->handed_over    = 1;
+    cx->pc->cx         = next;
+
+    /* libevhtp's read callback, finding bytes left after this response,
+     * would "resume" a connection that is not paused (and log an error).
+     * A paused request status makes it pause the connection instead; the
+     * T_KICK below resumes it and parses those bytes. */
+    if (in_readcb) {
+        next->req->status = EVHTP_RES_PAUSE;
+    }
+
+    /* A parser that read this response straight through left our 1xx
+     * interposer in front of it: take it out before putting the next
+     * exchange's there, or the two would chain. */
+    if (cx->interposed) {
+        cli_interpose_end(cx, evhtp_connection_get_bev(conn));
+    }
+
+    cli_interpose_begin(next, evhtp_connection_get_bev(conn));
+    cx_apply_timeouts(next);
+
+    /* Bytes of the next response may already be buffered: a parser that
+     * stops after each message leaves them there, and no read event comes
+     * for data already read. */
+    schedule(next->task, &next->pending, T_KICK);
+
+    return 1;
+}
+
 /* Response complete. */
 static void
 cli_on_complete(evhtp_request_t *req, void *arg)
 {
     hc_client_exchange *cx = arg;
+
+    if (cx->parser_interim) {
+        cx->parser_interim = 0;     /* the end of a 1xx, not of the response */
+        return;
+    }
 
     if (cx->failed || cx->done) {
         return;
@@ -3909,6 +4083,10 @@ cli_on_complete(evhtp_request_t *req, void *arg)
     cx->done = 1;
     cx->end_delivered = 1;
     cx->h->vtbl->stream_end(cx->h, NULL);
+
+    /* Now, not in T_FINISH: a parser that goes on to the next message in
+     * this same run must already parse it into the next exchange. */
+    cx_hand_over(cx, 1);
 
     /* Recycle or close the connection outside libevhtp's call stack. */
     schedule(cx->task, &cx->pending, T_FINISH);
@@ -3970,6 +4148,29 @@ cx_left_conn_reusable(const hc_client_exchange *cx)
            evbuffer_get_length(bufferevent_get_input(bev)) == 0;
 }
 
+/* Take cx out of its endpoint's queue. */
+static void
+ep_unlink(hc_endpoint *ep, hc_client_exchange *cx)
+{
+    hc_client_exchange **pp   = &ep->cx;
+    hc_client_exchange  *prev = NULL;
+
+    while (*pp && *pp != cx) {
+        prev = *pp;
+        pp   = &(*pp)->ep_next;
+    }
+
+    if (*pp) {
+        *pp = cx->ep_next;
+
+        if (ep->tail == cx) {
+            ep->tail = prev;
+        }
+    }
+
+    cx->ep_next = NULL;
+}
+
 static void
 cli_task_cb(evutil_socket_t fd, short what, void *arg)
 {
@@ -3993,20 +4194,74 @@ cli_task_cb(evutil_socket_t fd, short what, void *arg)
         cli_raw_read(evhtp_connection_get_bev(cx_conn(cx)), cx);
     }
 
+    if (todo & T_KICK && cx_conn(cx) && !cx->done && !cx->failed && !cx->released &&
+        cx->pc->cx == cx) {
+        evhtp_connection_t *c   = cx_conn(cx);
+        struct bufferevent *bev = evhtp_connection_get_bev(c);
+        bufferevent_data_cb read_cb;
+        void               *read_arg;
+
+        /* Undo the pause the hand-over asked libevhtp for. */
+        if (c->flags & EVHTP_CONN_FLAG_PAUSED) {
+            c->flags &= ~EVHTP_CONN_FLAG_PAUSED;
+
+            if (!cx->input_suspended) {
+                bufferevent_enable(bev, EV_READ);
+            }
+        }
+
+        if (cx->req && cx->req->status == EVHTP_RES_PAUSE) {
+            cx->req->status = EVHTP_RES_OK;
+        }
+
+        if (evbuffer_get_length(bufferevent_get_input(bev)) > 0) {
+            bufferevent_getcb(bev, &read_cb, NULL, NULL, &read_arg);
+
+            if (read_cb) {
+                read_cb(bev, read_arg);     /* our interposer, or libevhtp */
+            }
+        }
+    }
+
     if (todo & (T_ABORT | T_FINISH)) {
-        hc_pconn *pc       = cx->pc;
-        int       reusable;
+        hc_pconn           *pc     = cx->pc;
+        hc_endpoint        *ep     = cx->ep;
+        hc_client_exchange *next   = ep ? cx->ep_next : NULL;
+        int                 target = pc && pc->cx == cx;    /* libevhtp's request */
+        int                 reusable;
 
         if (cx->interposed && cx_conn(cx)) {
             cli_interpose_end(cx, evhtp_connection_get_bev(cx_conn(cx)));
         }
 
-        reusable = cx_left_conn_reusable(cx) && !cx->interposed;
+        /* A pipelined request written since the response completed takes
+         * the connection's next response. */
+        if (target && cx_hand_over(cx, 0)) {
+            target = 0;
+        }
+
+        reusable = cx->handed_over || (target && cx_left_conn_reusable(cx));
 
         chan_detach(&cx->out);
 
-        if (pc) {
-            pc->cx       = NULL;
+        if (ep) {
+            ep_unlink(ep, cx);
+        }
+
+        if (pc && cx->handed_over) {
+            /* The connection carries on with the next exchange. */
+            pc->reusable      = 1;
+            pc->keep_alive_ms = cx->keep_alive_ms;
+
+            if (cx->req) {
+                cx->req->conn = NULL;           /* libevhtp's no longer */
+                evhtp_request_free(cx->req);
+            }
+
+            if (pc->conn && cx->input_suspended && !(pc->cx && pc->cx->input_suspended)) {
+                bufferevent_enable(evhtp_connection_get_bev(pc->conn), EV_READ);
+            }
+        } else if (target) {
             pc->reusable = reusable;
 
             if (reusable) {
@@ -4029,18 +4284,42 @@ cli_task_cb(evutil_socket_t fd, short what, void *arg)
                     bufferevent_set_timeouts(bev, NULL, NULL);  /* idle: none */
                 }
 
-                /* No request is attached any more, so libevhtp's parser
-                 * must not see input until the next exchange starts. */
-                pc_set_idle(pc);
-            } else if (pc->conn) {
-                /* Not reusable (or unpooled): close now. Frees the
-                 * request with it. */
-                evhtp_connection_free(pc->conn);
+                /* The next exchange (not sent yet) gets the connection;
+                 * with none, no request is attached any more, so libevhtp's
+                 * parser must not see input until the next one starts. */
+                pc->cx = next;
+
+                if (next == NULL) {
+                    pc_set_idle(pc);
+                }
+            } else {
+                /* Not reusable (or unpooled): close now, which frees the
+                 * request with it. Exchanges queued behind fail. */
+                pc->cx = NULL;
+
+                for (hc_client_exchange *q = next; q; q = q->ep_next) {
+                    cli_fail(q, "upstream connection closed");
+                    chan_detach(&q->out);
+                    q->started = 1;
+                    schedule(q->task, &q->pending, T_FINISH);
+                }
+
+                if (pc->conn) {
+                    evhtp_connection_free(pc->conn);
+                }
             }
+        } else if (pc && pc->conn && cx->head_sent && !cx->req_attached) {
+            /* A pipelined exchange failed after its request was written:
+             * its response will still come, so the connection can no longer
+             * pair requests with responses. Closing it fails the others. */
+            evhtp_connection_free(pc->conn);
         }
 
         if (cx->req && !cx->req_attached) {
-            evhtp_request_free(cx->req);    /* never handed to libevhtp */
+            /* Never libevhtp's request; a pipelined one still points at the
+             * connection, which may be gone by now. */
+            cx->req->conn = NULL;
+            evhtp_request_free(cx->req);
         }
 
         if (!cx->released) {
@@ -4063,10 +4342,9 @@ cli_task_cb(evutil_socket_t fd, short what, void *arg)
             cx->h->vtbl->release(cx->h);
         }
 
-        if (cx->ep) {
-            hc_endpoint *ep = cx->ep;
-
-            ep->cx = NULL;
+        if (ep) {
+            /* An exchange queued behind may be able to send now. */
+            ep_kick(ep);
 
             /* Hand the connection back now, not on a later timer: a handler
              * that starts its next request from ->release() (the usual
@@ -4345,7 +4623,7 @@ hc_endpoint_execute(hc_endpoint *ep, hc_client_handler *h)
 {
     hc_client_exchange *cx;
 
-    if (ep->cx || ep->release_pending || ep->rq->closing ||
+    if (ep->release_pending || ep->rq->closing ||
         (cx = cx_new(ep->rq->r, h)) == NULL) {
         return NULL;
     }
@@ -4354,16 +4632,26 @@ hc_endpoint_execute(hc_endpoint *ep, hc_client_handler *h)
     cx->ep     = ep;
     cx->proc   = ep->rq->processor;     /* the requester outlives its exchanges */
     cx->ctx    = hc_context_new(0, &ep->pc->target, NULL);
-    ep->cx     = cx;
-    ep->pc->cx = cx;
 
-    if (ep->pc->conn == NULL || ep->pc->dead) {
-        cli_fail(cx, "upstream connection closed");
-        schedule(cx->task, &cx->pending, T_FINISH);
+    /* Queue it. With the endpoint idle it has the connection to itself;
+     * otherwise it is pipelined behind the exchanges already there. */
+    if (ep->tail) {
+        ep->tail->ep_next = cx;
     } else {
-        pc_set_active(ep->pc);
-        schedule(cx->task, &cx->pending, T_START);
+        ep->cx = cx;
     }
+
+    ep->tail = cx;
+
+    if (ep->cx == cx) {
+        ep->pc->cx = cx;
+
+        if (ep->pc->conn && !ep->pc->dead) {
+            pc_set_active(ep->pc);
+        }
+    }
+
+    ep_kick(ep);
 
     return cx;
 }
@@ -4426,10 +4714,12 @@ ep_task_cb(void *arg)
     int          keep;
 
     if (ep->cx) {
-        /* Exchange still running: finish (or cancel) it first; its
-         * T_FINISH re-runs this task. */
+        /* Exchanges still running: finish (or cancel) them first; the
+         * last one's T_FINISH re-runs this task. */
         if (!ep->reuse) {
-            hc_client_cancel(ep->cx);
+            for (hc_client_exchange *x = ep->cx; x; x = x->ep_next) {
+                hc_client_cancel(x);
+            }
         }
 
         return;
