@@ -260,6 +260,11 @@ hc_buffer_entity_consumer_data(const hc_entity_consumer *c, size_t *len)
 /* Basic client exchange handler                                            */
 /* ======================================================================== */
 
+/* struct basic_handler: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    BH_DELIVERED = 1u << 0,   /* completed/failed called */
+};
+
 typedef struct basic_handler {
     hc_client_handler    base;          /* must be first */
     hc_request_producer *req;
@@ -269,7 +274,7 @@ typedef struct basic_handler {
     int                  status;
     int                  version;
     hc_headers          *resp_headers;
-    int                  delivered;     /* completed/failed called */
+    unsigned             flags;  /* BH_*, above */
     const char          *abort_reason;
 } basic_handler;
 
@@ -278,11 +283,11 @@ typedef struct basic_handler {
 static void
 basic_fail(basic_handler *b, const char *reason)
 {
-    if (b->delivered) {
+    if (HC_TEST_FLAG(b->flags, BH_DELIVERED)) {
         return;
     }
 
-    b->delivered = 1;
+    HC_SET_FLAG(b->flags, BH_DELIVERED);
 
     if (b->req->entity && b->req->entity->vtbl->failed) {
         b->req->entity->vtbl->failed(b->req->entity, reason);
@@ -380,7 +385,7 @@ basic_stream_end(hc_client_handler *self, const hc_headers *trailers)
     hc_response_head head;
     hc_message       msg;
 
-    if (b->abort_reason || b->delivered) {
+    if (b->abort_reason || HC_TEST_FLAG(b->flags, BH_DELIVERED)) {
         return;
     }
 
@@ -393,7 +398,7 @@ basic_stream_end(hc_client_handler *self, const hc_headers *trailers)
     head.headers = b->resp_headers;
     msg.head     = &head;
     msg.body     = b->body;
-    b->delivered = 1;
+    HC_SET_FLAG(b->flags, BH_DELIVERED);
 
     if (b->cb.completed) {
         b->cb.completed(b->cb.arg, &msg);
@@ -484,6 +489,12 @@ hc_requester_execute_request(hc_requester *rq, hc_request_producer *request,
 
 #define BASIC_SERVER_MAX_BODY (1024u * 1024u)
 
+/* struct hc_basic_request: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    BR_REJECTED  = 1u << 0,   /* over the limit: 413 sent */
+    BR_DELIVERED = 1u << 1,   /* ->request() was called */
+};
+
 struct hc_basic_request {
     hc_server_handler             base;     /* must be first */
     const hc_basic_server_config *cfg;
@@ -498,8 +509,7 @@ struct hc_basic_request {
     size_t                        len;
     size_t                        cap;
     size_t                        max;
-    int                           rejected; /* over the limit: 413 sent  */
-    int                           delivered;/* ->request() was called    */
+    unsigned                      flags;  /* BR_*, above */
     void                         *data;
 };
 
@@ -508,8 +518,8 @@ struct hc_basic_request {
 static void
 breq_reject(hc_basic_request *r)
 {
-    if (!r->rejected) {
-        r->rejected = 1;
+    if (!HC_TEST_FLAG(r->flags, BR_REJECTED)) {
+        HC_SET_FLAG(r->flags, BR_REJECTED);
         /* -1 when a response has started already: nothing to add then */
         hc_response_send_simple(r->rc, 413, "text/plain", "Request body too large\n", 1);
     }
@@ -533,7 +543,7 @@ breq_handle_request(hc_server_handler *self, hc_server_exchange *ex,
 
     if (!r->method || !r->target || (head->authority && !r->authority) ||
         !r->headers || !r->body) {
-        r->rejected = 1;
+        HC_SET_FLAG(r->flags, BR_REJECTED);
         hc_response_send_simple(rc, 500, "text/plain", "out of memory\n", 1);
         return;
     }
@@ -550,7 +560,7 @@ breq_consume(hc_server_handler *self, const void *data, size_t len)
 {
     hc_basic_request *r = BREQ(self);
 
-    if (r->rejected || len == 0) {
+    if (HC_TEST_FLAG(r->flags, BR_REJECTED) || len == 0) {
         return;
     }
 
@@ -568,7 +578,7 @@ breq_consume(hc_server_handler *self, const void *data, size_t len)
         }
 
         if ((p = realloc(r->body, cap)) == NULL) {
-            r->rejected = 1;
+            HC_SET_FLAG(r->flags, BR_REJECTED);
             hc_response_send_simple(r->rc, 500, "text/plain", "out of memory\n", 1);
             return;
         }
@@ -589,8 +599,8 @@ breq_stream_end(hc_server_handler *self, const hc_headers *trailers)
 
     (void)trailers;
 
-    if (!r->rejected && !r->delivered) {
-        r->delivered = 1;
+    if (!HC_TEST_FLAG(r->flags, BR_REJECTED | BR_DELIVERED)) {
+        HC_SET_FLAG(r->flags, BR_DELIVERED);
         r->cfg->request(r->cfg->arg, r);
     }
 }
@@ -600,7 +610,7 @@ breq_produce(hc_server_handler *self, hc_data_channel *ch)
 {
     hc_basic_request *r = BREQ(self);
 
-    if (r->delivered && r->cfg->produce) {
+    if (HC_TEST_FLAG(r->flags, BR_DELIVERED) && r->cfg->produce) {
         r->cfg->produce(r->cfg->arg, r, ch);
     }
 }
@@ -610,7 +620,7 @@ breq_failed(hc_server_handler *self, const char *reason)
 {
     hc_basic_request *r = BREQ(self);
 
-    if (r->delivered && r->cfg->failed) {
+    if (HC_TEST_FLAG(r->flags, BR_DELIVERED) && r->cfg->failed) {
         r->cfg->failed(r->cfg->arg, r, reason);
     }
 }
@@ -620,7 +630,7 @@ breq_release(hc_server_handler *self)
 {
     hc_basic_request *r = BREQ(self);
 
-    if (r->delivered && r->cfg->release) {
+    if (HC_TEST_FLAG(r->flags, BR_DELIVERED) && r->cfg->release) {
         r->cfg->release(r->cfg->arg, r);
     }
 
