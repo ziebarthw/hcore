@@ -64,11 +64,16 @@
 /* Reactor                                                                  */
 /* ======================================================================== */
 
+/* struct hc_reactor: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    R_OWNS_BASE = 1u << 0,   /* 0: hc_reactor_new_on_base() */
+};
+
 struct hc_reactor {
     struct event_base *base;
     struct evdns_base *dns;
     struct event      *sig[2];
-    int                owns_base;  /* 0: hc_reactor_new_on_base() */
+    unsigned           flags;  /* R_*, above */
 };
 
 static hc_reactor *
@@ -85,7 +90,7 @@ reactor_new(struct event_base *base)
     if (base) {
         r->base = base;
     } else if ((r->base = event_base_new()) != NULL) {
-        r->owns_base = 1;
+        HC_SET_FLAG(r->flags, R_OWNS_BASE);
     } else {
         free(r);
         return NULL;
@@ -241,7 +246,7 @@ hc_reactor_free(hc_reactor *r)
         evdns_base_free(r->dns, 0);
     }
 
-    if (r->owns_base) {
+    if (HC_TEST_FLAG(r->flags, R_OWNS_BASE)) {
         event_base_free(r->base);
     }
 
@@ -487,6 +492,14 @@ entity_from_headers(const hc_headers *h, hc_entity *e, int body_possible,
 /* Data channel (outgoing body)                                             */
 /* ======================================================================== */
 
+/* struct hc_data_channel: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    CH_CHUNKED = 1u << 0,
+    CH_DISCARD = 1u << 1,   /* HEAD response: accept, send nothing */
+    CH_ENDED   = 1u << 2,
+    CH_FULL    = 1u << 3,
+};
+
 struct hc_data_channel {
     struct bufferevent       *bev;     /* NULL once detached                 */
     struct evbuffer          *out;     /* bev's output; HTTP/2: the stream's
@@ -494,11 +507,8 @@ struct hc_data_channel {
     evhtp_request_t          *h2req;   /* HTTP/2 server reply, else NULL     */
     struct evbuffer          *stage;   /* HTTP/2: hands data to libevhtp     */
     struct evbuffer_cb_entry *cbe;
-    int                       chunked;
-    int                       discard; /* HEAD response: accept, send nothing */
+    unsigned                  flags;  /* CH_*, above */
     int64_t                   remaining; /* Content-Length mode, else -1     */
-    int                       ended;
-    int                       full;
     void                     *owner;
     void                    (*on_produce)(void *owner);
     void                    (*on_end)(void *owner);
@@ -509,9 +519,9 @@ chan_drain_cb(struct evbuffer *buf, const struct evbuffer_cb_info *info, void *a
 {
     hc_data_channel *ch = arg;
 
-    if (info->n_deleted > 0 && ch->full && !ch->ended &&
-        evbuffer_get_length(buf) < HC_LOW_WATER) {
-        ch->full = 0;
+    if (info->n_deleted > 0 && HC_TEST_FLAG(ch->flags, CH_FULL) &&
+        !HC_TEST_FLAG(ch->flags, CH_ENDED) && evbuffer_get_length(buf) < HC_LOW_WATER) {
+        HC_CLEAR_FLAG(ch->flags, CH_FULL);
         ch->on_produce(ch->owner);
     }
 }
@@ -525,10 +535,14 @@ chan_attach(hc_data_channel *ch, struct bufferevent *bev, int chunked,
     ch->out        = bufferevent_get_output(bev);
     ch->h2req      = NULL;
     ch->stage      = NULL;
-    ch->chunked    = chunked;
     ch->remaining  = chunked ? -1 : length;
-    ch->ended      = 0;
-    ch->full       = 0;
+    if (chunked) {
+        HC_SET_FLAG(ch->flags, CH_CHUNKED);
+    } else {
+        HC_CLEAR_FLAG(ch->flags, CH_CHUNKED);
+    }
+    HC_CLEAR_FLAG(ch->flags, CH_ENDED);
+    HC_CLEAR_FLAG(ch->flags, CH_FULL);
     ch->owner      = owner;
     ch->on_produce = on_produce;
     ch->on_end     = on_end;
@@ -547,10 +561,10 @@ chan_attach_h2(hc_data_channel *ch, evhtp_request_t *req, int64_t length,
     ch->out        = req->buffer_out;
     ch->h2req      = req;
     ch->stage      = evbuffer_new();
-    ch->chunked    = 0;
+    HC_CLEAR_FLAG(ch->flags, CH_CHUNKED);
     ch->remaining  = length;
-    ch->ended      = 0;
-    ch->full       = 0;
+    HC_CLEAR_FLAG(ch->flags, CH_ENDED);
+    HC_CLEAR_FLAG(ch->flags, CH_FULL);
     ch->owner      = owner;
     ch->on_produce = on_produce;
     ch->on_end     = on_end;
@@ -578,7 +592,7 @@ chan_detach(hc_data_channel *ch)
 long
 hc_data_write(hc_data_channel *ch, const void *data, size_t len)
 {
-    if (ch == NULL || ch->bev == NULL || ch->ended) {
+    if (ch == NULL || ch->bev == NULL || HC_TEST_FLAG(ch->flags, CH_ENDED)) {
         return -1;
     }
 
@@ -586,7 +600,7 @@ hc_data_write(hc_data_channel *ch, const void *data, size_t len)
         return 0;
     }
 
-    if (ch->discard) {
+    if (HC_TEST_FLAG(ch->flags, CH_DISCARD)) {
         return (long)len;
     }
 
@@ -602,7 +616,7 @@ hc_data_write(hc_data_channel *ch, const void *data, size_t len)
         /* appends to req->buffer_out and wakes the stream */
         evbuffer_add(ch->stage, data, len);
         evhtp_send_reply_body(ch->h2req, ch->stage);
-    } else if (ch->chunked) {
+    } else if (HC_TEST_FLAG(ch->flags, CH_CHUNKED)) {
         evbuffer_add_printf(ch->out, "%zx\r\n", len);
         evbuffer_add(ch->out, data, len);
         evbuffer_add(ch->out, "\r\n", 2);
@@ -611,7 +625,7 @@ hc_data_write(hc_data_channel *ch, const void *data, size_t len)
     }
 
     if (evbuffer_get_length(ch->out) >= HC_HIGH_WATER) {
-        ch->full = 1;
+        HC_SET_FLAG(ch->flags, CH_FULL);
     }
 
     return (long)len;
@@ -622,14 +636,14 @@ hc_data_capacity(hc_data_channel *ch)
 {
     size_t queued;
 
-    if (ch == NULL || ch->bev == NULL || ch->ended) {
+    if (ch == NULL || ch->bev == NULL || HC_TEST_FLAG(ch->flags, CH_ENDED)) {
         return 0;
     }
 
     queued = evbuffer_get_length(ch->out);
 
     if (queued >= HC_HIGH_WATER) {
-        ch->full = 1;
+        HC_SET_FLAG(ch->flags, CH_FULL);
         return 0;
     }
 
@@ -639,7 +653,7 @@ hc_data_capacity(hc_data_channel *ch)
 void
 hc_data_request_output(hc_data_channel *ch)
 {
-    if (ch && ch->bev && !ch->ended) {
+    if (ch && ch->bev && !HC_TEST_FLAG(ch->flags, CH_ENDED)) {
         ch->on_produce(ch->owner);
     }
 }
@@ -647,17 +661,17 @@ hc_data_request_output(hc_data_channel *ch)
 int
 hc_data_end(hc_data_channel *ch, const hc_headers *trailers)
 {
-    if (ch == NULL || ch->bev == NULL || ch->ended) {
+    if (ch == NULL || ch->bev == NULL || HC_TEST_FLAG(ch->flags, CH_ENDED)) {
         return -1;
     }
 
-    if (ch->remaining > 0 && !ch->discard) {
+    if (ch->remaining > 0 && !HC_TEST_FLAG(ch->flags, CH_DISCARD)) {
         return -1;              /* fewer bytes than declared */
     }
 
     /* Trailers go out with HTTP/1.1 chunked framing only; an HTTP/2 reply
      * ends without them (libevhtp has no HTTP/2 trailer support). */
-    if (ch->chunked && !ch->discard) {
+    if (HC_TEST_FLAG(ch->flags, CH_CHUNKED) && !HC_TEST_FLAG(ch->flags, CH_DISCARD)) {
         const char *k, *v;
 
         evbuffer_add(ch->out, "0\r\n", 3);
@@ -669,7 +683,7 @@ hc_data_end(hc_data_channel *ch, const hc_headers *trailers)
         evbuffer_add(ch->out, "\r\n", 2);
     }
 
-    ch->ended = 1;
+    HC_SET_FLAG(ch->flags, CH_ENDED);
     ch->on_end(ch->owner);
 
     return 0;
@@ -715,15 +729,20 @@ schedule(struct event *task, unsigned *pending, unsigned what)
 
 /* Accepted connections, so hc_server_free() can close them: libevhtp does
  * not track them and evhtp_free() leaves them open. */
+/* struct srv_conn: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    SC_TLS = 1u << 0,   /* counted in cx_ssl_active */
+    SC_H2  = 1u << 1,   /* counted as HTTP/2 (else HTTP/1) */
+};
+
 typedef struct srv_conn {
     struct srv_conn    *prev;
     struct srv_conn    *next;
     hc_server          *srv;
     evhtp_connection_t *c;
     unsigned            h2_active; /* HTTP/2 streams under way (read timeout off) */
-    int                 tls;       /* counted in cx_ssl_active          */
+    unsigned            flags;  /* SC_*, above */
     int                 tls_state; /* 0 handshaking, 1 done, 2 failed (counted) */
-    int                 h2;        /* counted as HTTP/2 (else HTTP/1)   */
     struct evbuffer          *rx, *tx;          /* the bufferevent's buffers */
     struct evbuffer_cb_entry *rx_cbe, *tx_cbe;  /* byte counters             */
 } srv_conn;
@@ -742,13 +761,19 @@ typedef struct srv_route {
     void                     *arg;
 } srv_route;
 
+/* struct hc_server: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    SRV_CLOSING  = 1u << 0,   /* hc_server_free() in progress */
+    SRV_DRAINING = 1u << 1,   /* hc_server_drain(): no more keep-alive */
+    SRV_HTTP2    = 1u << 2,   /* offer h2 in TLS ALPN (if built in) */
+};
+
 struct hc_server {
     hc_reactor               *r;
     evhtp_t                  *htp;
     srv_conn                 *conns;
     size_t                    n_conns;
-    int                       closing;  /* hc_server_free() in progress */
-    int                       draining; /* hc_server_drain(): no more keep-alive */
+    unsigned                  flags;  /* SRV_*, above */
     struct hc_server_exchange *exchanges; /* live exchanges (drain: busy connections) */
     struct event             *drain_ev; /* closes idle connections, from the loop */
     evhtp_callback_t         *cb;
@@ -757,7 +782,6 @@ struct hc_server {
     srv_route                *routes;
     size_t                    n_routes;
     hc_server_listener        listener;
-    int                       http2;   /* offer h2 in TLS ALPN (if built in) */
     hc_processor             *processor; /* interceptors (own reference) */
     struct timeval            read_tv;  /* client timeouts (0: none) */
     struct timeval            write_tv;
@@ -772,6 +796,24 @@ struct hc_response_channel {
     hc_server_exchange *ex;
 };
 
+/* struct hc_server_exchange: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    EX_IS_HEAD         = 1u << 0,
+    EX_REQ_DONE        = 1u << 1,
+    EX_RESP_STARTED    = 1u << 2,
+    EX_RESP_DONE       = 1u << 3,
+    EX_PAUSED          = 1u << 4,
+    EX_FINISHED        = 1u << 5,
+    EX_FAILED          = 1u << 6,
+    EX_RELEASED        = 1u << 7,
+    EX_INPUT_SUSPENDED = 1u << 8,
+    EX_KEEP_ALIVE      = 1u << 9,   /* connection stays open afterwards */
+    EX_H2              = 1u << 10,  /* an HTTP/2 stream */
+    EX_H2_COUNTED      = 1u << 11,  /* in its srv_conn's h2_active */
+    EX_RESET           = 1u << 12,  /* HTTP/2 stream reset sent */
+    EX_TOO_LARGE       = 1u << 13,  /* body over the limit: 413 / close */
+};
+
 struct hc_server_exchange {
     hc_server           *srv;
     struct hc_server_exchange *prev, *next;  /* srv->exchanges */
@@ -782,20 +824,7 @@ struct hc_server_exchange {
     hc_data_channel      out;
     struct event        *task;
     unsigned             pending;
-    int                  is_head;
-    int                  req_done;
-    int                  resp_started;
-    int                  resp_done;
-    int                  paused;
-    int                  finished;
-    int                  failed;
-    int                  released;
-    int                  input_suspended;
-    int                  keep_alive;   /* connection stays open afterwards */
-    int                  h2;           /* an HTTP/2 stream                 */
-    int                  h2_counted;   /* in its srv_conn's h2_active      */
-    int                  reset;        /* HTTP/2 stream reset sent         */
-    int                  too_large;    /* body over the limit: 413 / close */
+    unsigned             flags;  /* EX_*, above */
     int64_t              body_read;    /* request body bytes so far        */
     struct evbuffer_cb_entry *flush_cbe; /* close once the output is sent  */
     hc_processor        *proc;         /* the server's when it began (ref) */
@@ -847,12 +876,12 @@ srv_h2_busy(hc_server_exchange *ex)
 {
     srv_conn *n;
 
-    if (!ex->h2 || ex->h2_counted || !tv_is_set(&ex->srv->read_tv) ||
-        (n = srv_conn_of(ex->conn)) == NULL) {
+    if (!HC_TEST_FLAG(ex->flags, EX_H2) || HC_TEST_FLAG(ex->flags, EX_H2_COUNTED) ||
+        !tv_is_set(&ex->srv->read_tv) || (n = srv_conn_of(ex->conn)) == NULL) {
         return;
     }
 
-    ex->h2_counted = 1;
+    HC_SET_FLAG(ex->flags, EX_H2_COUNTED);
 
     if (n->h2_active++ == 0) {
         evhtp_connection_set_timeouts(ex->conn, NULL,
@@ -865,14 +894,14 @@ srv_h2_idle(hc_server_exchange *ex)
 {
     srv_conn *n;
 
-    if (!ex->h2_counted) {
+    if (!HC_TEST_FLAG(ex->flags, EX_H2_COUNTED)) {
         return;
     }
 
-    ex->h2_counted = 0;
+    HC_CLEAR_FLAG(ex->flags, EX_H2_COUNTED);
 
     if ((n = srv_conn_of(ex->conn)) == NULL || --n->h2_active > 0 ||
-        ex->srv->closing || (ex->conn->flags & EVHTP_CONN_FLAG_ERROR)) {
+        HC_TEST_FLAG(ex->srv->flags, SRV_CLOSING) || (ex->conn->flags & EVHTP_CONN_FLAG_ERROR)) {
         return;
     }
 
@@ -894,31 +923,37 @@ srv_try_finalize(hc_server_exchange *ex)
 {
     struct bufferevent *bev;
 
-    if (!ex->req || !ex->req_done || !ex->resp_done || ex->finished) {
+    if (!ex->req || !HC_TEST_ALL(ex->flags, EX_REQ_DONE | EX_RESP_DONE) ||
+        HC_TEST_FLAG(ex->flags, EX_FINISHED)) {
         return;
     }
 
-    ex->finished   = 1;
+    HC_SET_FLAG(ex->flags, EX_FINISHED);
 
-    if (ex->h2) {
+    if (HC_TEST_FLAG(ex->flags, EX_H2)) {
         /* A stream: END_STREAM follows the last DATA frame, libevhtp frees
          * the request when the stream closes, and the connection stays for
          * its other streams (a drain closes it once they are done). */
-        ex->keep_alive = 1;
+        HC_SET_FLAG(ex->flags, EX_KEEP_ALIVE);
         evhtp_send_reply_end(ex->req);
         return;
     }
 
-    if (ex->srv->draining) {
+    if (HC_TEST_FLAG(ex->srv->flags, SRV_DRAINING)) {
         ex->req->flags &= ~EVHTP_REQ_FLAG_KEEPALIVE;    /* close once flushed */
     }
 
-    ex->keep_alive = (ex->req->flags & EVHTP_REQ_FLAG_KEEPALIVE) != 0;
-    bev            = evhtp_connection_get_bev(ex->conn);
+    bev = evhtp_connection_get_bev(ex->conn);
+
+    if (ex->req->flags & EVHTP_REQ_FLAG_KEEPALIVE) {
+        HC_SET_FLAG(ex->flags, EX_KEEP_ALIVE);
+    } else {
+        HC_CLEAR_FLAG(ex->flags, EX_KEEP_ALIVE);
+    }
 
     evhtp_send_reply_end(ex->req);
 
-    if (ex->paused || ex->input_suspended) {
+    if (HC_TEST_FLAG(ex->flags, EX_PAUSED | EX_INPUT_SUSPENDED)) {
         /* Un-pause synchronously instead of evhtp_request_resume(). That
          * function defers its work to an event; a write callback that runs
          * in between frees the finished request, and the deferred resume
@@ -926,8 +961,8 @@ srv_try_finalize(hc_server_exchange *ex)
          * call the write callback once more with no request ("no request
          * associated with connection") and drop the keep-alive connection.
          * WAITING makes libevhtp's write callback re-enable reading. */
-        ex->paused          = 0;
-        ex->input_suspended = 0;
+        HC_CLEAR_FLAG(ex->flags, EX_PAUSED);
+        HC_CLEAR_FLAG(ex->flags, EX_INPUT_SUSPENDED);
         ex->conn->flags    &= ~EVHTP_CONN_FLAG_PAUSED;
         ex->conn->flags    |= EVHTP_CONN_FLAG_WAITING;
     }
@@ -988,12 +1023,13 @@ srv_on_response_end(void *owner)
 {
     hc_server_exchange *ex = owner;
 
-    ex->resp_done = 1;
+    HC_SET_FLAG(ex->flags, EX_RESP_DONE);
 
     /* The body is over the limit and the rest of it will not be read: close
      * the connection once the response has gone out. HTTP/2 discards the
      * rest of the stream instead. */
-    if (ex->too_large && !ex->req_done && !ex->h2 && ex->conn) {
+    if (HC_TEST_FLAG(ex->flags, EX_TOO_LARGE) && !HC_TEST_FLAG(ex->flags, EX_REQ_DONE | EX_H2) &&
+        ex->conn) {
         srv_close_after_flush(ex);
         return;
     }
@@ -1013,7 +1049,7 @@ hc_response_send(hc_response_channel *rc, const hc_response_head *head,
     hc_headers         *own_headers = NULL;
     hc_response_head    processed;
 
-    if (req == NULL || ex->resp_started || ex->failed) {
+    if (req == NULL || HC_TEST_FLAG(ex->flags, EX_RESP_STARTED | EX_FAILED)) {
         return NULL;
     }
 
@@ -1044,7 +1080,7 @@ hc_response_send(hc_response_channel *rc, const hc_response_head *head,
         head              = &processed;
     }
 
-    ex->resp_started = 1;
+    HC_SET_FLAG(ex->flags, EX_RESP_STARTED);
     bev              = evhtp_connection_get_bev(ex->conn);
 
     switch (head->status / 100) {
@@ -1064,7 +1100,7 @@ hc_response_send(hc_response_channel *rc, const hc_response_head *head,
     /* libevhtp writes its own Connection header from the keep-alive flag. */
     conn_hdr = hc_headers_get(head->headers, "connection");
 
-    if ((conn_hdr && has_token(conn_hdr, "close")) || ex->srv->draining) {
+    if ((conn_hdr && has_token(conn_hdr, "close")) || HC_TEST_FLAG(ex->srv->flags, SRV_DRAINING)) {
         req->flags &= ~EVHTP_REQ_FLAG_KEEPALIVE;    /* "Connection: close" */
     }
 
@@ -1077,7 +1113,7 @@ hc_response_send(hc_response_channel *rc, const hc_response_head *head,
         return NULL;
     }
 
-    if (ex->is_head) {
+    if (HC_TEST_FLAG(ex->flags, EX_IS_HEAD)) {
         if (entity->content_length >= 0) {
             snprintf(num, sizeof(num), "%lld", (long long)entity->content_length);
             evhtp_headers_add_header(req->headers_out,
@@ -1085,13 +1121,13 @@ hc_response_send(hc_response_channel *rc, const hc_response_head *head,
         }
 
         evhtp_send_reply_start(req, (evhtp_res)head->status);
-        if (ex->h2) {
+        if (HC_TEST_FLAG(ex->flags, EX_H2)) {
             chan_attach_h2(&ex->out, req, -1, ex, srv_schedule_produce, srv_on_response_end);
         } else {
             chan_attach(&ex->out, bev, 0, -1, ex, srv_schedule_produce, srv_on_response_end);
         }
-        ex->out.discard = 1;
-    } else if (ex->h2) {
+        HC_SET_FLAG(ex->out.flags, CH_DISCARD);
+    } else if (HC_TEST_FLAG(ex->flags, EX_H2)) {
         /* DATA frames delimit the body: Content-Length is optional */
         if (entity->content_length >= 0) {
             snprintf(num, sizeof(num), "%lld", (long long)entity->content_length);
@@ -1133,8 +1169,8 @@ hc_response_send_information(hc_response_channel *rc, const hc_response_head *he
 
     /* 1xx only, before the final response, and never to an HTTP/1.0 client
      * (RFC 9110 15.2). 100 is libevhtp's job; 101 would be an upgrade. */
-    if (ex->req == NULL || ex->resp_started || ex->failed || ex->req->proto != EVHTP_PROTO_11 ||
-        head->status < 102 || head->status > 199) {
+    if (ex->req == NULL || HC_TEST_FLAG(ex->flags, EX_RESP_STARTED | EX_FAILED) ||
+        ex->req->proto != EVHTP_PROTO_11 || head->status < 102 || head->status > 199) {
         return -1;
     }
 
@@ -1187,7 +1223,7 @@ hc_response_send_simple(hc_response_channel *rc, int status,
     ch = hc_response_send(rc, &head, len ? &e : NULL);
 
     if (len == 0) {
-        rv = rc->ex->resp_started ? 0 : -1;
+        rv = HC_TEST_FLAG(rc->ex->flags, EX_RESP_STARTED) ? 0 : -1;
     } else if (ch && hc_data_write(ch, body, len) == (long)len && hc_data_end(ch, NULL) == 0) {
         rv = 0;
     }
@@ -1203,8 +1239,8 @@ hc_server_suspend_input(hc_server_exchange *ex)
     /* HTTP/2: reading the connection serves every stream on it, so it is
      * never stopped for one (as libevhtp's own pause does on HTTP/2); the
      * request body is delivered as it arrives. */
-    if (ex->req && !ex->req_done && !ex->input_suspended && !ex->h2) {
-        ex->input_suspended = 1;
+    if (ex->req && !HC_TEST_FLAG(ex->flags, EX_REQ_DONE | EX_INPUT_SUSPENDED | EX_H2)) {
+        HC_SET_FLAG(ex->flags, EX_INPUT_SUSPENDED);
         bufferevent_disable(evhtp_connection_get_bev(ex->conn), EV_READ);
     }
 }
@@ -1212,8 +1248,9 @@ hc_server_suspend_input(hc_server_exchange *ex)
 void
 hc_server_resume_input(hc_server_exchange *ex)
 {
-    if (ex->req && !ex->req_done && ex->input_suspended && !ex->h2) {
-        ex->input_suspended = 0;
+    if (ex->req && HC_TEST_FLAG(ex->flags, EX_INPUT_SUSPENDED) &&
+        !HC_TEST_FLAG(ex->flags, EX_REQ_DONE | EX_H2)) {
+        HC_CLEAR_FLAG(ex->flags, EX_INPUT_SUSPENDED);
         bufferevent_enable(evhtp_connection_get_bev(ex->conn), EV_READ);
     }
 }
@@ -1221,12 +1258,12 @@ hc_server_resume_input(hc_server_exchange *ex)
 void
 hc_server_abort(hc_server_exchange *ex)
 {
-    if (ex->released || ex->req == NULL) {
+    if (HC_TEST_FLAG(ex->flags, EX_RELEASED) || ex->req == NULL) {
         return;
     }
 
-    if (!ex->failed) {
-        ex->failed = 1;
+    if (!HC_TEST_FLAG(ex->flags, EX_FAILED)) {
+        HC_SET_FLAG(ex->flags, EX_FAILED);
         ex->reason = "aborted";
     }
 
@@ -1239,29 +1276,29 @@ hc_server_abort(hc_server_exchange *ex)
 static void
 srv_body_too_large(hc_server_exchange *ex)
 {
-    ex->too_large = 1;
+    HC_SET_FLAG(ex->flags, EX_TOO_LARGE);
     ex->srv->stats.rq_too_large++;
 
-    if (ex->failed || ex->req == NULL) {
+    if (HC_TEST_FLAG(ex->flags, EX_FAILED) || ex->req == NULL) {
         return;                 /* already failing: its body is discarded */
     }
 
-    if (!ex->resp_started) {
+    if (!HC_TEST_FLAG(ex->flags, EX_RESP_STARTED)) {
         /* HTTP/1.x: also closes once sent (srv_on_response_end) */
         hc_response_send_simple(&ex->rc, 413, "text/plain", "Request body too large\n",
-                                !ex->h2);
+                                !HC_TEST_FLAG(ex->flags, EX_H2));
     }
 
-    ex->failed = 1;
+    HC_SET_FLAG(ex->flags, EX_FAILED);
     ex->reason = "request body too large";
 
     /* A response under way cannot be finished properly: close the
      * connection. HTTP/1.x after a complete response (the 413, or one the
      * handler made earlier): close once it is sent - the rest of the body
      * is not read. */
-    if (!ex->resp_done) {
+    if (!HC_TEST_FLAG(ex->flags, EX_RESP_DONE)) {
         schedule(ex->task, &ex->pending, T_ABORT);
-    } else if (!ex->h2 && !ex->req_done) {
+    } else if (!HC_TEST_FLAG(ex->flags, EX_H2 | EX_REQ_DONE)) {
         srv_close_after_flush(ex);
     }
 }
@@ -1276,11 +1313,12 @@ srv_on_read(evhtp_request_t *req, struct evbuffer *buf, void *arg)
 
     ex->body_read += (int64_t)len;
 
-    if (ex->srv->max_body > 0 && ex->body_read > ex->srv->max_body && !ex->too_large) {
+    if (ex->srv->max_body > 0 && ex->body_read > ex->srv->max_body &&
+        !HC_TEST_FLAG(ex->flags, EX_TOO_LARGE)) {
         srv_body_too_large(ex);
     }
 
-    if (len && !ex->failed && !ex->released) {
+    if (len && !HC_TEST_FLAG(ex->flags, EX_FAILED | EX_RELEASED)) {
         ex->h->vtbl->consume(ex->h, evbuffer_pullup(buf, (ev_ssize_t)len), len);
     }
 
@@ -1296,8 +1334,8 @@ srv_on_error(evhtp_request_t *req, evhtp_error_flags errtype, void *arg)
     hc_server_exchange *ex = arg;
     short               ev = (short)errtype;  /* bufferevent events, or -1 */
 
-    if (!ex->failed) {
-        ex->failed = 1;
+    if (!HC_TEST_FLAG(ex->flags, EX_FAILED)) {
+        HC_SET_FLAG(ex->flags, EX_FAILED);
 
         if (errtype != (evhtp_error_flags)-1 && (ev & BEV_EVENT_TIMEOUT)) {
             ex->reason = (ev & BEV_EVENT_WRITING) ? "client write timeout" : "client read timeout";
@@ -1309,8 +1347,8 @@ srv_on_error(evhtp_request_t *req, evhtp_error_flags errtype, void *arg)
     chan_detach(&ex->out);
 
     /* A paused connection is only freed once resumed. */
-    if (ex->paused) {
-        ex->paused = 0;
+    if (HC_TEST_FLAG(ex->flags, EX_PAUSED)) {
+        HC_CLEAR_FLAG(ex->flags, EX_PAUSED);
         evhtp_request_resume(req);
     }
 
@@ -1330,12 +1368,13 @@ srv_on_fini(evhtp_request_t *req, void *arg)
     ex->req  = NULL;
     ex->conn = NULL;
 
-    if (!ex->finished && !ex->failed) {
-        ex->failed = 1;
-        ex->reason = ex->srv->closing ? "server shut down" : "client connection closed";
+    if (!HC_TEST_FLAG(ex->flags, EX_FINISHED | EX_FAILED)) {
+        HC_SET_FLAG(ex->flags, EX_FAILED);
+        ex->reason = HC_TEST_FLAG(ex->srv->flags, SRV_CLOSING) ? "server shut down"
+                                                                : "client connection closed";
     }
 
-    if (ex->srv->closing) {
+    if (HC_TEST_FLAG(ex->srv->flags, SRV_CLOSING)) {
         /* hc_server_free(): the loop will not run again, so release the
          * handler now. ex->req is already NULL; nothing touches libevhtp. */
         ex->pending |= T_FINISH;
@@ -1357,10 +1396,10 @@ srv_on_complete(evhtp_request_t *req, void *arg)
         return;
     }
 
-    ex->req_done = 1;
+    HC_SET_FLAG(ex->flags, EX_REQ_DONE);
     srv_h2_busy(ex);    /* the client now waits for the server */
 
-    if (!ex->failed && !ex->released) {
+    if (!HC_TEST_FLAG(ex->flags, EX_FAILED | EX_RELEASED)) {
         ex->h->vtbl->stream_end(ex->h, NULL);
     }
 
@@ -1370,11 +1409,11 @@ srv_on_complete(evhtp_request_t *req, void *arg)
      * expects a synchronous reply to be finished, so no pause is needed. */
     srv_try_finalize(ex);
 
-    if (!ex->finished && ex->req && !ex->h2) {
+    if (!HC_TEST_FLAG(ex->flags, EX_FINISHED) && ex->req && !HC_TEST_FLAG(ex->flags, EX_H2)) {
         /* Reply will come later: stop libevhtp from reading the next
          * request on this connection until we are done. (HTTP/2: other
          * streams go on; there is no next request on this one.) */
-        ex->paused = 1;
+        HC_SET_FLAG(ex->flags, EX_PAUSED);
         evhtp_request_pause(req);
     }
 }
@@ -1537,10 +1576,15 @@ static hc_server_handler not_found_handler = { &not_found_vtbl };
 /* A request an interceptor refused: answered with its status, in place of
  * the application's handler (which is released unused). Any request body
  * is read and discarded. */
+/* struct refused_handler: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    RF_CLOSE = 1u << 0,   /* HTTP/1.x: close after the response */
+};
+
 typedef struct refused_handler {
     hc_server_handler base;
     int               status;
-    int               close;    /* HTTP/1.x: close after the response */
+    unsigned          flags;  /* RF_*, above */
 } refused_handler;
 
 static void
@@ -1554,7 +1598,7 @@ rf_handle_request(hc_server_handler *self, hc_server_exchange *ex,
     (void)entity;
     hc_response_send_simple(rc, rf->status, "text/plain",
                             rf->status == 413 ? "Request body too large\n" : "Request refused",
-                            rf->close && !ex->h2);
+                            HC_TEST_FLAG(rf->flags, RF_CLOSE) && !HC_TEST_FLAG(ex->flags, EX_H2));
 }
 
 static void
@@ -1696,7 +1740,9 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
         }
     }
 
-    ex->h2 = conn_is_h2(ex->conn);
+    if (conn_is_h2(ex->conn)) {
+        HC_SET_FLAG(ex->flags, EX_H2);
+    }
 
     format_remote(ex->conn, ex->remote, sizeof(ex->remote));
     ex->remote_len = copy_sockaddr(&ex->remote_addr, ex->conn ? ex->conn->saddr : NULL);
@@ -1712,12 +1758,14 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
 
     ex->proc = hc_processor_ref(srv->processor);
     ex->ctx  = hc_context_new(1, NULL, ex->remote);
-    hc_context_set_protocol(ex->ctx, ex->h2 ? 20 : req->proto == EVHTP_PROTO_10 ? 10 : 11,
+    hc_context_set_protocol(ex->ctx,
+                            HC_TEST_FLAG(ex->flags, EX_H2) ? 20
+                                : req->proto == EVHTP_PROTO_10 ? 10 : 11,
                             ex->conn && ex->conn->ssl != NULL);
 
     srv->stats.rq_total++;
     srv->stats.rq_active++;
-    if (ex->h2) {
+    if (HC_TEST_FLAG(ex->flags, EX_H2)) {
         srv->stats.rq_http2_total++;
     } else {
         srv->stats.rq_http1_total++;
@@ -1736,7 +1784,11 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
     req->cbarg = ex;
 
     method      = htparser_get_methodstr_m(evhtp_request_get_method(req));
-    ex->is_head = strcmp(method, "HEAD") == 0;
+
+    if (strcmp(method, "HEAD") == 0) {
+        HC_SET_FLAG(ex->flags, EX_IS_HEAD);
+    }
+
     query       = req->uri->query_raw ? (const char *)req->uri->query_raw : NULL;
 
     if (query == NULL) {
@@ -1763,7 +1815,7 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
      * so a body follows exactly when the HEADERS frame did not end the
      * stream (an upload of unknown length has neither Content-Length nor
      * chunked encoding, and would otherwise look bodiless). */
-    if (ex->h2) {
+    if (HC_TEST_FLAG(ex->flags, EX_H2)) {
         if (req->flags & EVHTP_REQ_FLAG_END_STREAM) {
             entity = NULL;
         } else if (entity == NULL) {
@@ -1775,7 +1827,7 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
 
     /* Declared body over the limit: answered 413 below, never read. */
     if (srv->max_body > 0 && entity && entity->content_length > srv->max_body) {
-        ex->too_large = 1;
+        HC_SET_FLAG(ex->flags, EX_TOO_LARGE);
         srv->stats.rq_too_large++;
     }
 
@@ -1787,7 +1839,7 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
         const char *expect = hc_headers_get(h, "expect");
 
         if (expect && has_token(expect, "100-continue") && req->proto == EVHTP_PROTO_11 &&
-            entity != NULL && !ex->too_large) {
+            entity != NULL && !HC_TEST_FLAG(ex->flags, EX_TOO_LARGE)) {
             evbuffer_add(bufferevent_get_output(evhtp_connection_get_bev(ex->conn)),
                          "HTTP/1.1 100 Continue\r\n\r\n", 25);
         }
@@ -1796,7 +1848,7 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
     head.method    = method;
     head.target    = target;
     head.authority = hc_headers_get(h, "host");
-    head.version   = ex->h2 ? 20 : req->proto == EVHTP_PROTO_10 ? 10 : 11;
+    head.version   = HC_TEST_FLAG(ex->flags, EX_H2) ? 20 : req->proto == EVHTP_PROTO_10 ? 10 : 11;
     head.headers   = h;
 
     /* Interceptors: they may change the headers; one may refuse the
@@ -1805,7 +1857,7 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
     {
         int rv = 0;
 
-        if (ex->too_large) {
+        if (HC_TEST_FLAG(ex->flags, EX_TOO_LARGE)) {
             rv = 413;
         } else if (ex->proc) {
             hc_http_request r = { head.method, head.target, head.authority, head.version, h };
@@ -1821,7 +1873,10 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
             if (rf) {
                 rf->base.vtbl = &refused_vtbl;
                 rf->status    = rv;
-                rf->close     = ex->too_large;
+
+                if (HC_TEST_FLAG(ex->flags, EX_TOO_LARGE)) {
+                    HC_SET_FLAG(rf->flags, RF_CLOSE);
+                }
                 ex->h         = &rf->base;
             } else {
                 ex->h = &not_found_handler; /* out of memory: still answer */
@@ -1859,15 +1914,15 @@ srv_task_cb(evutil_socket_t fd, short what, void *arg)
         /* HTTP/2: reset just this stream; the connection's other streams go
          * on. libevhtp frees the request once the reset is sent, and the
          * fini hook schedules T_FINISH as usual. */
-        if (ex->h2 && ex->req) {
-            if (ex->reset) {
+        if (HC_TEST_FLAG(ex->flags, EX_H2) && ex->req) {
+            if (HC_TEST_FLAG(ex->flags, EX_RESET)) {
                 return;                 /* already on its way */
             }
 
             chan_detach(&ex->out);      /* nothing more for this stream */
 
             if (evhtp_request_reset_stream(ex->req, 0x2 /* INTERNAL_ERROR */) == 0) {
-                ex->reset = 1;
+                HC_SET_FLAG(ex->flags, EX_RESET);
                 return;
             }
         }
@@ -1877,26 +1932,27 @@ srv_task_cb(evutil_socket_t fd, short what, void *arg)
         return;
     }
 
-    if (todo & T_PRODUCE && !ex->failed && !ex->released &&
-        ex->out.bev && !ex->out.ended && ex->h->vtbl->produce) {
+    if (todo & T_PRODUCE && !HC_TEST_FLAG(ex->flags, EX_FAILED | EX_RELEASED) &&
+        ex->out.bev && !HC_TEST_FLAG(ex->out.flags, CH_ENDED) && ex->h->vtbl->produce) {
         ex->h->vtbl->produce(ex->h, &ex->out);
     }
 
     if (todo & T_FINISH && ex->req == NULL) {
-        if (!ex->released) {
-            ex->released = 1;
+        if (!HC_TEST_FLAG(ex->flags, EX_RELEASED)) {
+            HC_SET_FLAG(ex->flags, EX_RELEASED);
 
-            if (ex->failed && ex->h->vtbl->failed) {
+            if (HC_TEST_FLAG(ex->flags, EX_FAILED) && ex->h->vtbl->failed) {
                 ex->h->vtbl->failed(ex->h, ex->reason);
             }
 
-            if (ex->finished && !ex->failed) {
+            if (HC_TEST_FLAG(ex->flags, EX_FINISHED) && !HC_TEST_FLAG(ex->flags, EX_FAILED)) {
                 ex->srv->stats.rq_completed++;
             }
 
-            if (ex->finished && !ex->failed && ex->srv->listener.on_exchange_complete) {
+            if (HC_TEST_FLAG(ex->flags, EX_FINISHED) && !HC_TEST_FLAG(ex->flags, EX_FAILED) &&
+                ex->srv->listener.on_exchange_complete) {
                 ex->srv->listener.on_exchange_complete(ex->srv->listener.arg, ex->remote,
-                                                       ex->keep_alive);
+                                                       HC_TEST_FLAG(ex->flags, EX_KEEP_ALIVE));
             }
 
             ex->h->vtbl->release(ex->h);
@@ -1915,7 +1971,8 @@ srv_task_cb(evutil_socket_t fd, short what, void *arg)
 
         /* Draining: an HTTP/2 connection does not close by itself after a
          * stream (HTTP/1.x ones do, keep-alive off); look again. */
-        if (ex->h2 && ex->srv->draining && ex->srv->drain_ev && !ex->srv->closing) {
+        if (HC_TEST_FLAG(ex->flags, EX_H2) && HC_TEST_FLAG(ex->srv->flags, SRV_DRAINING) &&
+            !HC_TEST_FLAG(ex->srv->flags, SRV_CLOSING) && ex->srv->drain_ev) {
             event_active(ex->srv->drain_ev, EV_TIMEOUT, 0);
         }
 
@@ -1970,18 +2027,18 @@ srv_conn_fini(evhtp_connection_t *c, void *arg)
 
     n->srv->stats.cx_active--;
     n->srv->stats.cx_destroy++;
-    if (n->h2) {
+    if (HC_TEST_FLAG(n->flags, SC_H2)) {
         n->srv->stats.cx_http2_active--;
     } else {
         n->srv->stats.cx_http1_active--;
     }
-    if (n->tls) {
+    if (HC_TEST_FLAG(n->flags, SC_TLS)) {
         n->srv->stats.cx_ssl_active--;
 
         /* Closed during the handshake without an event saying why (e.g. by
          * the server): a failed connection all the same, unless the server
          * itself is shutting down. */
-        if (n->tls_state == 0 && !n->srv->closing) {
+        if (n->tls_state == 0 && !HC_TEST_FLAG(n->srv->flags, SRV_CLOSING)) {
             n->srv->stats.ssl_connection_error++;
         }
     }
@@ -2102,7 +2159,7 @@ srv_conn_event(evhtp_connection_t *c, short events, void *arg)
     (void)c;    /* unused without HTTP/2 */
 
 #ifdef HC_HAVE_TLS
-    if (n->tls && n->tls_state == 0 && c->ssl) {
+    if (HC_TEST_FLAG(n->flags, SC_TLS) && n->tls_state == 0 && c->ssl) {
         if (events & BEV_EVENT_CONNECTED) {
             srv_tls_done(n, c);
         } else if (events & (BEV_EVENT_ERROR | BEV_EVENT_EOF | BEV_EVENT_TIMEOUT)) {
@@ -2111,8 +2168,8 @@ srv_conn_event(evhtp_connection_t *c, short events, void *arg)
     }
 #endif
 
-    if ((events & BEV_EVENT_CONNECTED) && conn_is_h2(c) && !n->h2) {
-        n->h2 = 1;
+    if ((events & BEV_EVENT_CONNECTED) && conn_is_h2(c) && !HC_TEST_FLAG(n->flags, SC_H2)) {
+        HC_SET_FLAG(n->flags, SC_H2);
         n->srv->stats.cx_http1_total--;
         n->srv->stats.cx_http1_active--;
         n->srv->stats.cx_http2_total++;
@@ -2154,12 +2211,14 @@ srv_post_accept(evhtp_connection_t *c, void *arg)
     evhtp_connection_set_hook(c, evhtp_hook_on_event, (evhtp_hook)srv_conn_event, n);
 
     /* Counted as HTTP/1 until a TLS handshake says h2 (srv_conn_event). */
-    n->tls = c->ssl != NULL;
+    if (c->ssl != NULL) {
+        HC_SET_FLAG(n->flags, SC_TLS);
+    }
     s->stats.cx_total++;
     s->stats.cx_active++;
     s->stats.cx_http1_total++;
     s->stats.cx_http1_active++;
-    if (n->tls) {
+    if (HC_TEST_FLAG(n->flags, SC_TLS)) {
         s->stats.cx_ssl_total++;
         s->stats.cx_ssl_active++;
     }
@@ -2185,7 +2244,7 @@ hc_server_new(hc_reactor *r, hc_server_handler_factory factory, void *arg)
 
     s->r       = r;
 #ifdef HC_HAVE_H2
-    s->http2   = 1;             /* as libevhtp: h2 when TLS is on */
+    HC_SET_FLAG(s->flags, SRV_HTTP2);             /* as libevhtp: h2 when TLS is on */
 #endif
     s->factory = factory;
     s->arg     = arg;
@@ -2419,7 +2478,7 @@ hc_server_enable_tls_opts(hc_server *s, const hc_server_tls_options *o, char *er
 #ifdef HC_HAVE_H2
     /* Built with HTTP/2: libevhtp's ALPN callback (installed by
      * evhtp_ssl_init(), preferring h2) stays, unless switched off. */
-    if (!s->http2)
+    if (!HC_TEST_FLAG(s->flags, SRV_HTTP2))
 #endif
     SSL_CTX_set_alpn_select_cb(ctx, srv_alpn_http11, NULL);
 
@@ -2461,7 +2520,12 @@ hc_server_set_http2(hc_server *s, int enabled)
 #endif
 
 #ifdef HC_HAVE_H2
-    s->http2 = enabled != 0;
+    if (enabled) {
+        HC_SET_FLAG(s->flags, SRV_HTTP2);
+    } else {
+        HC_CLEAR_FLAG(s->flags, SRV_HTTP2);
+    }
+
     return 0;
 #else
     return enabled ? -1 : 0;    /* this libevhtp has no HTTP/2 */
@@ -2565,7 +2629,7 @@ hc_server_resume_accept(hc_server *s)
         return -1;
     }
 
-    s->draining = 0;
+    HC_CLEAR_FLAG(s->flags, SRV_DRAINING);
     return s->htp->server ? evconnlistener_enable(s->htp->server) : -1;
 }
 
@@ -2580,7 +2644,7 @@ srv_drain_cb(evutil_socket_t fd, short what, void *arg)
     (void)fd;
     (void)what;
 
-    if (!s->draining) {
+    if (!HC_TEST_FLAG(s->flags, SRV_DRAINING)) {
         return;                         /* resumed before we ran */
     }
 
@@ -2612,10 +2676,10 @@ srv_drain_cb(evutil_socket_t fd, short what, void *arg)
              * keep-alive connection, the client retries. */
             drop_output(evhtp_connection_get_bev(c));
             evhtp_connection_free(c);
-        } else if (busy->h2) {
+        } else if (HC_TEST_FLAG(busy->flags, EX_H2)) {
             /* Streams under way: closed when the last one is done (see
              * srv_task_cb). */
-        } else if (busy->finished) {
+        } else if (HC_TEST_FLAG(busy->flags, EX_FINISHED)) {
             /* Finished before the drain, still flushing: don't let
              * libevhtp keep it alive for another request. */
             busy->req->flags &= ~EVHTP_REQ_FLAG_KEEPALIVE;
@@ -2631,7 +2695,7 @@ hc_server_drain(hc_server *s)
         return;
     }
 
-    s->draining = 1;
+    HC_SET_FLAG(s->flags, SRV_DRAINING);
     hc_server_pause_accept(s);
 
     if (s->drain_ev == NULL) {
@@ -2658,7 +2722,7 @@ hc_server_free(hc_server *s)
         }
 
         evhtp_unbind_socket(s->htp);
-        s->closing = 1;
+        HC_SET_FLAG(s->flags, SRV_CLOSING);
 
         while (s->conns) {
             evhtp_connection_t *c = s->conns->c;
@@ -2715,6 +2779,12 @@ hc_server_free(hc_server *s)
 
 typedef struct hc_pconn hc_pconn;
 
+/* struct hc_requester: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    RQ_TLS_NO_VERIFY = 1u << 0,
+    RQ_CLOSING       = 1u << 1,   /* hc_requester_free() in progress */
+};
+
 struct hc_requester {
     hc_reactor *r;
     hc_pool    *pool;
@@ -2722,13 +2792,12 @@ struct hc_requester {
     hc_timer   *housekeeping;
 #ifdef HC_HAVE_TLS
     SSL_CTX    *tls_ctx;
-    int         tls_no_verify;
+    unsigned    flags;  /* RQ_*, above */
 #endif
     /* Everything hc_requester_free() must finish before the pool goes:
      * its tasks and timers would otherwise run later on the loop. */
     struct hc_connect_op *ops;
     struct hc_endpoint   *eps;
-    int                   closing;  /* hc_requester_free() in progress */
     hc_processor         *processor; /* interceptors (own reference) */
     int64_t               read_timeout_ms;  /* exchange defaults (0: none) */
     int64_t               write_timeout_ms;
@@ -2748,6 +2817,12 @@ struct hc_connect_op {
     hc_connect_op *prev, *next;  /* rq->ops */
 };
 
+/* struct hc_endpoint: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    EP_RELEASE_PENDING = 1u << 0,
+    EP_REUSE           = 1u << 1,
+};
+
 struct hc_endpoint {
     hc_requester       *rq;
     hc_pool_entry      *entry;
@@ -2756,8 +2831,7 @@ struct hc_endpoint {
      * responses arrive in this order. cx is the oldest, NULL when idle. */
     hc_client_exchange *cx;
     hc_client_exchange *tail;
-    int                 release_pending;
-    int                 reuse;
+    unsigned            flags;  /* EP_*, above */
     hc_timer           *task;
     hc_endpoint        *prev, *next;    /* rq->eps */
 };
@@ -2768,22 +2842,27 @@ enum {
     P_LOST           = 1u << 2,
 };
 
+/* struct hc_pconn: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    PC_RESOLVING = 1u << 0,
+    PC_DEAD      = 1u << 1,   /* closed, or idle and broken */
+    PC_CLOSING   = 1u << 2,   /* pc_destroy() in progress */
+    PC_IDLE      = 1u << 3,   /* parked in the pool */
+    PC_REUSABLE  = 1u << 4,   /* verdict of the last exchange */
+};
+
 struct hc_pconn {
     hc_reactor          *r;
     hc_requester        *rq;          /* NULL: unpooled                    */
     hc_host              target;
     struct evdns_getaddrinfo_request *dns_req;  /* https: resolving        */
-    int                  resolving;
+    unsigned             flags;  /* PC_*, above */
     char                 err[512];    /* why connecting failed, if known   */
     hc_pool_entry       *entry;
     evhtp_connection_t  *conn;        /* NULL once libevhtp freed it       */
     hc_client_exchange  *cx;          /* the exchange the incoming response
                                        * belongs to (libevhtp's request)    */
     hc_connect_op       *op;          /* connecting for this op            */
-    int                  dead;        /* closed, or idle and broken        */
-    int                  closing;     /* pc_destroy() in progress          */
-    int                  idle;        /* parked in the pool                */
-    int                  reusable;    /* verdict of the last exchange      */
     int64_t              keep_alive_ms;
     bufferevent_data_cb  saved_read;
     bufferevent_data_cb  saved_write;
@@ -2800,52 +2879,56 @@ struct hc_request_channel {
     hc_client_exchange *cx;
 };
 
+/* struct hc_client_exchange: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    CX_REQ_ATTACHED    = 1u << 0,   /* conn owns req after make_request */
+    CX_HEAD_SENT       = 1u << 1,
+    CX_RESP_HEAD       = 1u << 2,
+    CX_CLOSE_DELIMITED = 1u << 3,
+    CX_RAW_MODE        = 1u << 4,   /* reading a read-until-close body */
+    CX_INTERPOSED      = 1u << 5,   /* our read cb sits before libevhtp's */
+    CX_RESP_KEEPALIVE  = 1u << 6,
+    CX_DONE            = 1u << 7,   /* response complete */
+    CX_END_DELIVERED   = 1u << 8,
+    CX_FAILED          = 1u << 9,
+    CX_RELEASED        = 1u << 10,
+    CX_INPUT_SUSPENDED = 1u << 11,
+    CX_REQ_SENT        = 1u << 12,  /* request complete: read timeout runs */
+    CX_TIMEOUTS_ON     = 1u << 13,  /* set on the connection */
+    CX_STARTED         = 1u << 14,  /* T_START scheduled */
+    CX_PIPELINE_OK     = 1u << 15,  /* a request may follow this one before its
+                                     * response (not HEAD, CONNECT, HTTP/1.0
+                                     * or "Connection: close") */
+    CX_HANDED_OVER     = 1u << 16,  /* the connection's response stream moved on to ep_next */
+    CX_PARSER_INTERIM  = 1u << 17,  /* libevhtp's parser delivered a 1xx: its
+                                     * "completion" is not the end */
+};
+
 struct hc_client_exchange {
     hc_reactor         *r;
     hc_client_handler  *h;
     hc_pconn           *pc;            /* NULL if its connection was destroyed */
     hc_endpoint        *ep;            /* NULL: unpooled exchange            */
     evhtp_request_t    *req;           /* NULL once freed                    */
-    int                 req_attached;  /* conn owns req after make_request   */
+    unsigned            flags;  /* CX_*, above */
     hc_request_channel  rc;
     hc_data_channel     out;
     struct event       *task;
     unsigned            pending;
-    int                 head_sent;
-    int                 resp_head;
-    int                 close_delimited;
-    int                 raw_mode;      /* reading a read-until-close body    */
-    int                 interposed;    /* our read cb sits before libevhtp's */
     bufferevent_data_cb  ip_read;      /* libevhtp's callbacks, while so     */
     bufferevent_data_cb  ip_write;
     bufferevent_event_cb ip_event;
     void                *ip_arg;
-    int                 resp_keepalive;
     int64_t             keep_alive_ms;
-    int                 done;          /* response complete                  */
-    int                 end_delivered;
-    int                 failed;
-    int                 released;
-    int                 input_suspended;
     const char         *reason;
     int64_t             read_ms;       /* hc_client_set_timeouts(); -1: default */
     int64_t             write_ms;
-    int                 req_sent;      /* request complete: read timeout runs */
-    int                 timeouts_on;   /* set on the connection             */
     hc_context         *ctx;           /* interceptors' and handler's       */
     const hc_processor *proc;          /* the requester's (borrowed), or NULL */
     const hc_requester_listener *lis;  /* the requester's, or NULL (unpooled) */
     char                remote[64];    /* for the listener, from the request on */
     /* Pipelining (endpoint exchanges) */
     hc_client_exchange *ep_next;       /* next exchange on the endpoint      */
-    int                 started;       /* T_START scheduled                  */
-    int                 pipeline_ok;   /* a request may follow this one before
-                                        * its response (not HEAD, CONNECT,
-                                        * HTTP/1.0 or "Connection: close")  */
-    int                 handed_over;   /* the connection's response stream
-                                        * moved on to ep_next               */
-    int                 parser_interim; /* libevhtp's parser delivered a 1xx:
-                                        * its "completion" is not the end   */
 };
 
 static void cli_task_cb(evutil_socket_t fd, short what, void *arg);
@@ -2880,7 +2963,7 @@ cli_on_request_end(void *owner)
 {
     hc_client_exchange *cx = owner;
 
-    cx->req_sent = 1;           /* the response may still flow */
+    HC_SET_FLAG(cx->flags, CX_REQ_SENT);           /* the response may still flow */
     cx_apply_timeouts(cx);
 
     if (cx->ep) {
@@ -2919,8 +3002,8 @@ pc_remote(hc_pconn *pc)
 static void
 cli_fail(hc_client_exchange *cx, const char *reason)
 {
-    if (!cx->done && !cx->failed) {
-        cx->failed = 1;
+    if (!HC_TEST_FLAG(cx->flags, CX_DONE | CX_FAILED)) {
+        HC_SET_FLAG(cx->flags, CX_FAILED);
         cx->reason = reason;
     }
 }
@@ -3067,9 +3150,9 @@ pc_on_conn_fini(evhtp_connection_t *c, void *arg)
     }
 
     pc->conn = NULL;
-    pc->dead = 1;
+    HC_SET_FLAG(pc->flags, PC_DEAD);
 
-    if (pc->closing) {
+    if (HC_TEST_FLAG(pc->flags, PC_CLOSING)) {
         return EVHTP_RES_OK;
     }
 
@@ -3087,7 +3170,7 @@ pc_on_conn_fini(evhtp_connection_t *c, void *arg)
         schedule(pc->task, &pc->pending, P_CONNECT_FAILED);
     }
 
-    if (pc->idle) {
+    if (HC_TEST_FLAG(pc->flags, PC_IDLE)) {
         schedule(pc->task, &pc->pending, P_LOST);
     }
 
@@ -3107,7 +3190,7 @@ static void
 pc_fail_early(hc_pconn *pc, const char *why)
 {
     snprintf(pc->err, sizeof(pc->err), "%s", why);
-    pc->dead = 1;
+    HC_SET_FLAG(pc->flags, PC_DEAD);
     schedule(pc->task, &pc->pending, P_CONNECT_FAILED);
 }
 
@@ -3142,7 +3225,7 @@ pc_resolved(int err, struct evutil_addrinfo *res, void *arg)
         return;
     }
 
-    pc->resolving = 0;
+    HC_CLEAR_FLAG(pc->flags, PC_RESOLVING);
     pc->dns_req   = NULL;
 
     if (err || res == NULL) {
@@ -3177,7 +3260,7 @@ pc_resolved(int err, struct evutil_addrinfo *res, void *arg)
         SSL_set_tlsext_host_name(ssl, tls_name);            /* SNI */
     }
 
-    if (!pc->rq->tls_no_verify) {
+    if (!HC_TEST_FLAG(pc->rq->flags, RQ_TLS_NO_VERIFY)) {
         if (is_ip_literal(tls_name)) {
             X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), tls_name);
         } else {
@@ -3201,7 +3284,7 @@ pc_new(hc_reactor *r, hc_requester *rq, const hc_host *target)
     pc->r        = r;
     pc->rq       = rq;
     pc->target   = *target;
-    pc->reusable = 1;               /* a fresh connection is reusable */
+    HC_SET_FLAG(pc->flags, PC_REUSABLE);               /* a fresh connection is reusable */
     pc->keep_alive_ms = rq ? rq->default_keep_alive_ms : 0;
 
     if ((pc->task = event_new(r->base, -1, 0, pc_task_cb, pc)) == NULL) {
@@ -3233,10 +3316,10 @@ pc_new(hc_reactor *r, hc_requester *rq, const hc_host *target)
         hints.ai_socktype = SOCK_STREAM;
         hints.ai_protocol = IPPROTO_TCP;
 
-        pc->resolving = 1;
+        HC_SET_FLAG(pc->flags, PC_RESOLVING);
         req           = evdns_getaddrinfo(r->dns, target->name, NULL, &hints, pc_resolved, pc);
 
-        if (pc->resolving) {                /* not answered synchronously */
+        if (HC_TEST_FLAG(pc->flags, PC_RESOLVING)) {                /* not answered synchronously */
             pc->dns_req = req;
         }
     }
@@ -3269,7 +3352,7 @@ pc_destroy(hc_pconn *pc)
     }
 
     if (pc->conn) {
-        pc->closing = 1;
+        HC_SET_FLAG(pc->flags, PC_CLOSING);
         evhtp_connection_free(pc->conn);
     }
 
@@ -3293,11 +3376,11 @@ pool_close_conn(void *ctx, void *conn)
 static void
 pc_idle_broken(hc_pconn *pc)
 {
-    if (pc->dead) {
+    if (HC_TEST_FLAG(pc->flags, PC_DEAD)) {
         return;
     }
 
-    pc->dead = 1;
+    HC_SET_FLAG(pc->flags, PC_DEAD);
     bufferevent_disable(evhtp_connection_get_bev(pc->conn), EV_READ | EV_WRITE);
     schedule(pc->task, &pc->pending, P_LOST);
 }
@@ -3322,7 +3405,7 @@ pc_set_idle(hc_pconn *pc)
 {
     struct bufferevent *bev = evhtp_connection_get_bev(pc->conn);
 
-    if (pc->idle) {
+    if (HC_TEST_FLAG(pc->flags, PC_IDLE)) {
         return;                 /* already parked: keep libevhtp's saved cbs */
     }
 
@@ -3330,19 +3413,19 @@ pc_set_idle(hc_pconn *pc)
                       &pc->saved_arg);
     bufferevent_setcb(bev, pc_idle_read, NULL, pc_idle_event, pc);
     bufferevent_enable(bev, EV_READ);   /* notice the peer closing */
-    pc->idle = 1;
+    HC_SET_FLAG(pc->flags, PC_IDLE);
 }
 
 static void
 pc_set_active(hc_pconn *pc)
 {
-    if (!pc->idle) {
+    if (!HC_TEST_FLAG(pc->flags, PC_IDLE)) {
         return;
     }
 
     bufferevent_setcb(evhtp_connection_get_bev(pc->conn), pc->saved_read,
                       pc->saved_write, pc->saved_event, pc->saved_arg);
-    pc->idle = 0;
+    HC_CLEAR_FLAG(pc->flags, PC_IDLE);
 }
 
 /* --- exchanges ---------------------------------------------------------------- */
@@ -3400,8 +3483,8 @@ cx_new(hc_reactor *r, hc_client_handler *h)
 static void
 cli_interpose_end(hc_client_exchange *cx, struct bufferevent *bev)
 {
-    if (cx->interposed) {
-        cx->interposed = 0;
+    if (HC_TEST_FLAG(cx->flags, CX_INTERPOSED)) {
+        HC_CLEAR_FLAG(cx->flags, CX_INTERPOSED);
         bufferevent_setcb(bev, cx->ip_read, cx->ip_write, cx->ip_event, cx->ip_arg);
     }
 }
@@ -3456,11 +3539,11 @@ cli_deliver_interim(hc_client_exchange *cx, const char *msg, size_t len)
         line = eol;
     }
 
-    if (cx->lis && cx->lis->on_response_head && !cx->released) {
+    if (cx->lis && cx->lis->on_response_head && !HC_TEST_FLAG(cx->flags, CX_RELEASED)) {
         cx->lis->on_response_head(cx->lis->arg, cx->remote, &head);
     }
 
-    if (!cx->failed && !cx->released && cx->h->vtbl->consume_information) {
+    if (!HC_TEST_FLAG(cx->flags, CX_FAILED | CX_RELEASED) && cx->h->vtbl->consume_information) {
         cx->h->vtbl->consume_information(cx->h, &head);
     }
 
@@ -3542,7 +3625,7 @@ cli_interpose_begin(hc_client_exchange *cx, struct bufferevent *bev)
 {
     bufferevent_getcb(bev, &cx->ip_read, &cx->ip_write, &cx->ip_event, &cx->ip_arg);
     bufferevent_setcb(bev, cli_pre_read, cli_pre_write, cli_pre_event, cx);
-    cx->interposed = 1;
+    HC_SET_FLAG(cx->flags, CX_INTERPOSED);
 }
 
 hc_data_channel *
@@ -3555,7 +3638,7 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
     hc_headers         *own_headers = NULL;
     char                num[32];
 
-    if (cx->head_sent || conn == NULL || cx->req == NULL || cx->failed) {
+    if (HC_TEST_FLAG(cx->flags, CX_HEAD_SENT | CX_FAILED) || conn == NULL || cx->req == NULL) {
         return NULL;
     }
 
@@ -3565,7 +3648,7 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
         return NULL;
     }
 
-    cx->head_sent = 1;
+    HC_SET_FLAG(cx->flags, CX_HEAD_SENT);
 
     /* Interceptors work on a copy of the headers: the caller's are const. */
     if (cx->proc) {
@@ -3603,8 +3686,10 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
     {
         const char *v = hc_headers_get(own_headers ? own_headers : head->headers, "connection");
 
-        cx->pipeline_ok = m != htp_method_HEAD && m != htp_method_CONNECT &&
-                          head->version != 10 && !(v && has_token(v, "close"));
+        if (m != htp_method_HEAD && m != htp_method_CONNECT && head->version != 10 &&
+            !(v && has_token(v, "close"))) {
+            HC_SET_FLAG(cx->flags, CX_PIPELINE_OK);
+        }
     }
 
     /* Requester listener: from here on this exchange reports to it. */
@@ -3640,7 +3725,7 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
         /* The connection's next response is ours: libevhtp parses into
          * this request. */
         evhtp_make_request(conn, cx->req, (htp_method)m, head->target);
-        cx->req_attached = 1;
+        HC_SET_FLAG(cx->flags, CX_REQ_ATTACHED);
         cli_interpose_begin(cx, evhtp_connection_get_bev(conn));
     } else {
         /* Pipelined behind responses still to come: write the request,
@@ -3653,7 +3738,7 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
     }
 
     if (entity == NULL) {
-        cx->req_sent = 1;
+        HC_SET_FLAG(cx->flags, CX_REQ_SENT);
         cx_apply_timeouts(cx);
 
         if (cx->ep) {
@@ -3668,8 +3753,8 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
                 cli_schedule_produce, cli_on_request_end);
 
     if (entity->content_length == 0) {
-        cx->out.ended = 1;
-        cx->req_sent  = 1;
+        HC_SET_FLAG(cx->out.flags, CH_ENDED);
+        HC_SET_FLAG(cx->flags, CX_REQ_SENT);
 
         if (cx->ep) {
             ep_kick(cx->ep);
@@ -3686,8 +3771,8 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
 void
 hc_client_suspend_input(hc_client_exchange *cx)
 {
-    if (cx_conn(cx) && !cx->done && !cx->input_suspended) {
-        cx->input_suspended = 1;
+    if (cx_conn(cx) && !HC_TEST_FLAG(cx->flags, CX_DONE | CX_INPUT_SUSPENDED)) {
+        HC_SET_FLAG(cx->flags, CX_INPUT_SUSPENDED);
         bufferevent_disable(evhtp_connection_get_bev(cx_conn(cx)), EV_READ);
     }
 }
@@ -3695,8 +3780,9 @@ hc_client_suspend_input(hc_client_exchange *cx)
 void
 hc_client_resume_input(hc_client_exchange *cx)
 {
-    if (cx_conn(cx) && !cx->done && cx->input_suspended) {
-        cx->input_suspended = 0;
+    if (cx_conn(cx) && HC_TEST_FLAG(cx->flags, CX_INPUT_SUSPENDED) &&
+        !HC_TEST_FLAG(cx->flags, CX_DONE)) {
+        HC_CLEAR_FLAG(cx->flags, CX_INPUT_SUSPENDED);
         bufferevent_enable(evhtp_connection_get_bev(cx_conn(cx)), EV_READ);
     }
 }
@@ -3720,8 +3806,8 @@ cx_apply_timeouts(hc_client_exchange *cx)
     int64_t             r = cx->read_ms, w = cx->write_ms;
     struct timeval      rt, wt;
 
-    if (c == NULL || !cx->head_sent || cx->done || cx->failed || cx->released ||
-        cx->pc->cx != cx) {
+    if (c == NULL || !HC_TEST_FLAG(cx->flags, CX_HEAD_SENT) ||
+        HC_TEST_FLAG(cx->flags, CX_DONE | CX_FAILED | CX_RELEASED) || cx->pc->cx != cx) {
         return;                 /* a pipelined exchange: applied at hand-over */
     }
 
@@ -3733,11 +3819,11 @@ cx_apply_timeouts(hc_client_exchange *cx)
         w = cx->ep ? cx->ep->rq->write_timeout_ms : 0;
     }
 
-    if (!cx->req_sent) {
+    if (!HC_TEST_FLAG(cx->flags, CX_REQ_SENT)) {
         r = 0;
     }
 
-    if (r <= 0 && w <= 0 && !cx->timeouts_on) {
+    if (r <= 0 && w <= 0 && !HC_TEST_FLAG(cx->flags, CX_TIMEOUTS_ON)) {
         return;
     }
 
@@ -3745,13 +3831,17 @@ cx_apply_timeouts(hc_client_exchange *cx)
     ms_to_tv(w, &wt);
     bufferevent_set_timeouts(evhtp_connection_get_bev(c), r > 0 ? &rt : NULL,
                              w > 0 ? &wt : NULL);
-    cx->timeouts_on = r > 0 || w > 0;
+    if (r > 0 || w > 0) {
+        HC_SET_FLAG(cx->flags, CX_TIMEOUTS_ON);
+    } else {
+        HC_CLEAR_FLAG(cx->flags, CX_TIMEOUTS_ON);
+    }
 }
 
 void
 hc_client_set_timeouts(hc_client_exchange *cx, int64_t read_ms, int64_t write_ms)
 {
-    if (cx == NULL || cx->released) {
+    if (cx == NULL || HC_TEST_FLAG(cx->flags, CX_RELEASED)) {
         return;
     }
 
@@ -3763,7 +3853,7 @@ hc_client_set_timeouts(hc_client_exchange *cx, int64_t read_ms, int64_t write_ms
 void
 hc_client_cancel(hc_client_exchange *cx)
 {
-    if (cx == NULL || cx->released) {
+    if (cx == NULL || HC_TEST_FLAG(cx->flags, CX_RELEASED)) {
         return;
     }
 
@@ -3784,9 +3874,10 @@ cli_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
     const hc_entity    *entity;
     const char         *v;
     int                 status = (int)evhtp_request_status(req);
+    int                 close_delimited = 0;
     int                 body_possible;
 
-    if (cx->resp_head || cx->done) {
+    if (HC_TEST_FLAG(cx->flags, CX_RESP_HEAD | CX_DONE)) {
         return EVHTP_RES_ERROR; /* unsolicited second response: drop conn */
     }
 
@@ -3802,42 +3893,49 @@ cli_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
     if (status >= 100 && status < 200 && status != 101) {
         hc_response_head interim = { status, htparser_get_minor(c->parser) == 0 ? 10 : 11, h };
 
-        if (cx->lis && cx->lis->on_response_head && !cx->released) {
+        if (cx->lis && cx->lis->on_response_head && !HC_TEST_FLAG(cx->flags, CX_RELEASED)) {
             cx->lis->on_response_head(cx->lis->arg, cx->remote, &interim);
         }
 
-        if (!cx->failed && !cx->released && cx->h->vtbl->consume_information) {
+        if (!HC_TEST_FLAG(cx->flags, CX_FAILED | CX_RELEASED) && cx->h->vtbl->consume_information) {
             cx->h->vtbl->consume_information(cx->h, &interim);
         }
 
-        cx->parser_interim = 1;
+        HC_SET_FLAG(cx->flags, CX_PARSER_INTERIM);
         hc_headers_free(h);
         return EVHTP_RES_OK;
     }
 
     body_possible = !(status < 200 || status == 204 || status == 304);
-    entity        = entity_from_headers(h, &e, body_possible, 1, &cx->close_delimited);
+    entity        = entity_from_headers(h, &e, body_possible, 1, &close_delimited);
+
+    if (close_delimited) {
+        HC_SET_FLAG(cx->flags, CX_CLOSE_DELIMITED);
+    }
 
     /* A HEAD response describes the entity but carries no body bytes.
      * Report the entity so a proxy can forward the Content-Length, but
      * never wait for a read-until-close body. */
     if (req->method == htp_method_HEAD) {
-        cx->close_delimited = 0;
+        HC_CLEAR_FLAG(cx->flags, CX_CLOSE_DELIMITED);
     }
 
     head.status   = status;
     head.version  = htparser_get_minor(c->parser) == 0 ? 10 : 11;
     head.headers  = h;
-    cx->resp_head = 1;
+    HC_SET_FLAG(cx->flags, CX_RESP_HEAD);
 
     /* Persistence (RFC 9112 9.3) and keep-alive duration (httpcore5's
      * DefaultConnectionKeepAliveStrategy). */
     v = hc_headers_get(h, "connection");
-    cx->resp_keepalive = head.version == 11 ? !(v && has_token(v, "close"))
-                                            : (v && has_token(v, "keep-alive"));
+    if (head.version == 11 ? !(v && has_token(v, "close"))
+                           : (v && has_token(v, "keep-alive"))) {
+        HC_SET_FLAG(cx->flags, CX_RESP_KEEPALIVE);
+    }
 
     if (status == 101) {
-        cx->resp_keepalive = 0;     /* the connection now speaks something else */
+        /* the connection now speaks something else */
+        HC_CLEAR_FLAG(cx->flags, CX_RESP_KEEPALIVE);
     }
     v = hc_headers_get(h, "keep-alive");
     cx->keep_alive_ms = v ? keep_alive_timeout_ms(v) : -1;
@@ -3847,20 +3945,20 @@ cli_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
     }
 
     /* Requester listener: the head as received. */
-    if (cx->lis && cx->lis->on_response_head && !cx->released) {
+    if (cx->lis && cx->lis->on_response_head && !HC_TEST_FLAG(cx->flags, CX_RELEASED)) {
         cx->lis->on_response_head(cx->lis->arg, cx->remote, &head);
     }
 
     /* Interceptors: after the engine has read framing and persistence from
      * the headers as received, before the handler sees them. */
-    if (cx->proc && !cx->failed && !cx->released) {
+    if (cx->proc && !HC_TEST_FLAG(cx->flags, CX_FAILED | CX_RELEASED)) {
         hc_http_response r = { head.status, head.version, h };
 
         hc_context_set_protocol(cx->ctx, head.version, cx->pc && hc_host_is_tls(&cx->pc->target));
 
         if (hc_processor_process_response(cx->proc, &r, entity, cx->ctx) != 0) {
             cli_fail(cx, "response refused by interceptor");
-            cx->resp_keepalive = 0;
+            HC_CLEAR_FLAG(cx->flags, CX_RESP_KEEPALIVE);
             schedule(cx->task, &cx->pending, T_ABORT);
             hc_headers_free(h);
             return EVHTP_RES_OK;
@@ -3869,7 +3967,7 @@ cli_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
         head.status = r.status;
     }
 
-    if (!cx->failed && !cx->released) {
+    if (!HC_TEST_FLAG(cx->flags, CX_FAILED | CX_RELEASED)) {
         cx->h->vtbl->consume_response(cx->h, &head, entity);
     }
 
@@ -3878,8 +3976,8 @@ cli_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
     /* htparser does not know the request was HEAD and would wait for the
      * Content-Length bytes forever. The exchange is complete at the head;
      * T_FINISH delivers stream_end and resets the parser for reuse. */
-    if (req->method == htp_method_HEAD && !cx->failed) {
-        cx->done = 1;
+    if (req->method == htp_method_HEAD && !HC_TEST_FLAG(cx->flags, CX_FAILED)) {
+        HC_SET_FLAG(cx->flags, CX_DONE);
         schedule(cx->task, &cx->pending, T_FINISH);
     }
 
@@ -3894,7 +3992,7 @@ cli_on_read(evhtp_request_t *req, struct evbuffer *buf, void *arg)
 
     (void)req;
 
-    if (len && !cx->failed && !cx->released && !cx->done) {
+    if (len && !HC_TEST_FLAG(cx->flags, CX_FAILED | CX_RELEASED | CX_DONE)) {
         cx->h->vtbl->consume(cx->h, evbuffer_pullup(buf, (ev_ssize_t)len), len);
     }
 
@@ -3930,7 +4028,7 @@ cli_raw_read(struct bufferevent *bev, void *arg)
     size_t              len;
 
     while ((len = evbuffer_get_length(in)) > 0) {
-        if (!cx->failed && !cx->released) {
+        if (!HC_TEST_FLAG(cx->flags, CX_FAILED | CX_RELEASED)) {
             cx->h->vtbl->consume(cx->h, evbuffer_pullup(in, (ev_ssize_t)len), len);
         }
 
@@ -3951,7 +4049,7 @@ cli_raw_event(struct bufferevent *bev, short events, void *arg)
 
     if (events & BEV_EVENT_EOF) {
         cli_raw_read(bev, cx);
-        cx->done = 1;
+        HC_SET_FLAG(cx->flags, CX_DONE);
     } else if (events & BEV_EVENT_TIMEOUT) {
         cli_fail(cx, (events & BEV_EVENT_WRITING) ? "upstream write timeout"
                                                   : "upstream read timeout");
@@ -3981,18 +4079,20 @@ ep_kick(hc_endpoint *ep)
     hc_client_exchange *prev = NULL, *cx;
 
     for (cx = ep->cx; cx; prev = cx, cx = cx->ep_next) {
-        if (cx->started) {
+        if (HC_TEST_FLAG(cx->flags, CX_STARTED)) {
             continue;
         }
 
-        if (prev && (!prev->req_sent || !prev->pipeline_ok || prev->failed ||
-                     (prev->resp_head && !prev->resp_keepalive))) {
+        if (prev && (!HC_TEST_ALL(prev->flags, CX_REQ_SENT | CX_PIPELINE_OK) ||
+                     HC_TEST_FLAG(prev->flags, CX_FAILED) ||
+                     (HC_TEST_FLAG(prev->flags, CX_RESP_HEAD) &&
+                      !HC_TEST_FLAG(prev->flags, CX_RESP_KEEPALIVE)))) {
             break;              /* it waits for the connection to be its own */
         }
 
-        cx->started = 1;
+        HC_SET_FLAG(cx->flags, CX_STARTED);
 
-        if (ep->pc->conn == NULL || ep->pc->dead) {
+        if (ep->pc->conn == NULL || HC_TEST_FLAG(ep->pc->flags, PC_DEAD)) {
             cli_fail(cx, "upstream connection closed");
             schedule(cx->task, &cx->pending, T_FINISH);
         } else {
@@ -4011,15 +4111,17 @@ cx_hand_over(hc_client_exchange *cx, int in_readcb)
     hc_client_exchange *next = cx->ep ? cx->ep_next : NULL;
     evhtp_connection_t *conn = cx_conn(cx);
 
-    if (next == NULL || conn == NULL || cx->handed_over || !cx->done || cx->failed ||
-        cx->raw_mode || !cx->resp_keepalive || cx->pc->cx != cx ||
-        !next->head_sent || next->req_attached || next->req == NULL || next->failed) {
+    if (next == NULL || conn == NULL || cx->pc->cx != cx ||
+        HC_TEST_FLAG(cx->flags, CX_HANDED_OVER | CX_FAILED | CX_RAW_MODE) ||
+        !HC_TEST_ALL(cx->flags, CX_DONE | CX_RESP_KEEPALIVE) ||
+        !HC_TEST_FLAG(next->flags, CX_HEAD_SENT) ||
+        HC_TEST_FLAG(next->flags, CX_REQ_ATTACHED | CX_FAILED) || next->req == NULL) {
         return 0;
     }
 
     conn->request      = next->req;
-    next->req_attached = 1;
-    cx->handed_over    = 1;
+    HC_SET_FLAG(next->flags, CX_REQ_ATTACHED);
+    HC_SET_FLAG(cx->flags, CX_HANDED_OVER);
     cx->pc->cx         = next;
 
     /* libevhtp's read callback, finding bytes left after this response,
@@ -4033,7 +4135,7 @@ cx_hand_over(hc_client_exchange *cx, int in_readcb)
     /* A parser that read this response straight through left our 1xx
      * interposer in front of it: take it out before putting the next
      * exchange's there, or the two would chain. */
-    if (cx->interposed) {
+    if (HC_TEST_FLAG(cx->flags, CX_INTERPOSED)) {
         cli_interpose_end(cx, evhtp_connection_get_bev(conn));
     }
 
@@ -4054,23 +4156,23 @@ cli_on_complete(evhtp_request_t *req, void *arg)
 {
     hc_client_exchange *cx = arg;
 
-    if (cx->parser_interim) {
-        cx->parser_interim = 0;     /* the end of a 1xx, not of the response */
+    if (HC_TEST_FLAG(cx->flags, CX_PARSER_INTERIM)) {
+        HC_CLEAR_FLAG(cx->flags, CX_PARSER_INTERIM);     /* the end of a 1xx, not of the response */
         return;
     }
 
-    if (cx->failed || cx->done) {
+    if (HC_TEST_FLAG(cx->flags, CX_FAILED | CX_DONE)) {
         return;
     }
 
-    if (cx->close_delimited) {
+    if (HC_TEST_FLAG(cx->flags, CX_CLOSE_DELIMITED)) {
         struct bufferevent *bev = evhtp_connection_get_bev(cx_conn(cx));
 
-        cx->raw_mode = 1;
+        HC_SET_FLAG(cx->flags, CX_RAW_MODE);
         evhtp_request_pause(req);   /* parser stops; body stays buffered */
         bufferevent_setcb(bev, cli_raw_read, NULL, cli_raw_event, cx);
 
-        if (!cx->input_suspended) {
+        if (!HC_TEST_FLAG(cx->flags, CX_INPUT_SUSPENDED)) {
             bufferevent_enable(bev, EV_READ);
         }
 
@@ -4080,8 +4182,8 @@ cli_on_complete(evhtp_request_t *req, void *arg)
         return;
     }
 
-    cx->done = 1;
-    cx->end_delivered = 1;
+    HC_SET_FLAG(cx->flags, CX_DONE);
+    HC_SET_FLAG(cx->flags, CX_END_DELIVERED);
     cx->h->vtbl->stream_end(cx->h, NULL);
 
     /* Now, not in T_FINISH: a parser that goes on to the next message in
@@ -4104,9 +4206,10 @@ cli_conn_event(hc_client_exchange *cx, short events)
     if (events & BEV_EVENT_TIMEOUT) {
         cli_fail(cx, (events & BEV_EVENT_WRITING) ? "upstream write timeout"
                                                   : "upstream read timeout");
-    } else if ((events & BEV_EVENT_EOF) && cx->resp_head && cx->close_delimited) {
-        cx->done = 1;           /* end of a read-until-close body */
-    } else if (!cx->head_sent || !cx->resp_head) {
+    } else if ((events & BEV_EVENT_EOF) &&
+               HC_TEST_ALL(cx->flags, CX_RESP_HEAD | CX_CLOSE_DELIMITED)) {
+        HC_SET_FLAG(cx->flags, CX_DONE);           /* end of a read-until-close body */
+    } else if (!HC_TEST_ALL(cx->flags, CX_HEAD_SENT | CX_RESP_HEAD)) {
         cli_fail(cx, "connection to upstream failed or closed");
     } else {
         cli_fail(cx, "upstream closed connection mid-response");
@@ -4121,7 +4224,7 @@ cli_conn_gone(hc_client_exchange *cx)
 {
     chan_detach(&cx->out);
 
-    if (!cx->done) {
+    if (!HC_TEST_FLAG(cx->flags, CX_DONE)) {
         cli_fail(cx, "upstream connection closed");
     }
 
@@ -4135,15 +4238,15 @@ cx_left_conn_reusable(const hc_client_exchange *cx)
     evhtp_connection_t *c = cx_conn(cx);
     struct bufferevent *bev;
 
-    if (c == NULL || cx->pc->dead || cx->pc->rq == NULL) {
+    if (c == NULL || HC_TEST_FLAG(cx->pc->flags, PC_DEAD) || cx->pc->rq == NULL) {
         return 0;
     }
 
     bev = evhtp_connection_get_bev(c);
 
-    return cx->done && !cx->failed && !cx->raw_mode && cx->resp_keepalive &&
-           cx->head_sent && cx->req_attached &&
-           (cx->out.bev == NULL || cx->out.ended) &&            /* body sent */
+    return HC_TEST_ALL(cx->flags, CX_DONE | CX_RESP_KEEPALIVE | CX_HEAD_SENT | CX_REQ_ATTACHED) &&
+           !HC_TEST_FLAG(cx->flags, CX_FAILED | CX_RAW_MODE) &&
+           (cx->out.bev == NULL || HC_TEST_FLAG(cx->out.flags, CH_ENDED)) &&    /* body sent */
            evbuffer_get_length(bufferevent_get_output(bev)) == 0 &&
            evbuffer_get_length(bufferevent_get_input(bev)) == 0;
 }
@@ -4181,21 +4284,21 @@ cli_task_cb(evutil_socket_t fd, short what, void *arg)
     (void)what;
     cx->pending = 0;
 
-    if (todo & T_START && !cx->failed && !cx->released) {
+    if (todo & T_START && !HC_TEST_FLAG(cx->flags, CX_FAILED | CX_RELEASED)) {
         cx->h->vtbl->produce_request(cx->h, &cx->rc);
     }
 
-    if (todo & T_PRODUCE && !cx->failed && !cx->released &&
-        cx->out.bev && !cx->out.ended && cx->h->vtbl->produce) {
+    if (todo & T_PRODUCE && !HC_TEST_FLAG(cx->flags, CX_FAILED | CX_RELEASED) &&
+        cx->out.bev && !HC_TEST_FLAG(cx->out.flags, CH_ENDED) && cx->h->vtbl->produce) {
         cx->h->vtbl->produce(cx->h, &cx->out);
     }
 
-    if (todo & T_RAWREAD && cx_conn(cx) && !cx->done) {
+    if (todo & T_RAWREAD && cx_conn(cx) && !HC_TEST_FLAG(cx->flags, CX_DONE)) {
         cli_raw_read(evhtp_connection_get_bev(cx_conn(cx)), cx);
     }
 
-    if (todo & T_KICK && cx_conn(cx) && !cx->done && !cx->failed && !cx->released &&
-        cx->pc->cx == cx) {
+    if (todo & T_KICK && cx_conn(cx) && cx->pc->cx == cx &&
+        !HC_TEST_FLAG(cx->flags, CX_DONE | CX_FAILED | CX_RELEASED)) {
         evhtp_connection_t *c   = cx_conn(cx);
         struct bufferevent *bev = evhtp_connection_get_bev(c);
         bufferevent_data_cb read_cb;
@@ -4205,7 +4308,7 @@ cli_task_cb(evutil_socket_t fd, short what, void *arg)
         if (c->flags & EVHTP_CONN_FLAG_PAUSED) {
             c->flags &= ~EVHTP_CONN_FLAG_PAUSED;
 
-            if (!cx->input_suspended) {
+            if (!HC_TEST_FLAG(cx->flags, CX_INPUT_SUSPENDED)) {
                 bufferevent_enable(bev, EV_READ);
             }
         }
@@ -4230,7 +4333,7 @@ cli_task_cb(evutil_socket_t fd, short what, void *arg)
         int                 target = pc && pc->cx == cx;    /* libevhtp's request */
         int                 reusable;
 
-        if (cx->interposed && cx_conn(cx)) {
+        if (HC_TEST_FLAG(cx->flags, CX_INTERPOSED) && cx_conn(cx)) {
             cli_interpose_end(cx, evhtp_connection_get_bev(cx_conn(cx)));
         }
 
@@ -4240,7 +4343,7 @@ cli_task_cb(evutil_socket_t fd, short what, void *arg)
             target = 0;
         }
 
-        reusable = cx->handed_over || (target && cx_left_conn_reusable(cx));
+        reusable = HC_TEST_FLAG(cx->flags, CX_HANDED_OVER) || (target && cx_left_conn_reusable(cx));
 
         chan_detach(&cx->out);
 
@@ -4248,9 +4351,9 @@ cli_task_cb(evutil_socket_t fd, short what, void *arg)
             ep_unlink(ep, cx);
         }
 
-        if (pc && cx->handed_over) {
+        if (pc && HC_TEST_FLAG(cx->flags, CX_HANDED_OVER)) {
             /* The connection carries on with the next exchange. */
-            pc->reusable      = 1;
+            HC_SET_FLAG(pc->flags, PC_REUSABLE);
             pc->keep_alive_ms = cx->keep_alive_ms;
 
             if (cx->req) {
@@ -4258,11 +4361,16 @@ cli_task_cb(evutil_socket_t fd, short what, void *arg)
                 evhtp_request_free(cx->req);
             }
 
-            if (pc->conn && cx->input_suspended && !(pc->cx && pc->cx->input_suspended)) {
+            if (pc->conn && HC_TEST_FLAG(cx->flags, CX_INPUT_SUSPENDED) &&
+                !(pc->cx && HC_TEST_FLAG(pc->cx->flags, CX_INPUT_SUSPENDED))) {
                 bufferevent_enable(evhtp_connection_get_bev(pc->conn), EV_READ);
             }
         } else if (target) {
-            pc->reusable = reusable;
+            if (reusable) {
+                HC_SET_FLAG(pc->flags, PC_REUSABLE);
+            } else {
+                HC_CLEAR_FLAG(pc->flags, PC_REUSABLE);
+            }
 
             if (reusable) {
                 evhtp_connection_t *c   = pc->conn;
@@ -4274,13 +4382,13 @@ cli_task_cb(evutil_socket_t fd, short what, void *arg)
                 htparser_init(c->parser, htp_type_response);
                 htparser_set_userdata(c->parser, c);
 
-                if (cx->input_suspended) {
+                if (HC_TEST_FLAG(cx->flags, CX_INPUT_SUSPENDED)) {
                     bufferevent_enable(bev, EV_READ);
                 }
 
                 pc->keep_alive_ms = cx->keep_alive_ms;
 
-                if (cx->timeouts_on) {
+                if (HC_TEST_FLAG(cx->flags, CX_TIMEOUTS_ON)) {
                     bufferevent_set_timeouts(bev, NULL, NULL);  /* idle: none */
                 }
 
@@ -4300,7 +4408,7 @@ cli_task_cb(evutil_socket_t fd, short what, void *arg)
                 for (hc_client_exchange *q = next; q; q = q->ep_next) {
                     cli_fail(q, "upstream connection closed");
                     chan_detach(&q->out);
-                    q->started = 1;
+                    HC_SET_FLAG(q->flags, CX_STARTED);
                     schedule(q->task, &q->pending, T_FINISH);
                 }
 
@@ -4308,26 +4416,27 @@ cli_task_cb(evutil_socket_t fd, short what, void *arg)
                     evhtp_connection_free(pc->conn);
                 }
             }
-        } else if (pc && pc->conn && cx->head_sent && !cx->req_attached) {
+        } else if (pc && pc->conn && HC_TEST_FLAG(cx->flags, CX_HEAD_SENT) &&
+                   !HC_TEST_FLAG(cx->flags, CX_REQ_ATTACHED)) {
             /* A pipelined exchange failed after its request was written:
              * its response will still come, so the connection can no longer
              * pair requests with responses. Closing it fails the others. */
             evhtp_connection_free(pc->conn);
         }
 
-        if (cx->req && !cx->req_attached) {
+        if (cx->req && !HC_TEST_FLAG(cx->flags, CX_REQ_ATTACHED)) {
             /* Never libevhtp's request; a pipelined one still points at the
              * connection, which may be gone by now. */
             cx->req->conn = NULL;
             evhtp_request_free(cx->req);
         }
 
-        if (!cx->released) {
-            cx->released = 1;
+        if (!HC_TEST_FLAG(cx->flags, CX_RELEASED)) {
+            HC_SET_FLAG(cx->flags, CX_RELEASED);
 
-            if (cx->done && !cx->failed) {
-                if (!cx->end_delivered) {
-                    cx->end_delivered = 1;
+            if (HC_TEST_FLAG(cx->flags, CX_DONE) && !HC_TEST_FLAG(cx->flags, CX_FAILED)) {
+                if (!HC_TEST_FLAG(cx->flags, CX_END_DELIVERED)) {
+                    HC_SET_FLAG(cx->flags, CX_END_DELIVERED);
                     cx->h->vtbl->stream_end(cx->h, NULL);
                 }
 
@@ -4351,7 +4460,7 @@ cli_task_cb(evutil_socket_t fd, short what, void *arg)
              * pattern for sequential exchanges) has queued a lease, and the
              * pool must see this connection as idle before that lease is
              * served. We are on the event loop, outside libevhtp's stack. */
-            if (ep->release_pending) {
+            if (HC_TEST_FLAG(ep->flags, EP_RELEASE_PENDING)) {
                 ep_task_cb(ep);
             }
         } else if (pc) {
@@ -4508,7 +4617,7 @@ op_on_lease(void *arg, hc_pool_entry *e, const char *error)
     op->entry = e;
     pc        = hc_pool_entry_conn(e);
 
-    if (pc && !pc->dead && pc->conn) {
+    if (pc && !HC_TEST_FLAG(pc->flags, PC_DEAD) && pc->conn) {
         /* Pooled connection: ready now. It stays parked (idle callbacks)
          * until an exchange is executed on it. */
         if ((ep = ep_new(op->rq, e, pc)) == NULL) {
@@ -4550,7 +4659,7 @@ pc_task_cb(evutil_socket_t fd, short what, void *arg)
     (void)what;
     pc->pending = 0;
 
-    if (todo & P_CONNECTED && pc->op && !pc->dead) {
+    if (todo & P_CONNECTED && pc->op && !HC_TEST_FLAG(pc->flags, PC_DEAD)) {
         op_connected(pc->op);
     } else if (todo & (P_CONNECTED | P_CONNECT_FAILED) && pc->op) {
         char why[sizeof(pc->err)];
@@ -4560,10 +4669,10 @@ pc_task_cb(evutil_socket_t fd, short what, void *arg)
         return;                 /* pc was destroyed */
     }
 
-    if (todo & P_LOST && pc->idle && pc->entry) {
+    if (todo & P_LOST && HC_TEST_FLAG(pc->flags, PC_IDLE) && pc->entry) {
         /* Frees pc if the entry is idle in the pool; if it is leased (an
          * endpoint holds it between exchanges) the pool leaves it and the
-         * endpoint's next execute/release sees pc->dead. */
+         * endpoint's next execute/release sees PC_DEAD. */
         hc_pool_connection_lost(pc->rq->pool, pc->entry);
     }
 }
@@ -4574,7 +4683,7 @@ hc_requester_connect(hc_requester *rq, const hc_host *target, int64_t timeout_ms
 {
     hc_connect_op *op;
 
-    if (rq->closing || (op = calloc(1, sizeof(*op))) == NULL) {
+    if (HC_TEST_FLAG(rq->flags, RQ_CLOSING) || (op = calloc(1, sizeof(*op))) == NULL) {
         return NULL;
     }
 
@@ -4623,7 +4732,7 @@ hc_endpoint_execute(hc_endpoint *ep, hc_client_handler *h)
 {
     hc_client_exchange *cx;
 
-    if (ep->release_pending || ep->rq->closing ||
+    if (HC_TEST_FLAG(ep->flags, EP_RELEASE_PENDING) || HC_TEST_FLAG(ep->rq->flags, RQ_CLOSING) ||
         (cx = cx_new(ep->rq->r, h)) == NULL) {
         return NULL;
     }
@@ -4646,7 +4755,7 @@ hc_endpoint_execute(hc_endpoint *ep, hc_client_handler *h)
     if (ep->cx == cx) {
         ep->pc->cx = cx;
 
-        if (ep->pc->conn && !ep->pc->dead) {
+        if (ep->pc->conn && !HC_TEST_FLAG(ep->pc->flags, PC_DEAD)) {
             pc_set_active(ep->pc);
         }
     }
@@ -4685,12 +4794,16 @@ hc_endpoint_get_attachment(const hc_endpoint *ep)
 static void
 ep_release(hc_endpoint *ep, int reuse)
 {
-    if (ep->release_pending) {
+    if (HC_TEST_FLAG(ep->flags, EP_RELEASE_PENDING)) {
         return;
     }
 
-    ep->release_pending = 1;
-    ep->reuse           = reuse;
+    HC_SET_FLAG(ep->flags, EP_RELEASE_PENDING);
+
+    if (reuse) {
+        HC_SET_FLAG(ep->flags, EP_REUSE);
+    }
+
     hc_timer_start(ep->task, 0);  /* never from inside libevhtp's stack */
 }
 
@@ -4716,7 +4829,7 @@ ep_task_cb(void *arg)
     if (ep->cx) {
         /* Exchanges still running: finish (or cancel) them first; the
          * last one's T_FINISH re-runs this task. */
-        if (!ep->reuse) {
+        if (!HC_TEST_FLAG(ep->flags, EP_REUSE)) {
             for (hc_client_exchange *x = ep->cx; x; x = x->ep_next) {
                 hc_client_cancel(x);
             }
@@ -4725,7 +4838,8 @@ ep_task_cb(void *arg)
         return;
     }
 
-    keep = ep->reuse && pc->conn && !pc->dead && pc->reusable;
+    keep = HC_TEST_FLAG(ep->flags, EP_REUSE) && pc->conn && !HC_TEST_FLAG(pc->flags, PC_DEAD) &&
+           HC_TEST_FLAG(pc->flags, PC_REUSABLE);
 
     if (keep) {
         pc_set_idle(pc);        /* no-op if already parked */
@@ -4761,7 +4875,9 @@ requester_tls_init(hc_requester *rq, const hc_requester_config *c)
     }
 
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    rq->tls_no_verify = c->tls_no_verify;
+    if (c->tls_no_verify) {
+        HC_SET_FLAG(rq->flags, RQ_TLS_NO_VERIFY);
+    }
 
     if (c->tls_no_verify) {
         SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
@@ -4863,7 +4979,7 @@ hc_requester_free(hc_requester *rq)
 {
     static const char why[] = "requester shut down";
 
-    if (rq == NULL || rq->closing) {
+    if (rq == NULL || HC_TEST_FLAG(rq->flags, RQ_CLOSING)) {
         return;
     }
 
@@ -4871,7 +4987,7 @@ hc_requester_free(hc_requester *rq)
      * that replaces its requester, e.g. on a config reload), so everything
      * still queued on it for this requester is finished here and now.
      * Callbacks run from here cannot start anything new on it. */
-    rq->closing = 1;
+    HC_SET_FLAG(rq->flags, RQ_CLOSING);
     hc_timer_free(rq->housekeeping);
     rq->housekeeping = NULL;
 
@@ -4899,7 +5015,10 @@ hc_requester_free(hc_requester *rq)
             continue;
         }
 
-        ep->reuse = ep->release_pending ? ep->reuse : 0;
+        if (!HC_TEST_FLAG(ep->flags, EP_RELEASE_PENDING)) {
+            HC_CLEAR_FLAG(ep->flags, EP_REUSE);     /* still held: discard */
+        }
+
         ep_task_cb(ep);                     /* unlinks and frees ep */
     }
 

@@ -21,11 +21,16 @@ typedef struct ctx_attr {
     void           (*free_fn)(void *);
 } ctx_attr;
 
+/* struct hc_context: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    CTX_IS_SERVER  = 1u << 0,
+    CTX_IS_TLS     = 1u << 1,
+    CTX_HAS_TARGET = 1u << 2,
+};
+
 struct hc_context {
-    int       is_server;
+    unsigned  flags;  /* CTX_*, above */
     int       version;      /* 0: not known yet */
-    int       is_tls;
-    int       has_target;
     hc_host   target;
     char     *remote;
     ctx_attr *attrs;
@@ -59,12 +64,17 @@ hc_context_new(int is_server, const hc_host *target, const char *remote)
         return NULL;
     }
 
-    ctx->is_server = is_server != 0;
+    if (is_server) {
+        HC_SET_FLAG(ctx->flags, CTX_IS_SERVER);
+    }
 
     if (target) {
         ctx->target     = *target;
-        ctx->has_target = 1;
-        ctx->is_tls     = hc_host_is_tls(target);
+        HC_SET_FLAG(ctx->flags, CTX_HAS_TARGET);
+
+        if (hc_host_is_tls(target)) {
+            HC_SET_FLAG(ctx->flags, CTX_IS_TLS);
+        }
     }
 
     if (remote && (ctx->remote = dup_str(remote)) == NULL) {
@@ -109,7 +119,12 @@ hc_context_set_protocol(hc_context *ctx, int version, int is_tls)
 {
     if (ctx) {
         ctx->version = version;
-        ctx->is_tls  = is_tls != 0;
+
+        if (is_tls) {
+            HC_SET_FLAG(ctx->flags, CTX_IS_TLS);
+        } else {
+            HC_CLEAR_FLAG(ctx->flags, CTX_IS_TLS);
+        }
     }
 }
 
@@ -193,7 +208,7 @@ hc_context_remove_attribute(hc_context *ctx, const char *name)
 int
 hc_context_is_server(const hc_context *ctx)
 {
-    return ctx ? ctx->is_server : 0;
+    return ctx ? HC_TEST_FLAG(ctx->flags, CTX_IS_SERVER) : 0;
 }
 
 int
@@ -205,13 +220,13 @@ hc_context_protocol_version(const hc_context *ctx)
 int
 hc_context_is_tls(const hc_context *ctx)
 {
-    return ctx ? ctx->is_tls : 0;
+    return ctx ? HC_TEST_FLAG(ctx->flags, CTX_IS_TLS) : 0;
 }
 
 const hc_host *
 hc_context_target(const hc_context *ctx)
 {
-    return ctx && ctx->has_target ? &ctx->target : NULL;
+    return ctx && HC_TEST_FLAG(ctx->flags, CTX_HAS_TARGET) ? &ctx->target : NULL;
 }
 
 const char *
@@ -238,9 +253,14 @@ typedef struct icpt_list {
     size_t n, cap;
 } icpt_list;
 
+/* struct hc_processor_builder: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    PB_FAILED = 1u << 0,   /* an add failed: build() returns NULL */
+};
+
 struct hc_processor_builder {
     icpt_list req, resp;
-    int       failed;       /* an add failed: build() returns NULL */
+    unsigned  flags;  /* PB_*, above */
 };
 
 struct hc_processor {
@@ -313,7 +333,7 @@ builder_add(hc_processor_builder *b, int response, icpt it, int first)
             it.free_arg(it.arg);
         }
         if (b) {
-            b->failed = 1;
+            HC_SET_FLAG(b->flags, PB_FAILED);
         }
         return -1;
     }
@@ -366,7 +386,7 @@ hc_processor_builder_build(hc_processor_builder *b)
         return NULL;
     }
 
-    if (b->failed || (p = calloc(1, sizeof(*p))) == NULL) {
+    if (HC_TEST_FLAG(b->flags, PB_FAILED) || (p = calloc(1, sizeof(*p))) == NULL) {
         hc_processor_builder_free(b);
         return NULL;
     }
@@ -569,7 +589,7 @@ hc_processor_builder_add_user_agent(hc_processor_builder *b, const char *agent)
 
     if (a == NULL) {
         if (b) {
-            b->failed = 1;
+            HC_SET_FLAG(b->flags, PB_FAILED);
         }
         return -1;
     }
@@ -590,7 +610,7 @@ hc_processor_builder_add_default_headers(hc_processor_builder *b, const hc_heade
 
     if (copy == NULL) {
         if (b) {
-            b->failed = 1;
+            HC_SET_FLAG(b->flags, PB_FAILED);
         }
         return -1;
     }
@@ -611,7 +631,7 @@ hc_processor_builder_add_response_server(hc_processor_builder *b, const char *na
 
     if (n == NULL) {
         if (b) {
-            b->failed = 1;
+            HC_SET_FLAG(b->flags, PB_FAILED);
         }
         return -1;
     }

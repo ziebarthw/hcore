@@ -75,6 +75,11 @@ typedef struct route_pool {
     int      n_pending;
 } route_pool;
 
+/* struct hc_pool_entry: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    PE_LEASED = 1u << 0,
+};
+
 struct hc_pool_entry {
     hc_link     route_link;      /* rp->available or rp->leased           */
     hc_link     lru_link;        /* pool->available while idle            */
@@ -82,11 +87,16 @@ struct hc_pool_entry {
     hc_pool    *pool;
     void       *conn;
     const void *state;
-    int         leased;
+    unsigned    flags;  /* PE_*, above */
     int64_t     created;
     int64_t     updated;
     int64_t     valid_until;     /* created + time_to_live                */
     int64_t     expiry;          /* min(valid_until, last keep-alive)     */
+};
+
+/* struct hc_pool_lease_req: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    LR_COMPLETED = 1u << 0,
 };
 
 struct hc_pool_lease_req {
@@ -99,7 +109,12 @@ struct hc_pool_lease_req {
     hc_timer        *timer;      /* lease timeout                         */
     hc_pool_entry   *entry;
     const char      *error;
-    int              completed;
+    unsigned         flags;  /* LR_*, above */
+};
+
+/* struct hc_pool: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    POOL_SHUTDOWN = 1u << 0,
 };
 
 struct hc_pool {
@@ -116,7 +131,7 @@ struct hc_pool {
     int              n_available;
     int              n_pending;
     hc_timer        *service;
-    int              shutdown;
+    unsigned         flags;  /* POOL_*, above */
 };
 
 #define ENTRY_OF_ROUTE(lnk) HC_CONTAINER_OF(lnk, hc_pool_entry, route_link)
@@ -138,7 +153,7 @@ now_ms(const hc_pool *p)
 static void
 schedule_service(hc_pool *p)
 {
-    if (!p->shutdown) {
+    if (!HC_TEST_FLAG(p->flags, POOL_SHUTDOWN)) {
         hc_timer_start(p->service, 0);
     }
 }
@@ -213,7 +228,7 @@ entry_drop_available(hc_pool *p, hc_pool_entry *e)
 static void
 entry_mark_leased(hc_pool *p, route_pool *rp, hc_pool_entry *e)
 {
-    e->leased = 1;
+    HC_SET_FLAG(e->flags, PE_LEASED);
     l_push_back(&rp->leased, &e->route_link);
     rp->n_leased++;
     p->n_leased++;
@@ -250,7 +265,7 @@ lease_complete(hc_pool_lease_req *l, hc_pool_entry *e, const char *error)
     l_remove(&l->link);             /* from pending */
     p->n_pending--;
     l->rp->n_pending--;
-    l->completed = 1;
+    HC_SET_FLAG(l->flags, LR_COMPLETED);
     l->entry     = e;
     l->error     = error;
     hc_timer_stop(l->timer);
@@ -362,7 +377,7 @@ lease_timeout_cb(void *arg)
 {
     hc_pool_lease_req *l = arg;
 
-    if (!l->completed) {
+    if (!HC_TEST_FLAG(l->flags, LR_COMPLETED)) {
         lease_complete(l, NULL, ERR_TIMEOUT);
         deliver_completed(l->pool);
     }
@@ -414,7 +429,7 @@ hc_pool_lease(hc_pool *p, const hc_host *route, const void *state,
     hc_pool_lease_req *l;
     route_pool    *rp;
 
-    if (p->shutdown || (rp = get_route(p, route, 1)) == NULL ||
+    if (HC_TEST_FLAG(p->flags, POOL_SHUTDOWN) || (rp = get_route(p, route, 1)) == NULL ||
         (l = calloc(1, sizeof(*l))) == NULL) {
         return NULL;
     }
@@ -449,7 +464,7 @@ hc_pool_lease_cancel(hc_pool_lease_req *l)
 {
     hc_pool *p = l->pool;
 
-    if (l->completed) {
+    if (HC_TEST_FLAG(l->flags, LR_COMPLETED)) {
         /* Served but not yet delivered: hand the slot straight back. */
         l_remove(&l->link);
 
@@ -474,11 +489,11 @@ hc_pool_release(hc_pool *p, hc_pool_entry *e, int reusable)
     int         keep;
 
     l_remove(&e->route_link);
-    e->leased = 0;
+    HC_CLEAR_FLAG(e->flags, PE_LEASED);
     rp->n_leased--;
     p->n_leased--;
 
-    keep = reusable && e->conn && !p->shutdown && now_ms(p) < e->expiry;
+    keep = reusable && e->conn && !HC_TEST_FLAG(p->flags, POOL_SHUTDOWN) && now_ms(p) < e->expiry;
 
     if (keep) {
         e->updated = now_ms(p);
@@ -509,7 +524,7 @@ hc_pool_release(hc_pool *p, hc_pool_entry *e, int reusable)
 void
 hc_pool_connection_lost(hc_pool *p, hc_pool_entry *e)
 {
-    if (e->leased) {
+    if (HC_TEST_FLAG(e->flags, PE_LEASED)) {
         return;                 /* the lessee finds out and releases it */
     }
 
@@ -615,7 +630,7 @@ hc_pool_free(hc_pool *p)
         return;
     }
 
-    p->shutdown = 1;
+    HC_SET_FLAG(p->flags, POOL_SHUTDOWN);
     hc_timer_stop(p->service);
 
     /* Fail everything still waiting; deliver results already served. */
