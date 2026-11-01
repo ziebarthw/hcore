@@ -645,9 +645,16 @@ hc_connect_op *hc_requester_connect(hc_requester *rq, const hc_host *target,
 /* Only valid before the callback has run; the callback will not run. */
 void           hc_connect_cancel(hc_connect_op *op);
 
-/* Run one exchange on the endpoint (one at a time; HTTP/1.1, no
- * pipelining). The handler gets ->release() as usual; the endpoint stays
- * leased until released. */
+/* Run an exchange on the endpoint. The handler gets ->release() as usual;
+ * the endpoint stays leased until released. Several exchanges may be
+ * executed without waiting (Java: AsyncClientEndpoint.execute() in a loop):
+ * they are pipelined (HTTP/1.1). Each request is sent once the one ahead of
+ * it has been sent completely - after a HEAD or CONNECT request, an HTTP/1.0
+ * one or one with "Connection: close", only once that exchange is finished -
+ * and the responses come back in that order. If the connection ends early,
+ * the exchanges still queued fail. Cancelling one whose request is already
+ * on the wire closes the connection (its response would still come), which
+ * fails the others; one not sent yet is just dropped. */
 hc_client_exchange *hc_endpoint_execute(hc_endpoint *ep, hc_client_handler *h);
 
 /* Give the connection back. "reuse" is a request: the engine also checks

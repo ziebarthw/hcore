@@ -116,6 +116,9 @@ out=$($FD http://127.0.0.1:9000/close 2>&1)
 check "client: read-until-close response -> exchange completed (connection closed)" "$(echo "$out" | grep -c 'exchange completed (connection closed)')" "1"
 out=$($FD http://127.0.0.1:9000/die 2>&1)
 check "client: response cut off -> no exchange completed line" "$(echo "$out" | grep -c 'HTTP/1.1 200$') $(echo "$out" | grep -c 'exchange completed')" "1 0"
+# --- pipelined client (examples/pipelined_client.c) ------------------------
+out=$($WRAP $B/pipelined_client http://127.0.0.1:9000 2>&1); rc=$?
+check "pipelined: 4 requests sent before the 1st response, 4 kept-alive completions" "$rc $(echo "$out" | grep -E '^127.0.0.1:9000 (GET|HTTP)' | head -5 | awk '{print $2}' | tr '\n' ' ')$(echo "$out" | grep -c 'exchange completed (connection kept alive)') $(echo "$out" | grep -cE '^/(ip|user-agent|headers)?->200$')" "0 GET GET GET GET HTTP/1.1 4 4"
 out=$($FD --duplex 8 http://127.0.0.1:9001/echo 2>&1); rc=$?
 check "client: 8MB full duplex direct to echo_server" "$rc $(echo "$out" | grep -c 'echo verified') $(echo "$out" | grep -c 'full duplex: both')" "0 1 1"
 out=$($FD -n 3 --duplex 32 http://127.0.0.1:8082/echo 2>&1); rc=$?
