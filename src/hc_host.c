@@ -83,6 +83,12 @@ parse_authority(hc_host *h, const char *s, const char *end)
         s = sep + 3;
     }
 
+    /* No userinfo ("user:pass@host"): it would otherwise become part of
+     * the host name. Credentials don't belong in a target address. */
+    if (memchr(s, '@', (size_t)(end - s)) != NULL) {
+        return -1;
+    }
+
     if (*s == '[') {                     /* [IPv6]:port */
         const char *rb = memchr(s, ']', (size_t)(end - s));
 
@@ -106,6 +112,10 @@ parse_authority(hc_host *h, const char *s, const char *end)
     if (colon) {
         char *e;
 
+        /* digits only: strtol() would also take " 80" and "+80" */
+        if (colon[1] < '0' || colon[1] > '9') {
+            return -1;
+        }
         port = strtol(colon + 1, &e, 10);
 
         if (e != end || port <= 0 || port > 65535) {

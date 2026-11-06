@@ -161,9 +161,11 @@ typedef struct hc_host {
  * or a name that does not fit. */
 int    hc_host_init(hc_host *h, const char *scheme, const char *name, uint16_t port);
 /* "[scheme://]name[:port]", scheme defaulting to http; IPv6 literals in
- * brackets. Java: HttpHost.create(). */
+ * brackets; the port in digits only. Userinfo ("user@name") is refused.
+ * Java: HttpHost.create(). */
 int    hc_host_parse(hc_host *h, const char *s);
-/* "scheme://authority[/path...]" -> host + request-target ("/" if none). */
+/* "scheme://authority[/path...]" -> host + request-target ("/" if none).
+ * The authority as for hc_host_parse(): userinfo refused. */
 int    hc_uri_parse(const char *uri, hc_host *h, char *target, size_t target_len);
 int    hc_host_is_tls(const hc_host *h);
 /* Java: SNIHostName on the connection's SSLParameters. NULL or "" clears it.
