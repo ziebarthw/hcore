@@ -532,6 +532,23 @@ test_host_parsing(void)
     CHECK(hc_uri_parse("http://a.b", &h, target, sizeof(target)) == 0 && strcmp(target, "/") == 0);
     CHECK(hc_uri_parse("http://a.b?q", &h, target, sizeof(target)) == 0 && strcmp(target, "/?q") == 0);
     CHECK(hc_uri_parse("a.b/p", &h, target, sizeof(target)) != 0);
+
+    /* userinfo is refused, not taken as part of the host name */
+    CHECK(hc_host_parse(&h, "user@example.org") != 0);
+    CHECK(hc_host_parse(&h, "https://user:pw@example.org:8443") != 0);
+    CHECK(hc_host_parse(&h, "[::1]@x") != 0);
+    CHECK(hc_uri_parse("http://user@a.b/p", &h, target, sizeof(target)) != 0);
+    CHECK(hc_uri_parse("https://u:p@a.b:9443/", &h, target, sizeof(target)) != 0);
+    /* but an '@' after the authority is just part of the target */
+    CHECK(hc_uri_parse("http://a.b/p@q?m=a@b", &h, target, sizeof(target)) == 0 &&
+          strcmp(h.name, "a.b") == 0 && strcmp(target, "/p@q?m=a@b") == 0);
+    CHECK(hc_uri_parse("http://a.b?x@y", &h, target, sizeof(target)) == 0 &&
+          strcmp(h.name, "a.b") == 0 && strcmp(target, "/?x@y") == 0);
+
+    /* the port: digits only */
+    CHECK(hc_host_parse(&h, "x: 80") != 0 && hc_host_parse(&h, "x:+80") != 0);
+    CHECK(hc_host_parse(&h, "x:") != 0 && hc_host_parse(&h, "[::1]:") != 0);
+    CHECK(hc_host_parse(&h, "x:8080") == 0 && h.port == 8080);
 }
 
 int
