@@ -27,7 +27,6 @@
 #include "hc.h"
 #include "hc_support.h"
 #include "htstring/htstring.h"
-#include "htstring/parsed_uri.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -230,8 +229,12 @@ send_error_page(hc_basic_request *r, int status, const char *msg)
 static int
 resolve_path(const char *target, char *out, size_t size)
 {
-    struct parsed_uri u = parse_uri_view(htstring_ctor(target, strlen(target)), false);
-    htstring_t        path = parsed_uri_get_path(target, &u);
+    /* The path: up to the query or fragment. (Only htstring.h's inline
+     * functions are used here: hcore links nothing of htstring, and with
+     * the upstream libevhtp there is no htstring library to link.) An
+     * absolute-form target ("http://host/p") doesn't start with '/' and
+     * is refused below. */
+    htstring_t        path = htstring_ctor(target, strcspn(target, "?#"));
 
     char              dec[2048];
     ptrdiff_t         n = htstring_pct_decode(path, dec, sizeof(dec));
