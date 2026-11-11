@@ -3681,12 +3681,33 @@ cli_pre_write(struct bufferevent *bev, void *arg)
     }
 }
 
+static void cli_interpose_begin(hc_client_exchange *cx, struct bufferevent *bev);
+
 static void
 cli_pre_event(struct bufferevent *bev, short events, void *arg)
 {
-    hc_client_exchange *cx = arg;
+    hc_client_exchange  *cx = arg;
+    bufferevent_event_cb ev;
+    void                *ev_arg;
 
-    cx->ip_event(bev, events, cx->ip_arg);      /* may free the connection */
+    if (!(events & BEV_EVENT_CONNECTED)) {
+        cx->ip_event(bev, events, cx->ip_arg);  /* may free the connection */
+        return;
+    }
+
+    /* The request went out before the connection was up
+     * (hc_client_execute()), so the callbacks put aside were libevhtp's
+     * pre-connect ones. On connect libevhtp installs its read and write
+     * callbacks, but keeps any it finds - ours - and gives them its
+     * connection as their argument. Step aside while it does, then sit in
+     * front of the callbacks it chose. */
+    cli_interpose_end(cx, bev);
+    cx->ip_event(bev, events, cx->ip_arg);
+    bufferevent_getcb(bev, NULL, NULL, &ev, &ev_arg);
+
+    if (ev == cx->ip_event && ev_arg == cx->ip_arg) {   /* still libevhtp's */
+        cli_interpose_begin(cx, bev);
+    }
 }
 
 static void
