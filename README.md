@@ -32,6 +32,7 @@ tests/support_test.c    in-process integration tests: support API, TLS, 1xx, rou
 tests/embed_test.c      hcore in the application's event loop: reuse_port, pause/resume accept, graceful drain
 tests/shutdown_test.c   freeing a requester (and server) while the application's loop keeps running
 tests/pipeline_test.c   HTTP/1.1 pipelining on an endpoint, against a scripted origin
+tests/client_execute_test.c  hc_client_execute(): unpooled exchanges, the request sent before the connect
 tests/tls_name_test.c   https to an address, presenting and verifying a host name (hc_host.tls_name)
 tests/h2_test.c         the server over HTTP/2 (libevhtp with HTTP/2 only), checked with curl
 tests/processor_test.c  interceptors and processors on both sides of real exchanges
@@ -1073,6 +1074,13 @@ a pooled requester sends a 100,000-byte chunked request through a wrapper
 request channel; the origin echoes what arrived, and
 `hc_request_channel_exchange()` reaches the real exchange. Incomplete ops
 are refused. ASan and UBSan: clean.
+
+**Unpooled exchanges** (`tests/client_execute_test`, 9 checks) runs
+`hc_client_execute()` against an in-process server. The request goes out
+before the connection is up: a GET, POSTs of 50,000 bytes with
+`Content-Length` and chunked (checksummed by the server), and a
+`103 Early Hints` ahead of the final response, delivered to
+`consume_information()` with its `Link` header. ASan and UBSan: clean.
 
 **TLS server name** (`tests/tls_name_test`, 19 checks) connects over https
 to 127.0.0.1, where a plain OpenSSL server answers with the SNI it received.
