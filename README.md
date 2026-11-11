@@ -16,11 +16,13 @@ include/hc_pool.h       generic route-based connection pool (StrictConnPool mode
 include/hc_support.h    request producers, response consumers, basic client handler (nio.support)
 include/hc_processor.h  request/response interceptors, the HTTP processor, the exchange context (http.protocol)
 include/hc_channel.h    channels the application implements: wrap a handler's channel to change what it sends
+include/hc_transform.h  body transformations (decompress a request, compress a response, ...) for any handler
 src/hc_evhtp.c          engine: drives the interfaces from libevhtp/libevent/OpenSSL
 src/hc_pool.c           the pool              } engine-independent:
 src/hc_host.c           hc_host / URI parsing } hc.h only
 src/hc_support.c        producers/consumers   }
 src/hc_processor.c      interceptors/context  }
+src/hc_transform.c      body transformations  }
 examples/reverse_proxy.c       port of AsyncReverseProxyExample (pooled, http/https origins, relays 1xx)
 examples/full_duplex_client.c  port of AsyncFullDuplexClientExample (producers/consumers, http/https)
 examples/pipelined_client.c    port of AsyncPipelinedRequestExecutionExample (HTTP/1.1 pipelining on one endpoint)
@@ -41,6 +43,7 @@ tests/stats_test.c      server statistics against what happened on the wire; end
 tests/tls_opts_test.c   server TLS options (protocols, ciphers, client certificates) via openssl s_client
 tests/basic_server_test.c  hc_basic_server_factory(): whole requests, later and streamed replies, limits, IPv6
 tests/channel_test.c    application channels: wrappers on both sides of real exchanges (HTTP/1.1 and HTTP/2)
+tests/transform_test.c  body transformations on both sides, flow control to a slow reader, errors (HTTP/1.1 and HTTP/2)
 tests/run.sh            end-to-end tests (curl / client -> proxy -> tests/origin.py, echo_server)
 tests/tls/              self-signed test certificates (localhost, other.example)
 third_party/htstring/   copy of htstring: htstring_t string views, used by the engine's routing
@@ -380,6 +383,58 @@ a body's length sends the head on with an entity of unknown length (-1).
 Response interceptors run inside the engine's channel, so they see the head
 as finally sent, after every wrapper. `tests/channel_test.c` has a complete
 upper-casing wrapper for both sides.
+
+## Body transformations (`hc_transform.h`)
+
+A transformation turns body bytes into other bytes - decompressing,
+compressing, re-encoding - and knows nothing of channels, framing or flow
+control:
+
+```c
+typedef struct hc_transform_ops {
+    int  (*update)(void *state, const void *in, size_t len, hc_bytes *out);
+    int  (*finish)(void *state, hc_bytes *out);     /* end: what is held back */
+    int  (*flush)(void *state, hc_bytes *out);      /* optional */
+    void (*free)(void *state);
+} hc_transform_ops;
+```
+
+A transform handler wraps any handler and runs transformations on either
+body of its exchanges, chosen per exchange by functions that see each head
+(with headers they may change) and return a transformation or none:
+
+```c
+static int
+choose_response(void *arg, const hc_request_head *request, int *status,
+                hc_headers *headers, const hc_entity *entity, hc_transform *t)
+{
+    if (entity && client_accepts(request, "gzip")) {
+        t->ops   = &my_gzip;
+        t->state = my_gzip_new();
+        hc_headers_add(headers, "Content-Encoding", "gzip");
+    }
+    return 0;           /* or 400..599 to refuse, as interceptors do */
+}
+
+static const hc_server_transform_config cfg = { NULL, choose_response, NULL, 0, 0 };
+
+hc_server_handler *h = hc_server_transform_handler_new(my_handler, &cfg);
+```
+
+The wrapped handler is unchanged: it reads `->consume()` and writes
+`hc_data_write()` as before, and sees an incoming transformed body as one
+of unknown length without `Content-Length`. An outgoing transformed body is
+sent with unknown length (chunked on HTTP/1.1). Flow control carries
+through: what the real channel cannot take waits in a pending buffer, and
+`hc_data_capacity()` on the wrapped handler's channel is the room left
+below a high-water mark (64 KiB by default), so a handler that respects it
+stays within the mark times the transformation's expansion. A failing
+transformation aborts the exchange; the wrapped handler's `->failed()` gets
+"body transformation failed". The client side is the same:
+`hc_client_transform_handler_new()`.
+
+`hc_bytes` is the growable buffer transformations append to, with
+`hc_bytes_reserve()` / `hc_bytes_commit()` for codecs that write in place.
 
 ## Interim (1xx) responses
 
@@ -1074,6 +1129,25 @@ a pooled requester sends a 100,000-byte chunked request through a wrapper
 request channel; the origin echoes what arrived, and
 `hc_request_channel_exchange()` reaches the real exchange. Incomplete ops
 are refused. ASan and UBSan: clean.
+
+**Body transformations** (`tests/transform_test`, 41 checks, 29 without
+HTTP/2) wraps a basic-server application and a client handler, with small
+test codecs (upper-casing, a x4 expander and its inverse, one holding
+everything until the end, one failing part-way). Over HTTP/1.1 and HTTP/2
+(curl): a request body decoded before the application sees it (no
+`Content-Length`), a request refused with 415 (the application never
+called), a response expanded to 400,000 bytes and sent with unknown length,
+the same to a slow reader (the application is told there is no capacity,
+and `->produce()` comes back), a held-back body delivered whole at the end,
+a failing codec (exchange aborted, `->failed("body transformation
+failed")`, released once), and a 204 (the choose function called without an
+entity). A never-ending event stream through the holding codec reaches the
+client only with `flush_each_write`. Client side, on a pooled requester: a
+request body expanded on the way out (chunked), a response decoded on the
+way in - both wrappers on one exchange, the original bytes back - a header
+added to a bodiless GET and seen by `choose_response`, and a response
+refused (`->failed("body transformation refused")`). Every transformation's
+state is freed exactly once. ASan and UBSan: clean.
 
 **Unpooled exchanges** (`tests/client_execute_test`, 9 checks) runs
 `hc_client_execute()` against an in-process server. The request goes out
