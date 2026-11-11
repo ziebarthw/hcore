@@ -17,12 +17,14 @@ include/hc_support.h    request producers, response consumers, basic client hand
 include/hc_processor.h  request/response interceptors, the HTTP processor, the exchange context (http.protocol)
 include/hc_channel.h    channels the application implements: wrap a handler's channel to change what it sends
 include/hc_transform.h  body transformations (decompress a request, compress a response, ...) for any handler
+include/hc_gzip.h       gzip/deflate through zlib: codecs and ready-made server/client decorators (ZLIB=1)
 src/hc_evhtp.c          engine: drives the interfaces from libevhtp/libevent/OpenSSL
 src/hc_pool.c           the pool              } engine-independent:
 src/hc_host.c           hc_host / URI parsing } hc.h only
 src/hc_support.c        producers/consumers   }
 src/hc_processor.c      interceptors/context  }
 src/hc_transform.c      body transformations  }
+src/hc_gzip.c           gzip/deflate (ZLIB=1) }
 examples/reverse_proxy.c       port of AsyncReverseProxyExample (pooled, http/https origins, relays 1xx)
 examples/full_duplex_client.c  port of AsyncFullDuplexClientExample (producers/consumers, http/https)
 examples/pipelined_client.c    port of AsyncPipelinedRequestExecutionExample (HTTP/1.1 pipelining on one endpoint)
@@ -45,6 +47,7 @@ tests/basic_server_test.c  hc_basic_server_factory(): whole requests, later and 
 tests/channel_test.c    application channels: wrappers on both sides of real exchanges (HTTP/1.1 and HTTP/2)
 tests/transform_test.c  body transformations on both sides, flow control to a slow reader, errors (HTTP/1.1 and HTTP/2)
 tests/decorator_test.c  handler decorator lists on a server and a requester: order, early answers, failures
+tests/gzip_test.c       gzip/deflate: codecs, negotiation, limits, both sides (ZLIB=1)
 tests/run.sh            end-to-end tests (curl / client -> proxy -> tests/origin.py, echo_server)
 tests/tls/              self-signed test certificates (localhost, other.example)
 third_party/htstring/   copy of htstring: htstring_t string views, used by the engine's routing
@@ -436,6 +439,41 @@ transformation aborts the exchange; the wrapped handler's `->failed()` gets
 
 `hc_bytes` is the growable buffer transformations append to, with
 `hc_bytes_reserve()` / `hc_bytes_commit()` for codecs that write in place.
+
+## gzip and deflate (`hc_gzip.h`, `ZLIB=1`)
+
+Ready-made decorators for content coding through zlib:
+
+```c
+hc_gzip *gz = hc_gzip_server_new(NULL);                 /* defaults */
+hc_server_add_decorator_last(s, "gzip", hc_gzip_server_decorator, gz);
+
+hc_gzip *gc = hc_gzip_client_new(NULL);
+hc_requester_add_decorator_last(rq, "gzip", hc_gzip_client_decorator, gc);
+/* ... free the server and requester first, then hc_gzip_free() */
+```
+
+The server compresses a response when the client's `Accept-Encoding`
+allows gzip or deflate (q-values and `*` honoured, gzip preferred), the
+request is not `HEAD`, the status is not 204, 206 or 304, the response is
+not already encoded, its type is on the list (by default text types,
+JSON, JavaScript, XML and SVG) and it is at least 1 KiB or of unknown
+length. It adds `Content-Encoding` and `Vary: Accept-Encoding`, weakens a
+strong `ETag` and drops `Accept-Ranges`. Event streams are left alone
+unless `flush_each_write` is set, which sync-flushes after every write so
+events still arrive as written. Request bodies can be decompressed too
+(`decompress_requests`, off by default; an unknown coding gets 415).
+
+The client adds `Accept-Encoding: gzip, deflate` to requests without one
+and decompresses gzip and deflate responses (zlib-wrapped or raw),
+removing `Content-Encoding`, as HttpClient's `ContentCompressionAsyncExec`
+does.
+
+Every decompression is limited (`max_size`, 64 MiB by default, and
+`max_ratio`, 100 times the compressed size past the first MiB), so a small
+"zip bomb" fails the exchange instead of filling memory. The codecs are
+also available alone, as transformations for choose functions of your own:
+`hc_gzip_encoder()`, `hc_gzip_decoder()`.
 
 ## Handler decorators
 
@@ -878,8 +916,16 @@ EVHTP_PREFIX = /opt/evhtp
 EXTRA_LIBS   = /opt/evhtp/lib/libhtstring.a -lnghttp2 -lonig
 ```
 
-**Installing for another project.** `make install` copies `hc.h`,
-`hc_pool.h` and `hc_support.h` to `$(PREFIX)/include`, `libhcore.a` to
+**gzip and deflate.** `ZLIB=1` (in `config.mk` or on the command line)
+builds the optional `hc_gzip.h` module into `libhcore.a`; it needs zlib's
+headers, and programs linking hcore then add `-lz` (`libhcore.pc` lists it).
+Off by default: without it nothing changes, and `make check` skips
+`gzip_test`.
+
+**Installing for another project.** `make install` copies the public
+headers (`hc.h`, `hc_channel.h`, `hc_pool.h`, `hc_processor.h`,
+`hc_support.h`, `hc_transform.h`, and `hc_gzip.h` with `ZLIB=1`) to
+`$(PREFIX)/include`, `libhcore.a` to
 `$(PREFIX)/lib`, and a pkg-config file, `libhcore.pc`, to
 `$(PREFIX)/lib/pkgconfig` (or `PKGCONFIGDIR`). `PREFIX` defaults to
 `/usr/local`; set it in `config.mk` to install next to your application's
@@ -1185,6 +1231,24 @@ and a registered route decorated the same; on a requester, the order (the
 first in the list sees the request last and the response first) and a
 failing decorator (`->failed("cannot start exchange: decorator failed")`).
 Every decorator released exactly once. ASan and UBSan: clean.
+
+**gzip and deflate** (`tests/gzip_test`, 73 checks, `ZLIB=1` only).
+Codecs: round trips of both codings (also fed a byte at a time), data from
+zlib itself (raw and zlib-wrapped deflate, concatenated gzip members), an
+empty body accepted, truncated and corrupt ones refused, the size and ratio
+limits (and a high ratio below the first MiB allowed), and a sync flush.
+Server, with curl over HTTP/1.1 and HTTP/2: `--compressed` (gzip, `Vary`,
+no `Content-Length`, body intact), `Accept-Encoding` negotiation (deflate
+only, `q=0`, q-values, `*`, identity, case), bodies left alone (small,
+`image/png`, `HEAD`, 204, already encoded), `ETag` weakened,
+`Accept-Ranges` dropped, `Vary` extended, and event streams (left alone;
+with `flush_each_write`, compressed and delivered as written). Request
+bodies: decompressed when enabled, 415 for an unknown coding, an 8 MiB
+bomb refused before the application sees it, and passed through untouched
+by default. Client, on a pooled requester: `Accept-Encoding` added (the
+application's own kept), responses decompressed with `Content-Encoding`
+removed, raw deflate decoded, and a bomb failing the exchange. ASan and
+UBSan: clean.
 
 **Unpooled exchanges** (`tests/client_execute_test`, 9 checks) runs
 `hc_client_execute()` against an in-process server. The request goes out
