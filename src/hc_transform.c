@@ -206,6 +206,14 @@ in_free(in_body *in)
 
 /* --- outgoing bodies ----------------------------------------------------- */
 
+/* struct out_body: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    OB_FLUSH    = 1u << 0,  /* flush() after every write                */
+    OB_ENDED    = 1u << 1,  /* the wrapped handler called end           */
+    OB_SENT_END = 1u << 2,  /* hc_data_end(real) done                   */
+    OB_BROKEN   = 1u << 3,
+};
+
 typedef struct out_body {
     hc_transform     t;
     hc_data_channel *real;      /* the engine's (or the next wrapper's)  */
@@ -213,10 +221,7 @@ typedef struct out_body {
     hc_bytes         pending;   /* transformed, not yet taken by real    */
     hc_headers      *trailers;
     size_t           high_water;
-    int              flush_each_write;
-    int              ended;     /* the wrapped handler called end        */
-    int              sent_end;  /* hc_data_end(real) done                */
-    int              broken;
+    unsigned         flags;     /* OB_*, above */
     void           (*fail)(void *owner, const char *reason);
     void            *owner;
 } out_body;
@@ -224,7 +229,7 @@ typedef struct out_body {
 static void
 out_break(out_body *o, const char *reason)
 {
-    o->broken = 1;
+    HC_SET_FLAG(o->flags, OB_BROKEN);
 
     if (reason) {
         o->fail(o->owner, reason);
@@ -235,7 +240,7 @@ out_break(out_body *o, const char *reason)
 static void
 out_pump(out_body *o)
 {
-    while (!o->broken && o->pending.len > 0) {
+    while (!HC_TEST_FLAG(o->flags, OB_BROKEN) && o->pending.len > 0) {
         size_t cap = hc_data_capacity(o->real);   /* 0 arms a produce() */
         size_t n   = o->pending.len < cap ? o->pending.len : cap;
         long   w;
@@ -252,8 +257,9 @@ out_pump(out_body *o)
         hc_bytes_consume(&o->pending, (size_t)w);
     }
 
-    if (!o->broken && o->ended && !o->sent_end && o->pending.len == 0) {
-        o->sent_end = 1;
+    if (HC_TEST_FLAG(o->flags, OB_ENDED) && !HC_TEST_FLAG(o->flags, OB_BROKEN | OB_SENT_END) &&
+        o->pending.len == 0) {
+        HC_SET_FLAG(o->flags, OB_SENT_END);
 
         if (hc_data_end(o->real, o->trailers) != 0) {
             out_break(o, NULL);
@@ -266,7 +272,7 @@ out_write(void *arg, const void *data, size_t len)
 {
     out_body *o = arg;
 
-    if (o->broken || o->ended) {
+    if (HC_TEST_FLAG(o->flags, OB_BROKEN | OB_ENDED)) {
         return -1;
     }
 
@@ -275,14 +281,14 @@ out_write(void *arg, const void *data, size_t len)
     }
 
     if (o->t.ops->update(o->t.state, data, len, &o->pending) != 0 ||
-        (o->flush_each_write && o->t.ops->flush &&
+        (HC_TEST_FLAG(o->flags, OB_FLUSH) && o->t.ops->flush &&
          o->t.ops->flush(o->t.state, &o->pending) != 0)) {
         out_break(o, FAILED);
         return -1;
     }
 
     out_pump(o);
-    return o->broken ? -1 : (long)len;
+    return HC_TEST_FLAG(o->flags, OB_BROKEN) ? -1 : (long)len;
 }
 
 static int
@@ -290,11 +296,11 @@ out_end(void *arg, const hc_headers *trailers)
 {
     out_body *o = arg;
 
-    if (o->broken || o->ended) {
+    if (HC_TEST_FLAG(o->flags, OB_BROKEN | OB_ENDED)) {
         return -1;
     }
 
-    o->ended = 1;
+    HC_SET_FLAG(o->flags, OB_ENDED);
 
     if (o->t.ops->finish(o->t.state, &o->pending) != 0) {
         out_break(o, FAILED);
@@ -308,7 +314,7 @@ out_end(void *arg, const hc_headers *trailers)
     }
 
     out_pump(o);
-    return o->broken ? -1 : 0;
+    return HC_TEST_FLAG(o->flags, OB_BROKEN) ? -1 : 0;
 }
 
 static size_t
@@ -316,7 +322,7 @@ out_capacity(void *arg)
 {
     out_body *o = arg;
 
-    if (o->broken || o->ended || o->pending.len >= o->high_water) {
+    if (HC_TEST_FLAG(o->flags, OB_BROKEN | OB_ENDED) || o->pending.len >= o->high_water) {
         return 0;   /* at the mark: the real channel is full, its drain
                      * calls the wrapper's ->produce() */
     }
@@ -329,7 +335,7 @@ out_request_output(void *arg)
 {
     out_body *o = arg;
 
-    if (!o->broken && !o->ended) {
+    if (!HC_TEST_FLAG(o->flags, OB_BROKEN | OB_ENDED)) {
         hc_data_request_output(o->real);    /* -> the wrapper's ->produce() */
     }
 }
@@ -344,7 +350,7 @@ static int
 out_produce(out_body *o)
 {
     out_pump(o);
-    return !o->broken && !o->ended && o->pending.len < o->high_water;
+    return !HC_TEST_FLAG(o->flags, OB_BROKEN | OB_ENDED) && o->pending.len < o->high_water;
 }
 
 static out_body *
@@ -361,10 +367,13 @@ out_new(hc_transform *t, hc_data_channel *real, size_t high_water, int flush_eac
     o->t                = *t;
     o->real             = real;
     o->high_water       = high_water ? high_water : HC_TRANSFORM_HIGH_WATER;
-    o->flush_each_write = flush_each_write;
     o->fail             = fail;
     o->owner            = owner;
     t->ops              = NULL;     /* o owns it now */
+
+    if (flush_each_write) {
+        HC_SET_FLAG(o->flags, OB_FLUSH);
+    }
     return o;
 }
 
@@ -398,6 +407,12 @@ entity_for(const hc_entity *entity, const hc_transform *t, hc_headers *headers,
 /* Server                                                                   */
 /* ======================================================================== */
 
+/* struct srv_wrap: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    SW_STARTED     = 1u << 0,   /* the wrapped handler has the request */
+    SW_FAILED_SENT = 1u << 1,   /* its ->failed() was called           */
+};
+
 typedef struct srv_wrap {
     hc_server_handler                 base;
     hc_server_handler                *inner;
@@ -409,9 +424,7 @@ typedef struct srv_wrap {
     in_body                          *in;
     out_body                         *out;
     const char                       *reason;   /* ours, for ->failed() */
-    int                               refused;  /* answered by us       */
-    int                               started;  /* inner has the request */
-    int                               failed_sent;
+    unsigned                          flags;    /* SW_*, above */
 } srv_wrap;
 
 static void
@@ -514,7 +527,6 @@ srv_handle_request(hc_server_handler *self, hc_server_exchange *ex,
     if (status) {
         transform_drop(&t);
         hc_headers_free(h);
-        w->refused = 1;
         hc_response_send_simple(rc, status, NULL, NULL, 0);
         return;
     }
@@ -542,7 +554,7 @@ srv_handle_request(hc_server_handler *self, hc_server_exchange *ex,
     }
 
     h2.headers = h;
-    w->started = 1;
+    HC_SET_FLAG(w->flags, SW_STARTED);
     w->inner->vtbl->handle_request(w->inner, ex, &h2, entity ? &e2 : NULL, w->rc);
 }
 
@@ -559,7 +571,7 @@ srv_consume(hc_server_handler *self, const void *data, size_t len)
 {
     srv_wrap *w = (srv_wrap *)self;
 
-    if (!w->started || w->reason) {
+    if (!HC_TEST_FLAG(w->flags, SW_STARTED) || w->reason) {
         return;
     }
 
@@ -575,7 +587,7 @@ srv_stream_end(hc_server_handler *self, const hc_headers *trailers)
 {
     srv_wrap *w = (srv_wrap *)self;
 
-    if (!w->started || w->reason) {
+    if (!HC_TEST_FLAG(w->flags, SW_STARTED) || w->reason) {
         return;
     }
 
@@ -592,7 +604,7 @@ srv_produce(hc_server_handler *self, hc_data_channel *ch)
 {
     srv_wrap *w = (srv_wrap *)self;
 
-    if (!w->started) {
+    if (!HC_TEST_FLAG(w->flags, SW_STARTED)) {
         return;
     }
 
@@ -610,8 +622,8 @@ srv_failed(hc_server_handler *self, const char *reason)
 {
     srv_wrap *w = (srv_wrap *)self;
 
-    if (w->started && !w->failed_sent) {
-        w->failed_sent = 1;
+    if (HC_TEST_FLAG(w->flags, SW_STARTED) && !HC_TEST_FLAG(w->flags, SW_FAILED_SENT)) {
+        HC_SET_FLAG(w->flags, SW_FAILED_SENT);
         w->inner->vtbl->failed(w->inner, w->reason ? w->reason : reason);
     }
 }
@@ -621,8 +633,9 @@ srv_release(hc_server_handler *self)
 {
     srv_wrap *w = (srv_wrap *)self;
 
-    if (w->reason && w->started && !w->failed_sent) {
-        w->failed_sent = 1;
+    if (w->reason && HC_TEST_FLAG(w->flags, SW_STARTED) &&
+        !HC_TEST_FLAG(w->flags, SW_FAILED_SENT)) {
+        HC_SET_FLAG(w->flags, SW_FAILED_SENT);
         w->inner->vtbl->failed(w->inner, w->reason);
     }
 
@@ -657,6 +670,12 @@ hc_server_transform_handler_new(hc_server_handler *inner, const hc_server_transf
 /* Client                                                                   */
 /* ======================================================================== */
 
+/* struct cli_wrap: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
+enum {
+    CW_STARTED     = 1u << 0,   /* the wrapped handler was asked for the request */
+    CW_FAILED_SENT = 1u << 1,   /* its ->failed() was called                     */
+};
+
 typedef struct cli_wrap {
     hc_client_handler                 base;
     hc_client_handler                *inner;
@@ -666,9 +685,8 @@ typedef struct cli_wrap {
     head_copy                         req;      /* as sent */
     in_body                          *in;
     out_body                         *out;
-    const char                       *reason;
-    int                               started;  /* inner was asked for the request */
-    int                               failed_sent;
+    const char                       *reason;   /* ours, for ->failed() */
+    unsigned                          flags;    /* CW_*, above */
 } cli_wrap;
 
 static void
@@ -762,7 +780,7 @@ cli_produce_request(hc_client_handler *self, hc_request_channel *rc)
         return;
     }
 
-    w->started = 1;
+    HC_SET_FLAG(w->flags, CW_STARTED);
     w->inner->vtbl->produce_request(w->inner, w->rc);
 }
 
@@ -876,8 +894,8 @@ cli_failed(hc_client_handler *self, const char *reason)
 {
     cli_wrap *w = (cli_wrap *)self;
 
-    if (w->started && !w->failed_sent) {
-        w->failed_sent = 1;
+    if (HC_TEST_FLAG(w->flags, CW_STARTED) && !HC_TEST_FLAG(w->flags, CW_FAILED_SENT)) {
+        HC_SET_FLAG(w->flags, CW_FAILED_SENT);
         w->inner->vtbl->failed(w->inner, w->reason ? w->reason : reason);
     }
 }
@@ -887,8 +905,9 @@ cli_release(hc_client_handler *self)
 {
     cli_wrap *w = (cli_wrap *)self;
 
-    if (w->reason && w->started && !w->failed_sent) {
-        w->failed_sent = 1;
+    if (w->reason && HC_TEST_FLAG(w->flags, CW_STARTED) &&
+        !HC_TEST_FLAG(w->flags, CW_FAILED_SENT)) {
+        HC_SET_FLAG(w->flags, CW_FAILED_SENT);
         w->inner->vtbl->failed(w->inner, w->reason);
     }
 
