@@ -32,6 +32,14 @@ HC_CFLAGS = -std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Iinclude -Ithird_p
 EVHTP_CFLAGS = -I$(EVHTP_PREFIX)/include
 EVHTP_LIBS   = $(EVHTP_PREFIX)/lib/libevhtp.a $(EXTRA_LIBS) -levent -levent_openssl -levent_pthreads -lssl -lcrypto -lpthread
 
+# ZLIB=1 (here, in config.mk or on the command line) builds the optional
+# gzip/deflate module (hc_gzip.h) into libhcore.a; programs then link -lz
+# too. Off by default.
+ZLIB      ?= 0
+WITH_ZLIB := $(filter 1 yes,$(ZLIB))
+ZLIB_LIBS := $(if $(WITH_ZLIB),-lz)
+EVHTP_LIBS += $(ZLIB_LIBS)
+
 all: libhcore.a reverse_proxy echo_server full_duplex_client full_duplex_server file_server pipelined_client
 
 src/hc_evhtp.o: src/hc_evhtp.c include/hc.h include/hc_channel.h include/hc_pool.h include/hc_processor.h third_party/htstring/include/htstring/htstring.h
@@ -53,8 +61,11 @@ src/hc_processor.o: src/hc_processor.c include/hc_processor.h include/hc.h
 src/hc_transform.o: src/hc_transform.c include/hc_transform.h include/hc_channel.h include/hc.h
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -c -o $@ $<
 
-HC_OBJS = src/hc_evhtp.o src/hc_pool.o src/hc_host.o src/hc_support.o src/hc_processor.o src/hc_transform.o
-HC_HDRS = include/hc.h include/hc_channel.h include/hc_pool.h include/hc_support.h include/hc_processor.h include/hc_transform.h
+src/hc_gzip.o: src/hc_gzip.c include/hc_gzip.h include/hc_transform.h include/hc.h
+	$(CC) $(HC_CFLAGS) $(CFLAGS) -c -o $@ $<
+
+HC_OBJS = src/hc_evhtp.o src/hc_pool.o src/hc_host.o src/hc_support.o src/hc_processor.o src/hc_transform.o $(if $(WITH_ZLIB),src/hc_gzip.o)
+HC_HDRS = include/hc.h include/hc_channel.h include/hc_pool.h include/hc_support.h include/hc_processor.h include/hc_transform.h $(if $(WITH_ZLIB),include/hc_gzip.h)
 
 # The library other projects link with: -lhcore, then libevhtp and what it needs
 # (the EVHTP_LIBS list below).
@@ -136,6 +147,12 @@ tests/channel_test: tests/channel_test.c $(HC_OBJS)
 tests/transform_test: tests/transform_test.c $(HC_OBJS)
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE -o $@ $^ $(EVHTP_LIBS) -lpthread
 
+# gzip/deflate (hc_gzip.h): only with ZLIB=1.
+tests/gzip_test: tests/gzip_test.c $(HC_OBJS)
+	$(CC) $(HC_CFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE -o $@ $^ $(EVHTP_LIBS) -lpthread
+
+GZIP_TEST := $(if $(WITH_ZLIB),tests/gzip_test)
+
 # Handler decorator lists on a server and a requester.
 tests/decorator_test: tests/decorator_test.c $(HC_OBJS)
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE -o $@ $^ $(EVHTP_LIBS) -lpthread
@@ -159,7 +176,7 @@ HAVE_RESET := $(shell grep -qs EVHTP_HAVE_REQUEST_RESET_STREAM $(EVHTP_PREFIX)/i
 tests/h2_test: tests/h2_test.c $(HC_OBJS)
 	$(CC) $(HC_CFLAGS) $(CFLAGS) $(if $(HAVE_RESET),-DHC_TEST_STREAM_RESET) -o $@ $^ $(EVHTP_LIBS)
 
-check: all tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/processor_test tests/timeout_test tests/stats_test tests/tls_opts_test tests/basic_server_test tests/pipeline_test tests/channel_test tests/client_execute_test tests/transform_test tests/decorator_test $(H2_TEST)
+check: all tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/processor_test tests/timeout_test tests/stats_test tests/tls_opts_test tests/basic_server_test tests/pipeline_test tests/channel_test tests/client_execute_test tests/transform_test tests/decorator_test $(GZIP_TEST) $(H2_TEST)
 	tests/pool_test
 	tests/support_test tests/tls
 	tests/embed_test
@@ -175,6 +192,7 @@ check: all tests/pool_test tests/support_test tests/embed_test tests/shutdown_te
 	tests/client_execute_test
 	tests/transform_test tests/tls
 	tests/decorator_test
+	$(if $(WITH_ZLIB),tests/gzip_test tests/tls,@echo "gzip_test: skipped (built without ZLIB=1)")
 	$(if $(HAVE_H2),tests/h2_test tests/tls,@echo "h2_test: skipped (libevhtp without HTTP/2)")
 	tests/run.sh
 
@@ -226,10 +244,10 @@ libhcore.pc:
 	  'Requires.private: libevent libevent_openssl libevent_pthreads openssl' \
 	  'Cflags: -I$${includedir}' \
 	  'Libs: -L$${libdir} -lhcore' \
-	  'Libs.private: $(EVHTP_PREFIX)/lib/libevhtp.a $(EXTRA_LIBS) -lpthread' > $@
+	  'Libs.private: $(EVHTP_PREFIX)/lib/libevhtp.a $(EXTRA_LIBS) $(ZLIB_LIBS) -lpthread' > $@
 	@echo "wrote $@"
 
 clean:
-	rm -f libhcore.a libhcore.pc src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server file_server pipelined_client tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/h2_test tests/processor_test tests/timeout_test tests/stats_test tests/tls_opts_test tests/basic_server_test tests/pipeline_test tests/channel_test tests/client_execute_test tests/transform_test tests/decorator_test
+	rm -f libhcore.a libhcore.pc src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server file_server pipelined_client tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/h2_test tests/processor_test tests/timeout_test tests/stats_test tests/tls_opts_test tests/basic_server_test tests/pipeline_test tests/channel_test tests/client_execute_test tests/transform_test tests/decorator_test tests/gzip_test
 
 .PHONY: all clean check install libhcore.pc

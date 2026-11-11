@@ -17,6 +17,10 @@ EVHTP_PREFIX = /usr/local
 # A full path to a library file works too, e.g. /opt/nghttp2/lib/libnghttp2.a
 EXTRA_LIBS =
 
+# 1: build the optional gzip/deflate module (hc_gzip.h, needs zlib; programs
+# linking libhcore.a then add -lz). Off by default.
+# ZLIB = 1
+
 # Where `make install` copies hcore's headers (include/) and libhcore.a (lib/),
 # e.g. the directory your application's other dependencies are installed in.
 # PREFIX = /usr/local
