@@ -26,6 +26,7 @@
  *    the request-fini hook can still unregister from the output buffer.
  */
 #include "hc.h"
+#include "hc_channel.h"
 #include "hc_processor.h"
 #include "hc_pool.h"
 #include "htstring/htstring.h"     /* third_party/htstring */
@@ -512,6 +513,10 @@ struct hc_data_channel {
     void                     *owner;
     void                    (*on_produce)(void *owner);
     void                    (*on_end)(void *owner);
+    /* Application channel (hc_channel.h): every call goes to ops, and the
+     * fields above are unused. NULL for the engine's own channels. */
+    const hc_data_channel_ops *ops;
+    void                      *ops_arg;
 };
 
 static void
@@ -592,6 +597,10 @@ chan_detach(hc_data_channel *ch)
 long
 hc_data_write(hc_data_channel *ch, const void *data, size_t len)
 {
+    if (ch && ch->ops) {
+        return ch->ops->write(ch->ops_arg, data, len);
+    }
+
     if (ch == NULL || ch->bev == NULL || HC_TEST_FLAG(ch->flags, CH_ENDED)) {
         return -1;
     }
@@ -636,6 +645,10 @@ hc_data_capacity(hc_data_channel *ch)
 {
     size_t queued;
 
+    if (ch && ch->ops) {
+        return ch->ops->capacity(ch->ops_arg);
+    }
+
     if (ch == NULL || ch->bev == NULL || HC_TEST_FLAG(ch->flags, CH_ENDED)) {
         return 0;
     }
@@ -653,6 +666,14 @@ hc_data_capacity(hc_data_channel *ch)
 void
 hc_data_request_output(hc_data_channel *ch)
 {
+    if (ch && ch->ops) {
+        if (ch->ops->request_output) {
+            ch->ops->request_output(ch->ops_arg);
+        }
+
+        return;
+    }
+
     if (ch && ch->bev && !HC_TEST_FLAG(ch->flags, CH_ENDED)) {
         ch->on_produce(ch->owner);
     }
@@ -661,6 +682,10 @@ hc_data_request_output(hc_data_channel *ch)
 int
 hc_data_end(hc_data_channel *ch, const hc_headers *trailers)
 {
+    if (ch && ch->ops) {
+        return ch->ops->end(ch->ops_arg, trailers);
+    }
+
     if (ch == NULL || ch->bev == NULL || HC_TEST_FLAG(ch->flags, CH_ENDED)) {
         return -1;
     }
@@ -793,7 +818,9 @@ struct hc_server {
 };
 
 struct hc_response_channel {
-    hc_server_exchange *ex;
+    hc_server_exchange            *ex;      /* NULL for an application channel */
+    const hc_response_channel_ops *ops;     /* hc_channel.h; NULL: the engine's */
+    void                          *ops_arg;
 };
 
 /* struct hc_server_exchange: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
@@ -1037,9 +1064,11 @@ srv_on_response_end(void *owner)
     srv_try_finalize(ex);
 }
 
-hc_data_channel *
-hc_response_send(hc_response_channel *rc, const hc_response_head *head,
-                 const hc_entity *entity)
+/* The engine's ResponseChannel.sendResponse(): hc_response_submit() for an
+ * engine channel. */
+static int
+srv_response_submit(hc_response_channel *rc, const hc_response_head *head,
+                    const hc_entity *entity, hc_data_channel **body)
 {
     hc_server_exchange *ex = rc->ex;
     evhtp_request_t    *req = ex->req;
@@ -1050,7 +1079,7 @@ hc_response_send(hc_response_channel *rc, const hc_response_head *head,
     hc_response_head    processed;
 
     if (req == NULL || HC_TEST_FLAG(ex->flags, EX_RESP_STARTED | EX_FAILED)) {
-        return NULL;
+        return -1;
     }
 
     /* Interceptors work on a copy (the caller's head is const); they may
@@ -1061,7 +1090,7 @@ hc_response_send(hc_response_channel *rc, const hc_response_head *head,
 
         if ((own_headers = hc_headers_copy(head->headers)) == NULL) {
             hc_server_abort(ex);
-            return NULL;
+            return -1;
         }
 
         r.status   = head->status;
@@ -1071,7 +1100,7 @@ hc_response_send(hc_response_channel *rc, const hc_response_head *head,
         if (hc_processor_process_response(ex->proc, &r, entity, ex->ctx) != 0) {
             hc_headers_free(own_headers);
             hc_server_abort(ex);
-            return NULL;
+            return -1;
         }
 
         processed         = *head;
@@ -1110,7 +1139,7 @@ hc_response_send(hc_response_channel *rc, const hc_response_head *head,
     if (entity == NULL) {
         evhtp_send_reply_start(req, (evhtp_res)head->status);
         srv_on_response_end(ex);
-        return NULL;
+        return 0;
     }
 
     if (HC_TEST_FLAG(ex->flags, EX_IS_HEAD)) {
@@ -1157,15 +1186,53 @@ hc_response_send(hc_response_channel *rc, const hc_response_head *head,
 
     schedule(ex->task, &ex->pending, T_PRODUCE);
 
-    return &ex->out;
+    *body = &ex->out;
+    return 0;
+}
+
+int
+hc_response_submit(hc_response_channel *rc, const hc_response_head *head,
+                   const hc_entity *entity, hc_data_channel **body)
+{
+    hc_data_channel *ch = NULL;
+    int              rv;
+
+    if (rc == NULL || head == NULL) {
+        rv = -1;
+    } else if (rc->ops) {
+        rv = rc->ops->send(rc->ops_arg, head, entity, &ch);
+    } else {
+        rv = srv_response_submit(rc, head, entity, &ch);
+    }
+
+    if (body) {
+        *body = rv == 0 ? ch : NULL;
+    }
+
+    return rv;
+}
+
+hc_data_channel *
+hc_response_send(hc_response_channel *rc, const hc_response_head *head,
+                 const hc_entity *entity)
+{
+    hc_data_channel *ch;
+
+    return hc_response_submit(rc, head, entity, &ch) == 0 ? ch : NULL;
 }
 
 int
 hc_response_send_information(hc_response_channel *rc, const hc_response_head *head)
 {
-    hc_server_exchange *ex = rc->ex;
+    hc_server_exchange *ex;
     struct evbuffer    *out;
     const char         *k, *v, *reason;
+
+    if (rc && rc->ops) {
+        return rc->ops->send_information ? rc->ops->send_information(rc->ops_arg, head) : -1;
+    }
+
+    ex = rc->ex;
 
     /* 1xx only, before the final response, and never to an HTTP/1.0 client
      * (RFC 9110 15.2). 100 is libevhtp's job; 101 would be an upgrade. */
@@ -1220,10 +1287,10 @@ hc_response_send_simple(hc_response_channel *rc, int status,
     head.version = 11;
     head.headers = h;
 
-    ch = hc_response_send(rc, &head, len ? &e : NULL);
-
-    if (len == 0) {
-        rv = HC_TEST_FLAG(rc->ex->flags, EX_RESP_STARTED) ? 0 : -1;
+    if (hc_response_submit(rc, &head, len ? &e : NULL, &ch) != 0) {
+        rv = -1;
+    } else if (len == 0) {
+        rv = 0;
     } else if (ch && hc_data_write(ch, body, len) == (long)len && hc_data_end(ch, NULL) == 0) {
         rv = 0;
     }
@@ -2876,7 +2943,9 @@ struct hc_pconn {
 };
 
 struct hc_request_channel {
-    hc_client_exchange *cx;
+    hc_client_exchange           *cx;       /* NULL for an application channel */
+    const hc_request_channel_ops *ops;      /* hc_channel.h; NULL: the engine's */
+    void                         *ops_arg;
 };
 
 /* struct hc_client_exchange: its flags (HC_SET_FLAG / HC_CLEAR_FLAG / HC_TEST_FLAG) */
@@ -3628,9 +3697,11 @@ cli_interpose_begin(hc_client_exchange *cx, struct bufferevent *bev)
     HC_SET_FLAG(cx->flags, CX_INTERPOSED);
 }
 
-hc_data_channel *
-hc_request_send(hc_request_channel *rc, const hc_request_head *head,
-                const hc_entity *entity)
+/* The engine's RequestChannel.sendRequest(): hc_request_submit() for an
+ * engine channel. */
+static int
+cli_request_submit(hc_request_channel *rc, const hc_request_head *head,
+                   const hc_entity *entity, hc_data_channel **body)
 {
     hc_client_exchange *cx   = rc->cx;
     evhtp_connection_t *conn = cx_conn(cx);
@@ -3639,13 +3710,13 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
     char                num[32];
 
     if (HC_TEST_FLAG(cx->flags, CX_HEAD_SENT | CX_FAILED) || conn == NULL || cx->req == NULL) {
-        return NULL;
+        return -1;
     }
 
     if (m < 0) {
         cli_fail(cx, "unsupported request method");
         schedule(cx->task, &cx->pending, T_ABORT);
-        return NULL;
+        return -1;
     }
 
     HC_SET_FLAG(cx->flags, CX_HEAD_SENT);
@@ -3657,7 +3728,7 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
         if ((own_headers = hc_headers_copy(head->headers)) == NULL) {
             cli_fail(cx, "out of memory");
             schedule(cx->task, &cx->pending, T_ABORT);
-            return NULL;
+            return -1;
         }
 
         r.method    = head->method;
@@ -3671,7 +3742,7 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
             hc_headers_free(own_headers);
             cli_fail(cx, "request refused by interceptor");
             schedule(cx->task, &cx->pending, T_ABORT);
-            return NULL;
+            return -1;
         }
     }
 
@@ -3745,7 +3816,7 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
             ep_kick(cx->ep);
         }
 
-        return NULL;
+        return 0;
     }
 
     chan_attach(&cx->out, evhtp_connection_get_bev(conn),
@@ -3765,7 +3836,39 @@ hc_request_send(hc_request_channel *rc, const hc_request_head *head,
 
     schedule(cx->task, &cx->pending, T_PRODUCE);
 
-    return &cx->out;
+    *body = &cx->out;
+    return 0;
+}
+
+int
+hc_request_submit(hc_request_channel *rc, const hc_request_head *head,
+                  const hc_entity *entity, hc_data_channel **body)
+{
+    hc_data_channel *ch = NULL;
+    int              rv;
+
+    if (rc == NULL || head == NULL) {
+        rv = -1;
+    } else if (rc->ops) {
+        rv = rc->ops->send(rc->ops_arg, head, entity, &ch);
+    } else {
+        rv = cli_request_submit(rc, head, entity, &ch);
+    }
+
+    if (body) {
+        *body = rv == 0 ? ch : NULL;
+    }
+
+    return rv;
+}
+
+hc_data_channel *
+hc_request_send(hc_request_channel *rc, const hc_request_head *head,
+                const hc_entity *entity)
+{
+    hc_data_channel *ch;
+
+    return hc_request_submit(rc, head, entity, &ch) == 0 ? ch : NULL;
 }
 
 void
@@ -5033,7 +5136,82 @@ hc_requester_free(hc_requester *rq)
 hc_client_exchange *
 hc_request_channel_exchange(hc_request_channel *rc)
 {
+    if (rc && rc->ops) {
+        return rc->ops->exchange ? rc->ops->exchange(rc->ops_arg) : NULL;
+    }
+
     return rc ? rc->cx : NULL;
+}
+
+/* ======================================================================== */
+/* Application channels (hc_channel.h)                                      */
+/* ======================================================================== */
+
+hc_data_channel *
+hc_data_channel_new(const hc_data_channel_ops *ops, void *arg)
+{
+    hc_data_channel *ch;
+
+    if (ops == NULL || ops->write == NULL || ops->end == NULL || ops->capacity == NULL ||
+        (ch = calloc(1, sizeof(*ch))) == NULL) {
+        return NULL;
+    }
+
+    ch->ops     = ops;
+    ch->ops_arg = arg;
+    return ch;
+}
+
+void
+hc_data_channel_free(hc_data_channel *ch)
+{
+    if (ch && ch->ops) {        /* never one of the engine's */
+        free(ch);
+    }
+}
+
+hc_response_channel *
+hc_response_channel_new(const hc_response_channel_ops *ops, void *arg)
+{
+    hc_response_channel *ch;
+
+    if (ops == NULL || ops->send == NULL || (ch = calloc(1, sizeof(*ch))) == NULL) {
+        return NULL;
+    }
+
+    ch->ops     = ops;
+    ch->ops_arg = arg;
+    return ch;
+}
+
+void
+hc_response_channel_free(hc_response_channel *ch)
+{
+    if (ch && ch->ops) {
+        free(ch);
+    }
+}
+
+hc_request_channel *
+hc_request_channel_new(const hc_request_channel_ops *ops, void *arg)
+{
+    hc_request_channel *ch;
+
+    if (ops == NULL || ops->send == NULL || (ch = calloc(1, sizeof(*ch))) == NULL) {
+        return NULL;
+    }
+
+    ch->ops     = ops;
+    ch->ops_arg = arg;
+    return ch;
+}
+
+void
+hc_request_channel_free(hc_request_channel *ch)
+{
+    if (ch && ch->ops) {
+        free(ch);
+    }
 }
 
 /* ======================================================================== */
