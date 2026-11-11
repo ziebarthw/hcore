@@ -225,6 +225,10 @@ hc_data_channel *hc_request_send(hc_request_channel *ch,
                                  const hc_request_head *head,
                                  const hc_entity *entity);
 
+/* The application can make channels of its own, e.g. to wrap the one a
+ * handler is given and change what it sends: see hc_channel.h. Every
+ * function above works on either kind. */
+
 /* ------------------------------------------------------------------------ */
 /* Server side: AsyncServerExchangeHandler                                  */
 /* ------------------------------------------------------------------------ */

@@ -15,6 +15,7 @@ include/hc.h            the "interfaces" an app implements, channels it calls, h
 include/hc_pool.h       generic route-based connection pool (StrictConnPool model)
 include/hc_support.h    request producers, response consumers, basic client handler (nio.support)
 include/hc_processor.h  request/response interceptors, the HTTP processor, the exchange context (http.protocol)
+include/hc_channel.h    channels the application implements: wrap a handler's channel to change what it sends
 src/hc_evhtp.c          engine: drives the interfaces from libevhtp/libevent/OpenSSL
 src/hc_pool.c           the pool              } engine-independent:
 src/hc_host.c           hc_host / URI parsing } hc.h only
@@ -38,6 +39,7 @@ tests/timeout_test.c    client and origin timeouts, the request body limit (HTTP
 tests/stats_test.c      server statistics against what happened on the wire; endpoint attachments
 tests/tls_opts_test.c   server TLS options (protocols, ciphers, client certificates) via openssl s_client
 tests/basic_server_test.c  hc_basic_server_factory(): whole requests, later and streamed replies, limits, IPv6
+tests/channel_test.c    application channels: wrappers on both sides of real exchanges (HTTP/1.1 and HTTP/2)
 tests/run.sh            end-to-end tests (curl / client -> proxy -> tests/origin.py, echo_server)
 tests/tls/              self-signed test certificates (localhost, other.example)
 third_party/htstring/   copy of htstring: htstring_t string views, used by the engine's routing
@@ -336,6 +338,47 @@ interceptors and the handler share (`hc_server_exchange_context()`,
 (client) or the client's address (server). Standard interceptors: target
 host, user agent, request date, default headers, response date, server;
 `hc_processor_client_default()` / `_server_default()` as `HttpProcessors`.
+
+## Application channels (`hc_channel.h`)
+
+A handler talks to the engine through channels: `hc_response_send()`,
+`hc_request_send()`, `hc_data_write()` and the rest. `hc_channel.h` lets the
+application make channels of its own, whose calls go to functions it
+supplies (Java: your own `ResponseChannel`, `RequestChannel` or
+`DataStreamChannel`). The usual use is a wrapper: a handler in front of
+another one gives it its own channel, changes what the inner handler sends -
+a header, the body - and passes it on to the channel the engine gave it:
+
+```c
+static int
+my_send(void *arg, const hc_response_head *head, const hc_entity *entity,
+        hc_data_channel **body)
+{
+    wrapper *w = arg;
+    /* ... look at or change head ... */
+    if (hc_response_submit(w->real, head, entity, &w->real_body) != 0)
+        return -1;
+    *body = w->real_body ? w->body : NULL;  /* the inner handler writes to ours */
+    return 0;
+}
+
+static const hc_response_channel_ops MY_RESPONSE = { my_send, NULL };
+static const hc_data_channel_ops     MY_DATA = { my_write, my_end, my_capacity, my_request_output };
+
+w->body = hc_data_channel_new(&MY_DATA, w);
+w->rc   = hc_response_channel_new(&MY_RESPONSE, w);   /* hand w->rc to the inner handler */
+```
+
+`hc_response_submit()` and `hc_request_submit()` are `hc_response_send()`
+and `hc_request_send()` with a status: they return 0 or -1 and give the body
+channel through a pointer, so "sent, no body" and "failed" can be told
+apart. The channels are the caller's to free (`hc_*_channel_free()`), after
+the last call - for a channel given to an inner handler, after that
+handler's `->release()`. Framing stays the engine's: a wrapper that changes
+a body's length sends the head on with an entity of unknown length (-1).
+Response interceptors run inside the engine's channel, so they see the head
+as finally sent, after every wrapper. `tests/channel_test.c` has a complete
+upper-casing wrapper for both sides.
 
 ## Interim (1xx) responses
 
@@ -1018,6 +1061,18 @@ leaving before a pending reply, a stream to a client that has left
 (`->failed()` and `->release()`), and every request released exactly once.
 With IPv6: servers on `::1` and `[::1]`, and an IPv4 and an IPv6 server on
 the same port. Valgrind: clean.
+
+**Application channels** (`tests/channel_test`, 40 checks, 26 without
+HTTP/2) answers through a wrapper response channel that adds a header and
+upper-cases the body, checked with curl over HTTP/1.1 and HTTP/2:
+`hc_response_send_simple()` with a body (length kept) and without one (204,
+returning 0), a 300,000-byte body of unknown length written only while the
+wrapper reports capacity (it runs out and `->produce()` comes back), and
+`hc_response_send_information()` on a wrapper without it (-1). A client on
+a pooled requester sends a 100,000-byte chunked request through a wrapper
+request channel; the origin echoes what arrived, and
+`hc_request_channel_exchange()` reaches the real exchange. Incomplete ops
+are refused. ASan and UBSan: clean.
 
 **TLS server name** (`tests/tls_name_test`, 19 checks) connects over https
 to 127.0.0.1, where a plain OpenSSL server answers with the SNI it received.
