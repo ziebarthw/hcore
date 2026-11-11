@@ -21,6 +21,7 @@
 /tests/channel_test
 /tests/client_execute_test
 /tests/transform_test
+/tests/decorator_test
 
 # local build settings (see config.mk.example)
 /config.mk

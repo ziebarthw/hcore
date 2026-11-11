@@ -948,3 +948,15 @@ hc_client_transform_handler_new(hc_client_handler *inner, const hc_client_transf
     w->cfg       = cfg;
     return &w->base;
 }
+
+hc_server_handler *
+hc_server_transform_decorator(void *cfg, hc_server_handler *inner)
+{
+    return hc_server_transform_handler_new(inner, cfg);
+}
+
+hc_client_handler *
+hc_client_transform_decorator(void *cfg, hc_client_handler *inner)
+{
+    return hc_client_transform_handler_new(inner, cfg);
+}

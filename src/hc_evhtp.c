@@ -793,6 +793,124 @@ enum {
     SRV_HTTP2    = 1u << 2,   /* offer h2 in TLS ALPN (if built in) */
 };
 
+/* ======================================================================== */
+/* Decorator lists (hc_server_add_decorator_*, hc_requester_add_decorator_*) */
+/* ======================================================================== */
+
+/* An ordered list of named handler decorators. fn is an
+ * hc_server_decorator or an hc_client_decorator, kept as a plain function
+ * pointer and cast back by the side that owns the list. */
+typedef struct deco {
+    char  *name;
+    void (*fn)(void);
+    void  *arg;
+} deco;
+
+typedef struct deco_list {
+    deco  *v;
+    size_t n;
+    size_t cap;
+} deco_list;
+
+static long
+deco_find(const deco_list *l, const char *name)
+{
+    for (size_t i = 0; name && i < l->n; i++) {
+        if (strcmp(l->v[i].name, name) == 0) {
+            return (long)i;
+        }
+    }
+
+    return -1;
+}
+
+/* where: 'F'irst, 'L'ast, 'B'efore existing, 'A'fter existing */
+static int
+deco_add(deco_list *l, int where, const char *existing, const char *name,
+         void (*fn)(void), void *arg)
+{
+    long   at;
+    char  *copy;
+
+    if (name == NULL || fn == NULL || deco_find(l, name) >= 0) {
+        return -1;
+    }
+
+    switch (where) {
+    case 'F': at = 0; break;
+    case 'L': at = (long)l->n; break;
+    case 'B': at = deco_find(l, existing); break;
+    default:  at = deco_find(l, existing); at = at < 0 ? -1 : at + 1; break;
+    }
+
+    if (at < 0) {
+        return -1;
+    }
+
+    if (l->n == l->cap) {
+        size_t cap = l->cap ? l->cap * 2 : 4;
+        deco  *v   = realloc(l->v, cap * sizeof(*v));
+
+        if (v == NULL) {
+            return -1;
+        }
+
+        l->v   = v;
+        l->cap = cap;
+    }
+
+    if ((copy = strdup(name)) == NULL) {
+        return -1;
+    }
+
+    memmove(&l->v[at + 1], &l->v[at], (l->n - (size_t)at) * sizeof(*l->v));
+    l->v[at].name = copy;
+    l->v[at].fn   = fn;
+    l->v[at].arg  = arg;
+    l->n++;
+    return 0;
+}
+
+static int
+deco_replace(deco_list *l, const char *existing, void (*fn)(void), void *arg)
+{
+    long at = deco_find(l, existing);
+
+    if (at < 0 || fn == NULL) {
+        return -1;
+    }
+
+    l->v[at].fn  = fn;
+    l->v[at].arg = arg;
+    return 0;
+}
+
+static int
+deco_remove(deco_list *l, const char *name)
+{
+    long at = deco_find(l, name);
+
+    if (at < 0) {
+        return -1;
+    }
+
+    free(l->v[at].name);
+    memmove(&l->v[at], &l->v[at + 1], (l->n - (size_t)at - 1) * sizeof(*l->v));
+    l->n--;
+    return 0;
+}
+
+static void
+deco_list_free(deco_list *l)
+{
+    for (size_t i = 0; i < l->n; i++) {
+        free(l->v[i].name);
+    }
+
+    free(l->v);
+    memset(l, 0, sizeof(*l));
+}
+
 struct hc_server {
     hc_reactor               *r;
     evhtp_t                  *htp;
@@ -812,6 +930,7 @@ struct hc_server {
     struct timeval            write_tv;
     int64_t                   max_body; /* request body limit (0: none) */
     hc_server_stats           stats;
+    deco_list                 decos;   /* hc_server_add_decorator_*() */
 #ifdef HC_HAVE_TLS
     evhtp_ssl_cfg_t           tls;     /* libevhtp keeps a pointer to it */
 #endif
@@ -839,6 +958,7 @@ enum {
     EX_H2_COUNTED      = 1u << 11,  /* in its srv_conn's h2_active */
     EX_RESET           = 1u << 12,  /* HTTP/2 stream reset sent */
     EX_TOO_LARGE       = 1u << 13,  /* body over the limit: 413 / close */
+    EX_UNAVAILABLE     = 1u << 14,  /* a decorator failed: 503 */
 };
 
 struct hc_server_exchange {
@@ -1807,6 +1927,24 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
         }
     }
 
+    /* Decorators, last to first: the first added ends up outermost, so it
+     * sees the request first and the response last. One that fails
+     * (returns NULL) leaves what it was given: that is released, and the
+     * request is answered 503 below, as a refused one is. */
+    for (size_t i = srv->decos.n; ex->h && i-- > 0;) {
+        hc_server_decorator fn = (hc_server_decorator)srv->decos.v[i].fn;
+        hc_server_handler  *d  = fn(srv->decos.v[i].arg, ex->h);
+
+        if (d == NULL) {
+            ex->h->vtbl->release(ex->h);
+            ex->h = &not_found_handler;     /* a stand-in until then */
+            HC_SET_FLAG(ex->flags, EX_UNAVAILABLE);
+            break;
+        }
+
+        ex->h = d;
+    }
+
     if (conn_is_h2(ex->conn)) {
         HC_SET_FLAG(ex->flags, EX_H2);
     }
@@ -1926,6 +2064,8 @@ srv_on_headers(evhtp_request_t *req, evhtp_headers_t *hdrs, void *arg)
 
         if (HC_TEST_FLAG(ex->flags, EX_TOO_LARGE)) {
             rv = 413;
+        } else if (HC_TEST_FLAG(ex->flags, EX_UNAVAILABLE)) {
+            rv = 503;
         } else if (ex->proc) {
             hc_http_request r = { head.method, head.target, head.authority, head.version, h };
 
@@ -2610,6 +2750,44 @@ hc_server_set_processor(hc_server *s, hc_processor *p)
     }
 }
 
+int
+hc_server_add_decorator_first(hc_server *s, const char *name, hc_server_decorator fn, void *arg)
+{
+    return s ? deco_add(&s->decos, 'F', NULL, name, (void (*)(void))fn, arg) : -1;
+}
+
+int
+hc_server_add_decorator_last(hc_server *s, const char *name, hc_server_decorator fn, void *arg)
+{
+    return s ? deco_add(&s->decos, 'L', NULL, name, (void (*)(void))fn, arg) : -1;
+}
+
+int
+hc_server_add_decorator_before(hc_server *s, const char *existing, const char *name,
+                               hc_server_decorator fn, void *arg)
+{
+    return s ? deco_add(&s->decos, 'B', existing, name, (void (*)(void))fn, arg) : -1;
+}
+
+int
+hc_server_add_decorator_after(hc_server *s, const char *existing, const char *name,
+                              hc_server_decorator fn, void *arg)
+{
+    return s ? deco_add(&s->decos, 'A', existing, name, (void (*)(void))fn, arg) : -1;
+}
+
+int
+hc_server_replace_decorator(hc_server *s, const char *existing, hc_server_decorator fn, void *arg)
+{
+    return s ? deco_replace(&s->decos, existing, (void (*)(void))fn, arg) : -1;
+}
+
+int
+hc_server_remove_decorator(hc_server *s, const char *name)
+{
+    return s ? deco_remove(&s->decos, name) : -1;
+}
+
 void
 hc_server_set_timeouts(hc_server *s, int64_t read_ms, int64_t write_ms)
 {
@@ -2813,6 +2991,7 @@ hc_server_free(hc_server *s)
         }
 
         free(s->routes);
+        deco_list_free(&s->decos);
         hc_processor_unref(s->processor);
         free(s);
     }
@@ -2869,6 +3048,7 @@ struct hc_requester {
     int64_t               read_timeout_ms;  /* exchange defaults (0: none) */
     int64_t               write_timeout_ms;
     hc_requester_listener listener;  /* hc_requester_set_listener() */
+    deco_list             decos;     /* hc_requester_add_decorator_*() */
 };
 
 struct hc_connect_op {
@@ -4866,6 +5046,22 @@ hc_endpoint_execute(hc_endpoint *ep, hc_client_handler *h)
     cx->proc   = ep->rq->processor;     /* the requester outlives its exchanges */
     cx->ctx    = hc_context_new(0, &ep->pc->target, NULL);
 
+    /* The requester's decorators, last to first (the first added is
+     * outermost). The exchange now owns h: if a decorator fails, the chain
+     * built so far is failed and released like a cancelled exchange. */
+    for (size_t i = ep->rq->decos.n; i-- > 0;) {
+        hc_client_decorator fn = (hc_client_decorator)ep->rq->decos.v[i].fn;
+        hc_client_handler  *d  = fn(ep->rq->decos.v[i].arg, cx->h);
+
+        if (d == NULL) {
+            cli_fail(cx, "cannot start exchange: decorator failed");
+            schedule(cx->task, &cx->pending, T_ABORT);
+            break;
+        }
+
+        cx->h = d;
+    }
+
     /* Queue it. With the endpoint idle it has the connection to itself;
      * otherwise it is pipelined behind the exchanges already there. */
     if (ep->tail) {
@@ -5088,6 +5284,47 @@ hc_requester_set_listener(hc_requester *rq, const hc_requester_listener *l)
     }
 }
 
+int
+hc_requester_add_decorator_first(hc_requester *rq, const char *name, hc_client_decorator fn,
+                                 void *arg)
+{
+    return rq ? deco_add(&rq->decos, 'F', NULL, name, (void (*)(void))fn, arg) : -1;
+}
+
+int
+hc_requester_add_decorator_last(hc_requester *rq, const char *name, hc_client_decorator fn,
+                                void *arg)
+{
+    return rq ? deco_add(&rq->decos, 'L', NULL, name, (void (*)(void))fn, arg) : -1;
+}
+
+int
+hc_requester_add_decorator_before(hc_requester *rq, const char *existing, const char *name,
+                                  hc_client_decorator fn, void *arg)
+{
+    return rq ? deco_add(&rq->decos, 'B', existing, name, (void (*)(void))fn, arg) : -1;
+}
+
+int
+hc_requester_add_decorator_after(hc_requester *rq, const char *existing, const char *name,
+                                 hc_client_decorator fn, void *arg)
+{
+    return rq ? deco_add(&rq->decos, 'A', existing, name, (void (*)(void))fn, arg) : -1;
+}
+
+int
+hc_requester_replace_decorator(hc_requester *rq, const char *existing, hc_client_decorator fn,
+                               void *arg)
+{
+    return rq ? deco_replace(&rq->decos, existing, (void (*)(void))fn, arg) : -1;
+}
+
+int
+hc_requester_remove_decorator(hc_requester *rq, const char *name)
+{
+    return rq ? deco_remove(&rq->decos, name) : -1;
+}
+
 /* Finish an exchange now, as its queued T_FINISH would later: the handler
  * sees failed + release, and the endpoint (if released) is handed back. */
 static void
@@ -5151,6 +5388,7 @@ hc_requester_free(hc_requester *rq)
     SSL_CTX_free(rq->tls_ctx);
 #endif
     hc_processor_unref(rq->processor);  /* after its exchanges are done */
+    deco_list_free(&rq->decos);
     free(rq);
 }
 

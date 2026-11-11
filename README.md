@@ -44,6 +44,7 @@ tests/tls_opts_test.c   server TLS options (protocols, ciphers, client certifica
 tests/basic_server_test.c  hc_basic_server_factory(): whole requests, later and streamed replies, limits, IPv6
 tests/channel_test.c    application channels: wrappers on both sides of real exchanges (HTTP/1.1 and HTTP/2)
 tests/transform_test.c  body transformations on both sides, flow control to a slow reader, errors (HTTP/1.1 and HTTP/2)
+tests/decorator_test.c  handler decorator lists on a server and a requester: order, early answers, failures
 tests/run.sh            end-to-end tests (curl / client -> proxy -> tests/origin.py, echo_server)
 tests/tls/              self-signed test certificates (localhost, other.example)
 third_party/htstring/   copy of htstring: htstring_t string views, used by the engine's routing
@@ -435,6 +436,30 @@ transformation aborts the exchange; the wrapped handler's `->failed()` gets
 
 `hc_bytes` is the growable buffer transformations append to, with
 `hc_bytes_reserve()` / `hc_bytes_commit()` for codecs that write in place.
+
+## Handler decorators
+
+Rather than wrap each handler in its factory, a server or requester can
+keep an ordered, named list of decorators, applied to every exchange it
+starts (Java: `AsyncServerBootstrap.addFilterFirst/Last/Before/After`,
+`replaceFilter`):
+
+```c
+hc_server_add_decorator_last(s, "auth", auth_decorator, &auth_cfg);
+hc_server_add_decorator_last(s, "gzip", hc_server_transform_decorator, &gzip_cfg);
+hc_server_add_decorator_before(s, "gzip", "log", log_decorator, NULL);
+```
+
+A decorator gets the handler the exchange would use and returns it
+unchanged, a handler that stands in for it (and owns it), or NULL on
+failure. A stand-in can answer the request itself - a 401, say - without
+ever passing it on. The first in the list is the outermost, closest to the
+connection: on a server it sees the request first and the response last;
+on a requester it sees the request last, just before it is sent, and the
+response first. A failing decorator gets the request answered 503 on a
+server, and fails the exchange on a requester. Transform handlers come as
+decorators: `hc_server_transform_decorator()` and
+`hc_client_transform_decorator()`, with their config as the argument.
 
 ## Interim (1xx) responses
 
@@ -1148,6 +1173,18 @@ way in - both wrappers on one exchange, the original bytes back - a header
 added to a bodiless GET and seen by `choose_response`, and a response
 refused (`->failed("body transformation refused")`). Every transformation's
 state is freed exactly once. ASan and UBSan: clean.
+
+**Handler decorators** (`tests/decorator_test`, 38 checks): list
+operations (first, last, before, after, replace, remove; duplicate and
+unknown names refused); on a server, checked with curl, the order (the
+first in the list sees the request first and the response last), a
+decorator answering 401 without passing the request on (the decorators
+inside it released, the application never called), one returning its
+handler unchanged, one failing (503), a transform handler as a decorator,
+and a registered route decorated the same; on a requester, the order (the
+first in the list sees the request last and the response first) and a
+failing decorator (`->failed("cannot start exchange: decorator failed")`).
+Every decorator released exactly once. ASan and UBSan: clean.
 
 **Unpooled exchanges** (`tests/client_execute_test`, 9 checks) runs
 `hc_client_execute()` against an in-process server. The request goes out
