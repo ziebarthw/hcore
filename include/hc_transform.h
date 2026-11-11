@@ -145,6 +145,10 @@ typedef struct hc_server_transform_config {
 hc_server_handler *hc_server_transform_handler_new(hc_server_handler *inner,
                                                    const hc_server_transform_config *cfg);
 
+/* The same as an hc_server_decorator (hc.h), with the config as its arg:
+ *   hc_server_add_decorator_last(s, "gzip", hc_server_transform_decorator, &cfg); */
+hc_server_handler *hc_server_transform_decorator(void *cfg, hc_server_handler *inner);
+
 /* ------------------------------------------------------------------------ */
 /* Client side                                                              */
 /* ------------------------------------------------------------------------ */
@@ -167,6 +171,9 @@ typedef struct hc_client_transform_config {
  * through unchanged. */
 hc_client_handler *hc_client_transform_handler_new(hc_client_handler *inner,
                                                    const hc_client_transform_config *cfg);
+
+/* As an hc_client_decorator, for hc_requester_add_decorator_*(). */
+hc_client_handler *hc_client_transform_decorator(void *cfg, hc_client_handler *inner);
 
 #ifdef __cplusplus
 }

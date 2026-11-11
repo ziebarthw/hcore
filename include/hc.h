@@ -374,6 +374,44 @@ int        hc_server_set_http2(hc_server *s, int enabled);
  * reference, drops the previous one; NULL removes them. Exchanges already
  * under way keep the processor they started with. */
 void       hc_server_set_processor(hc_server *s, hc_processor *p);
+
+/*
+ * Handler decorators: wrappers put around the handler of every exchange,
+ * by name, in order (Java: AsyncServerBootstrap.addFilterFirst/Last/
+ * Before/After and replaceFilter, for AsyncFilterHandlers). A decorator is
+ * called once per exchange with the handler the server would use (from
+ * the route's factory, or the next decorator) and returns
+ *
+ *   inner itself        not decorating this exchange
+ *   a new handler       that stands in for inner and owns it: forwards
+ *                       the calls it does not handle, and calls inner's
+ *                       ->release() from its own. It may also answer the
+ *                       request itself and never pass it on (e.g. 401):
+ *                       inner then gets ->release() only.
+ *   NULL                failure, inner untouched: the server releases
+ *                       inner and answers 503
+ *
+ * The first decorator in the list is the outermost, the one closest to
+ * the connection: it sees the request first and the response last.
+ * Transform handlers (hc_transform.h) are
+ * decorators: hc_server_transform_decorator(). The list is the server's
+ * for every exchange it starts afterwards, routes included; change it
+ * before hc_server_listen() or on the reactor's thread. Names are unique.
+ * Returns 0, or -1 for a duplicate or unknown name or out of memory.
+ */
+typedef hc_server_handler *(*hc_server_decorator)(void *arg, hc_server_handler *inner);
+
+int hc_server_add_decorator_first(hc_server *s, const char *name, hc_server_decorator fn,
+                                  void *arg);
+int hc_server_add_decorator_last(hc_server *s, const char *name, hc_server_decorator fn,
+                                 void *arg);
+int hc_server_add_decorator_before(hc_server *s, const char *existing, const char *name,
+                                   hc_server_decorator fn, void *arg);
+int hc_server_add_decorator_after(hc_server *s, const char *existing, const char *name,
+                                  hc_server_decorator fn, void *arg);
+int hc_server_replace_decorator(hc_server *s, const char *existing, hc_server_decorator fn,
+                                void *arg);
+int hc_server_remove_decorator(hc_server *s, const char *name);
 /* The exchange's context (hc_processor.h): what its interceptors set,
  * readable and writable by the handler for as long as the exchange lives
  * (made on first use). NULL only on allocation failure. */
@@ -638,6 +676,30 @@ typedef struct hc_requester_listener {
 } hc_requester_listener;
 
 void          hc_requester_set_listener(hc_requester *rq, const hc_requester_listener *l);
+
+/* Handler decorators for every exchange on the requester's connections
+ * (hc_endpoint_execute(), hc_requester_execute()), as for the server
+ * (hc_server_add_decorator_first() and the rest). Here too the first in
+ * the list is outermost, closest to the connection - so on this side it
+ * sees the request last, just before it is sent, and the response first,
+ * as it arrives (a decoder first in the list gets the bytes off the
+ * wire). Transform handlers: hc_client_transform_decorator(). A
+ * decorator returning NULL fails the exchange - the handler gets
+ * ->failed("cannot start exchange: decorator failed") and ->release().
+ * hc_client_execute() (unpooled, no requester) has none. */
+typedef hc_client_handler *(*hc_client_decorator)(void *arg, hc_client_handler *inner);
+
+int hc_requester_add_decorator_first(hc_requester *rq, const char *name, hc_client_decorator fn,
+                                     void *arg);
+int hc_requester_add_decorator_last(hc_requester *rq, const char *name, hc_client_decorator fn,
+                                    void *arg);
+int hc_requester_add_decorator_before(hc_requester *rq, const char *existing, const char *name,
+                                      hc_client_decorator fn, void *arg);
+int hc_requester_add_decorator_after(hc_requester *rq, const char *existing, const char *name,
+                                     hc_client_decorator fn, void *arg);
+int hc_requester_replace_decorator(hc_requester *rq, const char *existing, hc_client_decorator fn,
+                                   void *arg);
+int hc_requester_remove_decorator(hc_requester *rq, const char *name);
 
 /* Lease a connection to target, reusing an idle one when possible.
  * timeout_ms bounds the wait for a pool slot plus name resolution, TCP
