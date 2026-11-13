@@ -40,7 +40,7 @@ WITH_ZLIB := $(filter 1 yes,$(ZLIB))
 ZLIB_LIBS := $(if $(WITH_ZLIB),-lz)
 EVHTP_LIBS += $(ZLIB_LIBS)
 
-all: libhcore.a reverse_proxy echo_server full_duplex_client full_duplex_server file_server pipelined_client
+all: libhcore.a reverse_proxy echo_server full_duplex_client full_duplex_server file_server pipelined_client filter_server
 
 src/hc_evhtp.o: src/hc_evhtp.c include/hc.h include/hc_channel.h include/hc_pool.h include/hc_processor.h third_party/htstring/include/htstring/htstring.h
 	$(CC) $(HC_CFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE $(EVHTP_CFLAGS) -c -o $@ $<
@@ -96,6 +96,9 @@ file_server: examples/file_server.o $(HC_OBJS)
 	$(CC) -o $@ $^ $(EVHTP_LIBS)
 
 hcurl: examples/hcurl.o $(HC_OBJS)
+	$(CC) -o $@ $^ $(EVHTP_LIBS)
+
+filter_server: examples/filter_server.o $(HC_OBJS)
 	$(CC) -o $@ $^ $(EVHTP_LIBS)
 
 # Pool unit tests: fake connections, no sockets.
@@ -248,6 +251,6 @@ libhcore.pc:
 	@echo "wrote $@"
 
 clean:
-	rm -f libhcore.a libhcore.pc src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server file_server pipelined_client tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/h2_test tests/processor_test tests/timeout_test tests/stats_test tests/tls_opts_test tests/basic_server_test tests/pipeline_test tests/channel_test tests/client_execute_test tests/transform_test tests/decorator_test tests/gzip_test
+	rm -f libhcore.a libhcore.pc src/*.o examples/*.o reverse_proxy echo_server full_duplex_client full_duplex_server file_server pipelined_client filter_server tests/pool_test tests/support_test tests/embed_test tests/shutdown_test tests/tls_name_test tests/h2_test tests/processor_test tests/timeout_test tests/stats_test tests/tls_opts_test tests/basic_server_test tests/pipeline_test tests/channel_test tests/client_execute_test tests/transform_test tests/decorator_test tests/gzip_test
 
 .PHONY: all clean check install libhcore.pc
