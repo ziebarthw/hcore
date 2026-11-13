@@ -31,6 +31,7 @@ examples/pipelined_client.c    port of AsyncPipelinedRequestExecutionExample (HT
 examples/full_duplex_server.c  port of AsyncFullDuplexServerExample (routing, stream listener, http/https)
 examples/echo_server.c         minimal server handler: streams the request body back (http/https)
 examples/file_server.c         port of AsyncFileServerExample (whole requests, a file streamed with Content-Length)
+examples/filter_server.c       port of AsyncServerFilterExample (request filters as handler decorators)
 tests/pool_test.c       pool + hc_host unit tests with fake connections
 tests/support_test.c    in-process integration tests: support API, TLS, 1xx, routing (HTTP + HTTPS servers)
 tests/embed_test.c      hcore in the application's event loop: reuse_port, pause/resume accept, graceful drain

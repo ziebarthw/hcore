@@ -6,6 +6,7 @@
 /echo_server
 /full_duplex_client
 /pipelined_client
+/filter_server
 /tests/pool_test
 /tests/support_test
 /tests/embed_test
